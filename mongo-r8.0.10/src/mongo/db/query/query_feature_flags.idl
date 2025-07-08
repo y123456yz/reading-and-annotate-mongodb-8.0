@@ -1,0 +1,139 @@
+#    Copyright (C) 2020-present MongoDB, Inc.
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the Server Side Public License, version 1,
+#    as published by MongoDB, Inc.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    Server Side Public License for more details.
+#
+#    You should have received a copy of the Server Side Public License
+#    along with this program. If not, see
+#    <http://www.mongodb.com/licensing/server-side-public-license>.
+#
+#    As a special exception, the copyright holders give permission to link the
+#    code of portions of this program with the OpenSSL library under certain
+#    conditions as described in each individual source file and distribute
+#    linked combinations including the program with the OpenSSL library. You
+#    must comply with the Server Side Public License in all respects for
+#    all of the code used other than as permitted herein. If you modify file(s)
+#    with this exception, you may extend this exception to your version of the
+#    file(s), but you are not obligated to do so. If you do not wish to do so,
+#    delete this exception statement from your version. If you delete this
+#    exception statement from all source files in the program, then also delete
+#    it in the license file.
+#
+
+global:
+  cpp_namespace: "mongo::feature_flags"
+
+feature_flags:
+    featureFlagCommonQueryFramework:
+      description: "Feature flag for allowing use of Cascades-based query optimizer"
+      cpp_varname: gFeatureFlagCommonQueryFramework
+      default: false
+      shouldBeFCVGated: false
+
+    featureFlagOptimizerPlanCache:
+      description: "Enables the plan cache for the Cascades-based query optimizer"
+      cpp_varname: gFeatureFlagOptimizerPlanCache
+      default: true
+      shouldBeFCVGated: false
+
+    featureFlagColumnstoreIndexes:
+      description: "Enables creation of a new columnstore index type"
+      cpp_varname: gFeatureFlagColumnstoreIndexes
+      default: false
+      shouldBeFCVGated: true
+
+    featureFlagServerlessChangeStreams:
+      description: "Feature flag to enable reading change events from the change collection rather than the oplog"
+      cpp_varname: gFeatureFlagServerlessChangeStreams
+      default: false
+      shouldBeFCVGated: true
+
+    featureFlagSbeFull:
+      description: "Feature flag for SBE behaviors, features, or extensions that are not yet enabled
+                    by default"
+      cpp_varname: gFeatureFlagSbeFull
+      default: false
+      shouldBeFCVGated: false
+
+    featureFlagQueryStats:
+      description: "Feature flag for enabling full queryStats collection."
+      cpp_varname: gFeatureFlagQueryStats
+      default: true
+      shouldBeFCVGated: false
+
+    featureFlagQueryStatsDataBearingNodes:
+      description: "Feature flag for enabling aggregation of queryStats from data bearing nodes."
+      cpp_varname: gFeatureFlagQueryStatsDataBearingNodes
+      default: true
+      version: 8.0
+      shouldBeFCVGated: true
+
+    featureFlagSearchBatchSizeLimit:
+      description: "Feature flag to enable the search batchsize and limit optimization."
+      cpp_varname: gFeatureFlagSearchBatchSizeLimit
+      default: true
+      shouldBeFCVGated: false
+
+    featureFlagAggOutTimeseries:
+      description: "Feature flag for enabling support for $out to write to time-series collections"
+      cpp_varname: gFeatureFlagAggOutTimeseries
+      default: true
+      shouldBeFCVGated: false
+
+    featureFlagQuerySettings:
+      description: "Feature flag for enabling persistent query settings"
+      cpp_varname: gFeatureFlagQuerySettings
+      default: true
+      version: 8.0
+      shouldBeFCVGated: true
+
+    featureFlagVectorSearchPublicPreview:
+      description: "Feature flag to enable vector search for public preview."
+      cpp_varname: gFeatureFlagVectorSearchPublicPreview
+      default: true
+      shouldBeFCVGated: false
+
+    featureFlagSearchInSbe:
+      description: "Feature flag to enable $search execution in SBE"
+      cpp_varname: gFeatureFlagSearchInSbe
+      default: false
+      shouldBeFCVGated: false
+
+    featureFlagTimeSeriesInSbe:
+      description: "Feature flag to enable queries against time-series collections to execute in SBE"
+      cpp_varname: gFeatureFlagTimeSeriesInSbe
+      default: true
+      shouldBeFCVGated: false
+
+    featureFlagSbeBlockHashAgg:
+      description: "Feature flag to enable Block Hash Aggregation for TS queries SBE"
+      cpp_varname: gFeatureFlagSbeBlockHashAgg
+      default: true
+      shouldBeFCVGated: false
+
+    featureFlagClassicRuntimePlanningForSbe:
+      description: "Enables use of the classic engine's MultiPlanStage and SubplanStage to perform
+                    plan selection for queries that use SBE. When disabled, the SBE multi-planner
+                    and subplanner are used instead."
+      cpp_varname: gFeatureFlagClassicRuntimePlanningForSbe
+      default: true
+      shouldBeFCVGated: false
+
+    featureFlagBinDataConvert:
+      description: "Feature flag to enable BinData support in $convert."
+      cpp_varname: gFeatureFlagBinDataConvert
+      default: true
+      version: 8.0
+      shouldBeFCVGated: true
+
+    featureFlagSearchBatchSizeTuning:
+      description: "Feature flag to enable batchSize tuning for search queries."
+      cpp_varname: gFeatureFlagSearchBatcSizeTuning
+      default: false
+      shouldBeFCVGated: true

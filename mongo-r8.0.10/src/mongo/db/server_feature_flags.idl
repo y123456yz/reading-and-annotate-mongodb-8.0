@@ -1,0 +1,190 @@
+# Copyright (C) 2021-present MongoDB, Inc.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the Server Side Public License, version 1,
+# as published by MongoDB, Inc.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# Server Side Public License for more details.
+#
+# You should have received a copy of the Server Side Public License
+# along with this program. If not, see
+# <http://www.mongodb.com/licensing/server-side-public-license>.
+#
+# As a special exception, the copyright holders give permission to link the
+# code of portions of this program with the OpenSSL library under certain
+# conditions as described in each individual source file and distribute
+# linked combinations including the program with the OpenSSL library. You
+# must comply with the Server Side Public License in all respects for
+# all of the code used other than as permitted herein. If you modify file(s)
+# with this exception, you may extend this exception to your version of the
+# file(s), but you are not obligated to do so. If you do not wish to do so,
+# delete this exception statement from your version. If you delete this
+# exception statement from all source files in the program, then also delete
+# it in the license file.
+#
+
+global:
+    cpp_namespace: "mongo"
+
+feature_flags:
+    featureFlagSecurityToken:
+        description: "Enable parsing and handling of SecurityTokens in multitenancy mode"
+        cpp_varname: gFeatureFlagSecurityToken
+        default: false
+        shouldBeFCVGated: true
+    featureFlagGlobalIndexes:
+        description: "Enable support for global indexes"
+        cpp_varname: gFeatureFlagGlobalIndexes
+        default: false
+        shouldBeFCVGated: true
+    featureFlagAllowAdditionalParticipants:
+        description: "Enable adding additional participants to active transaction"
+        cpp_varname: gFeatureFlagAllowAdditionalParticipants
+        default: true
+        version: 8.0
+        shouldBeFCVGated: true
+    featureFlagBulkWriteCommand:
+        description: "Support for bulkWrite command and one-shot transactions"
+        cpp_varname: gFeatureFlagBulkWriteCommand
+        default: true
+        shouldBeFCVGated: false
+    featureFlagRecordIdsReplicated:
+        description: "Enable creating collections with the RecordIdsReplicated option."
+        cpp_varname: gFeatureFlagRecordIdsReplicated
+        default: false
+        shouldBeFCVGated: true
+    featureFlagAuditConfigClusterParameter:
+        description: "Enable use of new auditConfig cluster server parameter"
+        cpp_varname: feature_flags::gFeatureFlagAuditConfigClusterParameter
+        default: true
+        version: 7.1
+        shouldBeFCVGated: true
+    featureFlagOCSF:
+        description: "Provide an OCSF compatible output for audit logs"
+        cpp_varname: gFeatureFlagOCSF
+        default: true
+        shouldBeFCVGated: false
+    featureFlagStreams:
+        description: "Enable support for streams"
+        cpp_varname: gFeatureFlagStreams
+        default: false
+        shouldBeFCVGated: true
+    featureFlagUseUnreplicatedTruncatesForDeletions:
+        description: "Feature flag to enable pre-image collection and change collection maintenance
+        using unreplicated truncates instead of normal document deletions replicated from the
+        primary."
+        cpp_varname: feature_flags::gFeatureFlagUseUnreplicatedTruncatesForDeletions
+        default: true
+        shouldBeFCVGated: false
+    featureFlagEndOfTransactionChangeEvent:
+        description: "Feature flag to enable endOfTransaction oplog entry and change stream event"
+        cpp_varname: feature_flags::gFeatureFlagEndOfTransactionChangeEvent
+        default: false
+        shouldBeFCVGated: true
+    featureFlagAllMongodsAreSharded:
+        description: "Feature flag to enable and autobootstrap sharding for all mongods"
+        cpp_varname: gFeatureFlagAllMongodsAreSharded
+        default: false
+        shouldBeFCVGated: true
+    featureFlagShardKeyIndexOptionalHashedSharding:
+        description: "Feature flag to make a supporting shard key index for hashed sharding optional"
+        cpp_varname: gFeatureFlagShardKeyIndexOptionalHashedSharding
+        default: true
+        version: 7.0
+        shouldBeFCVGated: true
+    featureFlagBanEncryptionOptionsInCollectionCreation:
+        description: "Feature flag that bans encryption options from being used in createCollection
+        commands"
+        cpp_varname: gFeatureFlagBanEncryptionOptionsInCollectionCreation
+        default: true
+        version: 7.2
+        shouldBeFCVGated: true
+    featureFlagRearchitectUserAcquisition:
+        description: "Enable new flow for authentication and authorization"
+        cpp_varname: gFeatureFlagRearchitectUserAcquisition
+        default: false
+        shouldBeFCVGated: false
+    featureFlagOIDCInternalAuthorization:
+        description: "Feature flag gating OIDC authentication with internal authorization"
+        cpp_varname: gFeatureFlagOIDCInternalAuthorization
+        default: true
+        shouldBeFCVGated: false
+    featureFlagUseSorterChecksumV2:
+        description: "Feature flag to enable v2 version of sorter file checksum"
+        cpp_varname: gFeatureFlagUseSorterChecksumV2
+        default: true
+        version: 7.3
+        shouldBeFCVGated: true
+    featureFlagValidateAndDefaultValuesForShardedTimeseries:
+        description: "Feature flag to enable new durable metadata for the timeseries collection
+        create coordinator"
+        cpp_varname: gFeatureFlagValidateAndDefaultValuesForShardedTimeseries
+        default: true
+        version: 7.1
+        shouldBeFCVGated: true
+    featureFlagAutoCompact:
+        description: "Feature flag to execute background compaction"
+        cpp_varname: gFeatureFlagAutoCompact
+        default: true
+        shouldBeFCVGated: false
+    featureFlagCompactOptions:
+        description: "Feature flag to execute compaction with more options"
+        cpp_varname: gFeatureFlagCompactOptions
+        default: true
+        shouldBeFCVGated: false
+    featureFlagLogSlowOpsBasedOnTimeWorking:
+        description: "Feature flag to enable slow operation logging based on time working rather
+        than total latency"
+        cpp_varname: gFeatureFlagLogSlowOpsBasedOnTimeWorking
+        default: true
+        shouldBeFCVGated: false
+    featureFlagQERangeV2:
+        description: "Queryable Encryption Range V2"
+        cpp_varname: gFeatureFlagQERangeV2
+        default: true
+        version: 8.0
+        shouldBeFCVGated: true
+    featureFlagOnlineTransitionToSharded:
+        description: "Feature flag to transition a replica set into a one shard cluster (config shard)."
+        cpp_varname: gFeatureFlagOnlineTransitionToSharded
+        default: false
+        shouldBeFCVGated: true
+    # TODO SERVER-89999 remove once the version becomes last LTS
+    featureFlagDisallowBucketCollectionWithoutTimeseriesOptions:
+        description: "Disallow creation of timeseries bucket collection without timeseries options"
+        cpp_varname: gFeatureFlagDisallowBucketCollectionWithoutTimeseriesOptions
+        default: true
+        shouldBeFCVGated: true
+        version: 8.0
+    featureFlagPrefetch:
+        description: "Feature flag to make pre-fetching available"
+        cpp_varname: gFeatureFlagPrefetch
+        default: true
+        shouldBeFCVGated: false
+    featureFlagDefaultReadMaxTimeMS:
+        description: "Feature flag to allow setting a server-wide default maxTimeMS used for all
+        read operations"
+        cpp_varname: gFeatureFlagDefaultReadMaxTimeMS
+        default: true
+        version: 8.0
+        shouldBeFCVGated: true
+    featureFlagPeriodicServerParameterSampling:
+        description: "Feature flag to enable periodic FTDC sampling of server parameters"
+        cpp_varname: gFeatureFlagPeriodicServerParameterSampling
+        default: false
+        shouldBeFCVGated: false
+    featureFlagExposeClientIpInAuditLogs:
+         description: "Expose client IP in audit logs for load-balanced connections"
+         cpp_varname: gFeatureFlagExposeClientIpInAuditLogs
+         default: true
+         version: 8.0
+         shouldBeFCVGated: true
+    featureFlagMongodProxyProcolSupport:
+        description: "Enables non-OCS proxy protocol connections on Mongos and Mongod"
+        cpp_varname: gFeatureFlagMongodProxyProcolSupport
+        default: true
+        version: 8.0
+        shouldBeFCVGated: true

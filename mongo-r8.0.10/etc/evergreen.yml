@@ -1,0 +1,95 @@
+####################################################
+#                  YAML Conventions                 #
+#####################################################
+# Please see our conventions document at
+# https://wiki.corp.mongodb.com/pages/viewpage.action?pageId=133273894
+# for help navigating this document, or for help with our lint rules.
+
+
+#####################################################
+#               A note on expansions                #
+#####################################################
+
+# Expansions usually appear in the form ${key|default}
+# If 'key' is found in the executor's map of currently known
+# expansions, the corresponding value is used. If the key can
+# not be found, the default is used.
+#
+# Arbitrary expansions can be specified in the YAML configuration
+# files in the following places:
+# - The 'expansions' field for buildvariants (branch file)
+# - The 'expansions' field for distros (distros file)
+#
+# A number of 'built-in' expansions are also available for use; these include:
+# - environment variables available on the host machine
+# - 'workdir' (references the executor's work directory).
+# - 'task_id' (references the task id of the task the executor is working on).
+# - 'build_variant' (references the executing task's buildvariant).
+# - 'config_root' (references the root directory for the executor's configuration artifacts).
+
+
+#####################################################
+#          Setup environment in a new task          #
+#####################################################
+
+# There are several ways to setup the environment in your task.
+#
+# 1. If your task depends on 'archive_dist_test'/'archive_dist_test_debug' task you can call the function "do setup"
+# - func: "do setup"
+# Or alternatively call the functions in the sequence below, if you don't need everything else from "do setup"
+# - func: "fetch artifacts" (includes python, shell scripts, jstests etc. from the mongo and enterprise repos)
+# - func: "f_expansions_write"
+# - func: "kill processes"
+# - func: "cleanup environment"
+# - func: "set up venv"
+#
+# 2. If your task does not depend on 'archive_dist_test'/'archive_dist_test_debug' task use the following functions
+# call sequence
+# - command: manifest.load
+# - func: "git get project" (clone the entire mongo and enterprise repos)
+# - func: "f_expansions_write"
+# - func: "kill processes"
+# - func: "cleanup environment"
+# - func: "set up venv"
+
+include:
+- filename: etc/evergreen_yml_components/configuration.yml
+- filename: etc/evergreen_yml_components/definitions.yml
+
+- filename: etc/evergreen_yml_components/tasks/resmoke/server_divisions/clusters_and_integrations/tasks.yml
+- filename: etc/evergreen_yml_components/tasks/resmoke/server_divisions/durable_transactions_and_availability/tasks.yml
+- filename: etc/evergreen_yml_components/tasks/resmoke/server_divisions/query/tasks.yml
+- filename: etc/evergreen_yml_components/tasks/resmoke/non_server_teams/tasks.yml
+- filename: etc/evergreen_yml_components/tasks/compile_tasks.yml
+- filename: etc/evergreen_yml_components/tasks/misc_tasks.yml
+
+- filename: etc/evergreen_yml_components/variants/misc/task_generation.yml
+- filename: etc/evergreen_yml_components/variants/misc/misc.yml
+- filename: etc/evergreen_yml_components/variants/misc/misc_master_branch_only.yml
+
+- filename: etc/evergreen_yml_components/variants/amazon/test_dev.yml
+- filename: etc/evergreen_yml_components/variants/amazon/test_dev_master_branch_only.yml
+
+- filename: etc/evergreen_yml_components/variants/macos/test_dev_master_branch_only.yml
+
+- filename: etc/evergreen_yml_components/variants/rhel/test_dev.yml
+- filename: etc/evergreen_yml_components/variants/rhel/test_dev_master_and_lts_branches_only.yml
+- filename: etc/evergreen_yml_components/variants/mongot/test_dev.yml
+- filename: etc/evergreen_yml_components/variants/rhel/test_dev_master_branch_only.yml
+
+- filename: etc/evergreen_yml_components/variants/sanitizer/test_dev.yml
+- filename: etc/evergreen_yml_components/variants/sanitizer/test_dev_master_branch_only.yml
+
+- filename: etc/evergreen_yml_components/variants/ubuntu/test_dev_master_branch_only.yml
+
+- filename: etc/evergreen_yml_components/variants/windows/test_dev.yml
+- filename: etc/evergreen_yml_components/variants/windows/test_dev_master_and_lts_branches_only.yml
+- filename: etc/evergreen_yml_components/variants/windows/test_dev_master_branch_only.yml
+
+- filename: etc/evergreen_yml_components/variants/wiredtiger/test_dev_master_branch_only.yml
+
+
+parameters:
+- key: evergreen_config_file_path
+  value: "etc/evergreen.yml"
+  description: "path to this file"

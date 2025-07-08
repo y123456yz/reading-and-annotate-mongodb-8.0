@@ -1,0 +1,348 @@
+# TODO SERVER-84073 reenable the clustered config.transactions feature flag for all tests by
+# removing the nonClusteredConfigTransactions TestData variable from all overrides as well as all
+# instances of turning the clusteredConfigTransactions feature flag off across all nonmatrix tests.
+
+### Overrides for more than 1 suite ###
+- name: replica_fixture_last_lts_new_new_old
+  value:
+    executor:
+      fixture:
+        num_nodes: 3
+        old_bin_version: last_lts
+        mixed_bin_versions: new_new_old
+      config:
+        shell_options:
+          global_vars:
+            TestData:
+              nonClusteredConfigTransactions: true
+
+- name: replica_fixture_last_lts_new_old_new
+  value:
+    executor:
+      fixture:
+        num_nodes: 3
+        old_bin_version: last_lts
+        mixed_bin_versions: new_old_new
+      config:
+        shell_options:
+          global_vars:
+            TestData:
+              nonClusteredConfigTransactions: true
+
+- name: replica_fixture_last_lts_old_new_new
+  value:
+    executor:
+      fixture:
+        num_nodes: 3
+        old_bin_version: last_lts
+        mixed_bin_versions: old_new_new
+      config:
+        shell_options:
+          global_vars:
+            TestData:
+              nonClusteredConfigTransactions: true
+
+- name: replica_fixture_last_continuous_new_new_old
+  value:
+    executor:
+      fixture:
+        num_nodes: 3
+        old_bin_version: last_continuous
+        mixed_bin_versions: new_new_old
+      config:
+        shell_options:
+          global_vars:
+            TestData:
+              nonClusteredConfigTransactions: true
+
+- name: replica_fixture_last_continuous_new_old_new
+  value:
+    executor:
+      fixture:
+        num_nodes: 3
+        old_bin_version: last_continuous
+        mixed_bin_versions: new_old_new
+      config:
+        shell_options:
+          global_vars:
+            TestData:
+              nonClusteredConfigTransactions: true
+
+- name: replica_fixture_last_continuous_old_new_new
+  value:
+    executor:
+      fixture:
+        num_nodes: 3
+        old_bin_version: last_continuous
+        mixed_bin_versions: old_new_new
+      config:
+        shell_options:
+          global_vars:
+            TestData:
+              nonClusteredConfigTransactions: true
+
+- name: sharded_fixture_last_lts_new_old_old_new
+  value:
+    executor:
+      fixture:
+        num_shards: 2
+        num_rs_nodes_per_shard: 2
+        old_bin_version: last_lts
+        mixed_bin_versions: new_old_old_new
+      config:
+        shell_options:
+          global_vars:
+            TestData:
+              nonClusteredConfigTransactions: true
+
+- name: sharded_fixture_last_continuous_new_old_old_new
+  value:
+    executor:
+      fixture:
+        num_shards: 2
+        num_rs_nodes_per_shard: 2
+        old_bin_version: last_continuous
+        mixed_bin_versions: new_old_old_new
+      config:
+        shell_options:
+          global_vars:
+            TestData:
+              nonClusteredConfigTransactions: true
+
+
+### Suite-specific overrides ###
+- name: multiversion_future_git_tag_exclude_files
+  value:
+    selector:
+      exclude_files:
+        # Do not execute files with helper functions.
+        - jstests/multiVersion/libs/*.js
+
+        # TODO: SERVER-28104
+        - jstests/multiVersion/genericBinVersion/minor_version_tags_new_old_new.js
+
+        # TODO SERVER-42919: recent work on the ReplicaSetMonitor means that mongoS no longer crashes when
+        # it attempts to connect to an upgraded mongoD. Un-denylist when SERVER-42919 fixes this issue.
+        - jstests/multiVersion/genericSetFCVUsage/crash_mongos_against_upgraded_cluster.js
+      exclude_with_any_tags:
+        - DISABLED_TEMPORARILY_DUE_TO_FCV_UPGRADE
+    executor:
+      config:
+        shell_options:
+          global_vars:
+            TestData:
+              nonClusteredConfigTransactions: true
+
+- name: multiversion_auth_future_git_tag_exclude_files
+  value:
+    selector:
+      exclude_files:
+        # Do not execute files with helper functions.
+        - jstests/multiVersion/libs/*.js
+
+        # TODO: SERVER-28104
+        - jstests/multiVersion/genericBinVersion/minor_version_tags_new_old_new.js
+
+        # TODO SERVER-42919: recent work on the ReplicaSetMonitor means that mongoS no longer crashes when
+        # it attempts to connect to an upgraded mongoD. Un-denylist when SERVER-42919 fixes this issue.
+        - jstests/multiVersion/genericSetFCVUsage/crash_mongos_against_upgraded_cluster.js
+
+        # Skip any tests that run with auth explicitly.
+        - jstests/multiVersion/genericBinVersion/load_keys_on_upgrade.js
+        - jstests/multiVersion/targetedTestsLastLtsFeatures/oidc_multipurpose_idp.js
+      exclude_with_any_tags:
+        - DISABLED_TEMPORARILY_DUE_TO_FCV_UPGRADE
+    executor:
+      config:
+        shell_options:
+          global_vars:
+            TestData:
+              nonClusteredConfigTransactions: true
+
+- name: multiversion_sanity_check_selector
+  value:
+    selector:
+      include_with_any_tags:
+        - multiversion_sanity_check
+    executor:
+      config:
+        shell_options:
+          global_vars:
+            TestData:
+              nonClusteredConfigTransactions: true
+
+- name: replica_sets_multiversion_selector
+  value:
+    selector:
+      roots:
+        - jstests/replsets/*.js
+      exclude_with_any_tags:
+        - multiversion_incompatible
+        - backport_required_multiversion
+        - replica_sets_multiversion_backport_required_multiversion
+        - DISABLED_TEMPORARILY_DUE_TO_FCV_UPGRADE
+      exclude_files:
+        - jstests/replsets/initial_sync_rename_collection.js
+        - jstests/replsets/initial_sync_drop_collection.js
+        - jstests/replsets/apply_prepare_txn_write_conflict_robustness.js
+        - jstests/replsets/invalidate_sessions_on_stepdown.js
+        - jstests/replsets/initial_sync_fails_unclean_restart.js
+    executor:
+      config:
+        shell_options:
+          global_vars:
+            TestData:
+              nonClusteredConfigTransactions: true
+
+- name: replica_sets_multiversion_testdata_last_lts
+  value:
+    executor:
+      config:
+        shell_options:
+          global_vars:
+            TestData:
+              useRandomBinVersionsWithinReplicaSet: 'last-lts'
+              nonClusteredConfigTransactions: true
+
+- name: replica_sets_multiversion_testdata_last_continuous
+  value:
+    executor:
+      config:
+        shell_options:
+          global_vars:
+            TestData:
+              useRandomBinVersionsWithinReplicaSet: 'last-continuous'
+              nonClusteredConfigTransactions: true
+
+- name: rollback_multiversion_fuzzer_testdata_last_lts
+  value:
+    executor:
+      config:
+        shell_options:
+          global_vars:
+            TestData:
+              syncdelay: 5
+              logComponentVerbosity:
+                network:
+                  verbosity:
+                replication:
+                  verbosity: 1
+                storage:
+                  verbosity: 1
+              rollbackShutdowns: true
+              useRandomBinVersionsWithinReplicaSet: 'last-lts'
+              nonClusteredConfigTransactions: true
+
+- name: rollback_multiversion_fuzzer_testdata_last_continuous
+  value:
+    executor:
+      config:
+        shell_options:
+          global_vars:
+            TestData:
+              syncdelay: 5
+              logComponentVerbosity:
+                network:
+                  verbosity:
+                replication:
+                  verbosity: 1
+                storage:
+                  verbosity: 1
+              rollbackShutdowns: true
+              useRandomBinVersionsWithinReplicaSet: 'last-continuous'
+              nonClusteredConfigTransactions: true
+
+- name: sharding_multiversion_selector
+  value:
+    selector:
+      exclude_with_any_tags:
+        - multiversion_incompatible
+        - backport_required_multiversion
+        - replica_sets_multiversion_backport_required_multiversion
+        - DISABLED_TEMPORARILY_DUE_TO_FCV_UPGRADE
+      exclude_files:
+        - jstests/sharding/**/libs/**/*.js
+        # Enable when 4.6 becomes last stable
+        - jstests/sharding/query/merge_command_options.js
+        - jstests/sharding/max_time_ms_enforced_on_shard.js
+        # TODO SERVER-46040: Enable when SERVER-46040 is backported
+        - jstests/sharding/drop_indexes_with_stale_config_error.js
+        - jstests/sharding/query/merge_write_concern.js
+    executor:
+      config:
+        shell_options:
+          global_vars:
+            TestData:
+              nonClusteredConfigTransactions: true
+
+- name: sharding_multiversion_testdata_last_lts
+  value:
+    executor:
+      config:
+        shell_options:
+          global_vars:
+            TestData:
+              useRandomBinVersionsWithinReplicaSet: 'last-lts'
+              mongosBinVersion: 'last-lts'
+              nonClusteredConfigTransactions: true
+
+- name: sharding_multiversion_testdata_last_continuous
+  value:
+    executor:
+      config:
+        shell_options:
+          global_vars:
+            TestData:
+              useRandomBinVersionsWithinReplicaSet: 'last-continuous'
+              mongosBinVersion: 'last-continuous'
+
+- name: jstestfuzz_replication_multiversion_hooks
+  value:
+    executor:
+      hooks:
+        - class: FuzzerRestoreSettings
+        - class: LagOplogApplicationInBackground
+          shell_options:
+            nodb: ""
+        - class: CheckReplOplogs
+        - class: CheckReplDBHash
+          shell_options:
+            global_vars:
+              TestData:
+                skipValidationOnInvalidViewDefinitions: true
+        - class: ValidateCollections
+          shell_options:
+            global_vars:
+              TestData:
+                skipValidationOnInvalidViewDefinitions: true
+      config:
+        shell_options:
+          global_vars:
+            TestData:
+              nonClusteredConfigTransactions: true
+
+- name: jstestfuzz_sharded_multiversion_hooks
+  value:
+    executor:
+      hooks:
+        - class: CheckRoutingTableConsistency
+          shell_options:
+            global_vars:
+              TestData:
+                mayForgeReshardingTempCollections: true
+        - class: FuzzerRestoreSettings
+        - class: CheckReplDBHash
+          shell_options:
+            global_vars:
+              TestData:
+                skipValidationOnInvalidViewDefinitions: true
+        - class: ValidateCollections
+          shell_options:
+            global_vars:
+              TestData:
+                skipValidationOnInvalidViewDefinitions: true
+      config:
+        shell_options:
+          global_vars:
+            TestData:
+              nonClusteredConfigTransactions: true

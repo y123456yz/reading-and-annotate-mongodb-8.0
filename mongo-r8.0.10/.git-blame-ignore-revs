@@ -1,0 +1,38 @@
+# SERVER-72197 Clang format v12.0.1
+f63255ee677ecae5896d6f35dd712ed60ae8c39a
+
+# SERVER-66490 Apply pylinters to build system code
+9ea1d6f0419938770eea612479c75838f75752b7
+
+# SERVER-41772 Clang format v7.0.1
+134a4083953270e8a11430395357fb70a29047ad
+
+# SERVER-23971 Clang-Format code
+6dcdd23dd37ef12c87e71cf59ef01cd82432efe0
+
+# SERVER-22470 Format JS code with approved style
+f5a6c794a0af1a5d57db2617c2e9464eaad9f221
+
+# SERVER-22469 Format JS code with approved style in src/mongo/shell & src/mongo/scripting
+a025d43f3ce2efc1fb1282a718f5d286fa0a4dc1
+
+# SERVER-22340 Fix JS lint errors in src/mongo/shell & src/mongo/scripting with ESLint --fix
+c3996780b76316793758b43fa1fca5b9d0857b6c
+
+# SERVER-18579: Clang-Format - reformat code
+9c2ed42daa8fbbef4a919c21ec564e2db55e8d60
+
+# SERVER-79735 Convert jstest corpus to use es modules
+a4f458fe4d7a44eba056f5c150753e73067c8e4d
+
+# SERVER-78551 Migrate analyze_plan library to module
+1e98a0f23d62eb1f149658d190f0285879d91db5
+
+# SERVER-78419 Convert FSM to load workloads as modules
+1ce8128b8b286c2500ed8fdf6f7f18382b2cdd14
+
+# SERVER-74787 Prepare jstest corpus for implicit strict mode
+43b87324302209cbfa240d6c6b520007669e4ea6
+
+# SERVER-87034 Initally formatted all markdown using prettier
+64e388007ec1ac3744537253540995af628bcc00

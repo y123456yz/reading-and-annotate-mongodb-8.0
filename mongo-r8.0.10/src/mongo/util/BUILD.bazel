@@ -1,0 +1,20 @@
+load("//bazel:mongo_src_rules.bzl", "mongo_cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "exit_code",
+    srcs = [
+        "exit_code.h",
+    ],
+)
+
+mongo_cc_library(
+    name = "boost_assert_shim",
+    srcs = [
+        "boost_assert_shim.cpp",
+    ],
+    hdrs = [
+        "boost_assert_shim.h",
+    ],
+)

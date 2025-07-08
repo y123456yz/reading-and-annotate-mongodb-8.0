@@ -1,0 +1,8 @@
+{
+    "replication": {
+        "replSetName": "dummy"
+    },
+    "net": {
+        "routerPort": 27016
+    }
+}

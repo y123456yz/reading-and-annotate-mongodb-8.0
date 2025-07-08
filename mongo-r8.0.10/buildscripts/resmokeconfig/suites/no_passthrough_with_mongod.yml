@@ -1,0 +1,25 @@
+test_kind: js_test
+
+selector:
+  roots:
+  - jstests/noPassthroughWithMongod/*.js
+
+executor:
+  archive:
+    hooks:
+      - ValidateCollections
+  config: {}
+  hooks:
+  - class: ValidateCollections
+    shell_options:
+      global_vars:
+        TestData:
+          # Tests in this suite modify the bucket version manually to test validation.
+          skipEnforceTimeseriesBucketsAreAlwaysCompressedOnValidate: true
+  - class: CleanEveryN
+    n: 20
+  fixture:
+    class: MongoDFixture
+    mongod_options:
+      set_parameters:
+        enableTestCommands: 1

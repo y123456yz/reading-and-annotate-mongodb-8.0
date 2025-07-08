@@ -1,0 +1,418 @@
+/**
+ * Tests that the queryExecutor stats are correctly returned when $lookup is performed on
+ * foreign collection.
+ *
+ * @tags: [
+ *     # Should not run on sharded suites due to use of serverStatus()
+ *     assumes_unsharded_collection,
+ *     assumes_no_implicit_collection_creation_after_drop,
+ *     do_not_wrap_aggregations_in_facets,
+ *     assumes_read_preference_unchanged,
+ *     assumes_read_concern_unchanged,
+ *     assumes_against_mongod_not_mongos,
+ *     does_not_support_repeated_reads,
+ *     requires_pipeline_optimization
+ * ]
+ */
+import {getAggPlanStages} from "jstests/libs/analyze_plan.js";
+import {
+    getQueryInfoAtTopLevelOrFirstStage,
+    getSbePlanStages
+} from "jstests/libs/sbe_explain_helpers.js";
+import {checkSbeFullyEnabled, checkSbeRestrictedOrFullyEnabled} from "jstests/libs/sbe_util.js";
+
+const isSBEFullyEnabled = checkSbeFullyEnabled(db);
+const isSBELookupEnabled = checkSbeRestrictedOrFullyEnabled(db);
+const testDB = db.getSiblingDB("lookup_query_stats");
+testDB.dropDatabase();
+
+const localColl = testDB.getCollection("local");
+const fromColl = testDB.getCollection("foreign");
+const foreignDocCount = 10;
+const localDocCount = 2;
+
+const kExecutionStats = "executionStats";
+const kAllPlansExecution = "allPlansExecution";
+const kQueryPlanner = "queryPlanner";
+
+// Keeps track of the last query execution stats.
+let lastScannedObjects = 0;
+let lastScannedKeys = 0;
+
+let insertDocumentToCollection = function(collection, docCount, fieldName) {
+    const bulk = collection.initializeUnorderedBulkOp();
+    for (let i = 0; i < docCount; i++) {
+        let doc = {_id: i};
+        doc[fieldName] = i;
+        bulk.insert(doc);
+    }
+    assert.commandWorked(bulk.execute());
+};
+
+let aggregationLookupPipeline = function(localColl, fromColl, allowDiskUse, withUnwind) {
+    const lookupStage =         {
+            $lookup: {
+                from: fromColl.getName(),
+                localField: "localField",
+                foreignField: "foreignField",
+                as: "output"
+            }
+        };
+    const sortStage = {$sort: {localField: 1}};
+    const pipeline = withUnwind ? [lookupStage, {$unwind: {path: '$output'}}, sortStage]
+                                : [lookupStage, sortStage];
+    return localColl.aggregate(pipeline, allowDiskUse);
+};
+
+let doAggregationLookup = function(localColl, fromColl, allowDiskUse, withUnwind) {
+    return aggregationLookupPipeline(localColl, fromColl, allowDiskUse, withUnwind).toArray();
+};
+
+let explainAggregationLookup = function(
+    localColl, fromColl, verbosityLevel, allowDiskUse, withUnwind) {
+    return aggregationLookupPipeline(
+        localColl.explain(verbosityLevel), fromColl, allowDiskUse, withUnwind);
+};
+
+let getCurrentQueryExecutorStats = function() {
+    let queryExecutor = testDB.serverStatus().metrics.queryExecutor;
+
+    let curScannedObjects = queryExecutor.scannedObjects - lastScannedObjects;
+    let curScannedKeys = queryExecutor.scanned - lastScannedKeys;
+
+    lastScannedObjects = queryExecutor.scannedObjects;
+    lastScannedKeys = queryExecutor.scanned;
+
+    return [curScannedObjects, curScannedKeys];
+};
+
+let checkExplainOutputForVerLevel = function(
+    explainOutput, expected, verbosityLevel, expectedQueryPlan, withUnwind) {
+    // Only make SBE specific assertions when we know that our $lookup has been pushed down.
+    if (isSBEFullyEnabled || (isSBELookupEnabled && !withUnwind)) {
+        // If the SBE lookup is enabled, the "$lookup" stage is pushed down to the SBE and it's
+        // not visible in 'stages' field of the explain output. Instead, 'queryPlan.stage' must be
+        // "EQ_LOOKUP" or "EQ_LOOKUP_UNWIND".
+        let lkpStages = getAggPlanStages(explainOutput, "EQ_LOOKUP", true);
+        if (lkpStages.length == 0) {
+            lkpStages = getAggPlanStages(explainOutput, "EQ_LOOKUP_UNWIND", true);
+        }
+        assert.eq(lkpStages.length, 1, lkpStages);
+        const lkpStage = lkpStages[0];
+
+        const queryInfo = getQueryInfoAtTopLevelOrFirstStage(explainOutput);
+        const planner = queryInfo.queryPlanner;
+        assert(planner.hasOwnProperty("winningPlan") &&
+                   planner.winningPlan.hasOwnProperty("queryPlan"),
+               explainOutput);
+        const plan = planner.winningPlan.queryPlan;
+
+        assert(lkpStage.hasOwnProperty("stage"), lkpStage);
+        assert(lkpStage.stage == "EQ_LOOKUP" || lkpStage.stage == "EQ_LOOKUP_UNWIND", lkpStage);
+        assert(expectedQueryPlan.hasOwnProperty("strategy"), expectedQueryPlan);
+        assert(
+            lkpStage.hasOwnProperty("strategy") && lkpStage.strategy == expectedQueryPlan.strategy,
+            lkpStage);
+        if (expectedQueryPlan.strategy == "IndexedLoopJoin") {
+            assert(lkpStage.hasOwnProperty("indexName"), lkpStage);
+            assert.eq(lkpStage.indexName, expectedQueryPlan.indexName);
+        }
+
+        const expectedTopLevelJoinStage =
+            expectedQueryPlan.strategy == "HashJoin" ? "hash_lookup" : "nlj";
+
+        const sbeNljStages = getSbePlanStages(explainOutput, expectedTopLevelJoinStage);
+        if (verbosityLevel && verbosityLevel !== kQueryPlanner) {
+            assert.gt(sbeNljStages.length, 0, explainOutput);
+            const topNljStage = sbeNljStages[0];
+
+            assert(topNljStage.hasOwnProperty("totalDocsExamined"), explainOutput);
+            assert.eq(topNljStage.totalDocsExamined, expected.totalDocsExamined, explainOutput);
+            assert(topNljStage.hasOwnProperty("totalKeysExamined"), explainOutput);
+            assert.eq(topNljStage.totalKeysExamined, expected.totalKeysExamined, explainOutput);
+
+            assert(topNljStage.hasOwnProperty("collectionScans"), explainOutput);
+            assert.eq(topNljStage.collectionScans, expected.collectionScans, explainOutput);
+            assert(topNljStage.hasOwnProperty("collectionSeeks"), explainOutput);
+            assert.eq(topNljStage.collectionSeeks, expected.collectionSeeks, explainOutput);
+            assert(topNljStage.hasOwnProperty("indexScans"), explainOutput);
+            assert.eq(topNljStage.indexScans, expected.indexScans, explainOutput);
+            assert(topNljStage.hasOwnProperty("indexSeeks"), explainOutput);
+            assert.eq(topNljStage.indexSeeks, expected.indexSeeks, explainOutput);
+            assert(topNljStage.hasOwnProperty("indexesUsed"), explainOutput);
+            assert(Array.isArray(topNljStage.indexesUsed), explainOutput);
+            assert.eq(topNljStage.indexesUsed, expected.indexesUsed, explainOutput);
+        } else {  // If no `verbosityLevel` is passed or 'queryPlanner' is passed.
+            assert(!plan.hasOwnProperty("executionStats"), explainOutput);
+            assert.eq(sbeNljStages.length, 0, explainOutput);
+        }
+    } else {
+        const lkpStages = getAggPlanStages(explainOutput, "$lookup");
+        assert.eq(lkpStages.length, 1, lkpStages);
+        const lkpStage = lkpStages[0];
+        assert.eq(
+            lkpStage.hasOwnProperty("$lookup") && lkpStage.$lookup.hasOwnProperty("unwinding"),
+            withUnwind,
+            lkpStage);
+        if (verbosityLevel && verbosityLevel !== kQueryPlanner) {
+            assert(lkpStage.hasOwnProperty("totalDocsExamined"), lkpStage);
+            assert.eq(lkpStage.totalDocsExamined, expected.totalDocsExamined, lkpStage);
+            assert(lkpStage.hasOwnProperty("totalKeysExamined"), lkpStage);
+            assert.eq(lkpStage.totalKeysExamined, expected.totalKeysExamined, lkpStage);
+            assert(lkpStage.hasOwnProperty("collectionScans"), lkpStage);
+            assert.eq(lkpStage.collectionScans, expected.collectionScans, lkpStage);
+            assert(lkpStage.hasOwnProperty("indexesUsed"), lkpStage);
+            assert(Array.isArray(lkpStage.indexesUsed), lkpStage);
+            assert.eq(lkpStage.indexesUsed, expected.indexesUsed, lkpStage);
+        } else {  // If no `verbosityLevel` is passed or 'queryPlanner' is passed.
+            assert(!lkpStage.hasOwnProperty("totalDocsExamined"), lkpStage);
+            assert(!lkpStage.hasOwnProperty("totalKeysExamined"), lkpStage);
+            assert(!lkpStage.hasOwnProperty("collectionScans"), lkpStage);
+            assert(!lkpStage.hasOwnProperty("indexesUsed"), lkpStage);
+        }
+    }
+};
+
+let checkExplainOutputForAllVerbosityLevels = function(
+    localColl, fromColl, expectedExplainResult, allowDiskUse, withUnwind, expectedQueryPlan = {}) {
+    // The `explain` verbosity level: 'allPlansExecution'.
+    let explainAllPlansOutput =
+        explainAggregationLookup(localColl, fromColl, kAllPlansExecution, allowDiskUse, withUnwind);
+    checkExplainOutputForVerLevel(explainAllPlansOutput,
+                                  expectedExplainResult,
+                                  kAllPlansExecution,
+                                  expectedQueryPlan,
+                                  withUnwind);
+
+    // The `explain` verbosity level: 'executionStats'.
+    let explainExecStatsOutput =
+        explainAggregationLookup(localColl, fromColl, kExecutionStats, allowDiskUse, withUnwind);
+    checkExplainOutputForVerLevel(explainExecStatsOutput,
+                                  expectedExplainResult,
+                                  kExecutionStats,
+                                  expectedQueryPlan,
+                                  withUnwind);
+
+    // The `explain` verbosity level: 'queryPlanner'.
+    let explainQueryPlannerOutput =
+        explainAggregationLookup(localColl, fromColl, kQueryPlanner, allowDiskUse, withUnwind);
+    checkExplainOutputForVerLevel(explainQueryPlannerOutput,
+                                  expectedExplainResult,
+                                  kQueryPlanner,
+                                  expectedQueryPlan,
+                                  withUnwind);
+
+    // The `explain` verbosity level is not passed.
+    let explainOutput = explainAggregationLookup(localColl, fromColl, {}, allowDiskUse, withUnwind);
+    checkExplainOutputForVerLevel(
+        explainOutput, expectedExplainResult, {}, expectedQueryPlan, withUnwind);
+};
+
+let testQueryExecutorStatsWithCollectionScan = function(params) {
+    let output = doAggregationLookup(localColl, fromColl, {allowDiskUse: false}, params.withUnwind);
+
+    let expectedOutput = params.withUnwind ? [
+        {_id: 0, localField: 0, output: {_id: 0, foreignField: 0}},
+        {_id: 1, localField: 1, output: {_id: 1, foreignField: 1}},
+    ]
+    : [
+        {_id: 0, localField: 0, output: [{_id: 0, foreignField: 0}]},
+        {_id: 1, localField: 1, output: [{_id: 1, foreignField: 1}]}
+    ];
+
+    assert.eq(output, expectedOutput);
+
+    let [curScannedObjects, curScannedKeys] = getCurrentQueryExecutorStats();
+
+    // For collection scan, total scannedObjects should be sum of
+    // (total documents in local collection +
+    //  total documents in local collection * total documents in foreign collection)
+    assert.eq(localDocCount + localDocCount * foreignDocCount, curScannedObjects);
+
+    // There is no index in the collection.
+    assert.eq(0, curScannedKeys);
+
+    if (isSBEFullyEnabled || (isSBELookupEnabled && !params.withUnwind)) {
+        checkExplainOutputForAllVerbosityLevels(
+            localColl,
+            fromColl,
+            {
+                // When the SBE lookup is enabled, the execution stats can capture all the scanning
+                // objects. So, totalDocsExmained must be same as
+                // (total documents in local collection +
+                //  total documents in local collection * total documents in foreign collection)
+                // In this case: two documents in the local collection + one iteration over the
+                // foreign collection for each document in the local collection (i.e., 2*10) = 22.
+                totalDocsExamined: 2 + 2 * 10,
+                totalKeysExamined: 0,
+                // one scan over the local collection + one scan over the foreign collection for
+                // each document in the local collection = 3.
+                collectionScans: 1 + 2,
+                collectionSeeks: 0,
+                indexScans: 0,
+                indexSeeks: 0,
+                indexesUsed: []
+            },
+            {allowDiskUse: false},
+            params.withUnwind,
+            {strategy: "NestedLoopJoin"});
+    } else {
+        checkExplainOutputForAllVerbosityLevels(
+            localColl,
+            fromColl,
+            {
+                totalDocsExamined: localDocCount * foreignDocCount,
+                totalKeysExamined: 0,
+                collectionScans: localDocCount,
+                indexesUsed: []
+            },
+            {allowDiskUse: false},
+            params.withUnwind);
+    }
+};
+
+let testQueryExecutorStatsWithHashLookup = function() {
+    // "HashJoin" is available only in the SBE lookup.
+    if (!isSBELookupEnabled) {
+        return;
+    }
+
+    // SBE HashJoin doesn't $unwind internally.
+    const withUnwind = false;
+
+    let output = doAggregationLookup(localColl, fromColl, {allowDiskUse: true}, withUnwind);
+
+    let expectedOutput = [
+        {_id: 0, localField: 0, output: [{_id: 0, foreignField: 0}]},
+        {_id: 1, localField: 1, output: [{_id: 1, foreignField: 1}]}
+    ];
+
+    assert.eq(output, expectedOutput);
+
+    let [curScannedObjects, curScannedKeys] = getCurrentQueryExecutorStats();
+
+    // For collection scan, total scannedObjects should be sum of
+    // (total documents in local collection + total documents in foreign collection)
+    assert.eq(localDocCount + foreignDocCount, curScannedObjects);
+
+    // There is no index in the collection.
+    assert.eq(0, curScannedKeys);
+
+    checkExplainOutputForAllVerbosityLevels(
+        localColl,
+        fromColl,
+        {
+            // When the SBE lookup is enabled, the execution stats can capture all the scanning
+            // objects. So, totalDocsExmained must be same as
+            // (total documents in local collection + total documents in foreign collection).
+            // In this case, we scan the foreign collection once (10 docs) to create the hash-table
+            // and then scan the local collection (2 docs) once to check each document in the built
+            // hash-table = 12.
+            totalDocsExamined: 10 + 2,
+            totalKeysExamined: 0,
+            // scan the foreign collection once to create the hash-table and then scan the local
+            // collection once to check each document in the built hash-table = 2.
+            collectionScans: 1 + 1,
+            collectionSeeks: 0,
+            indexScans: 0,
+            indexSeeks: 0,
+            indexesUsed: []
+        },
+        {allowDiskUse: true},
+        withUnwind,
+        {strategy: "HashJoin"});
+};
+
+let createIndexForCollection = function(collection, fieldName) {
+    let request = {};
+    request[fieldName] = 1;
+    assert.commandWorked(collection.createIndex(request));
+};
+
+let testQueryExecutorStatsWithIndexScan = function(params) {
+    createIndexForCollection(fromColl, "foreignField");
+
+    let output = doAggregationLookup(localColl, fromColl, {allowDiskUse: false}, params.withUnwind);
+
+    let expectedOutput = params.withUnwind ? [
+        {_id: 0, localField: 0, output: {_id: 0, foreignField: 0}},
+        {_id: 1, localField: 1, output: {_id: 1, foreignField: 1}},
+    ]
+    : [
+        {_id: 0, localField: 0, output: [{_id: 0, foreignField: 0}]},
+        {_id: 1, localField: 1, output: [{_id: 1, foreignField: 1}]}
+    ];
+
+    assert.eq(output, expectedOutput);
+
+    let [curScannedObjects, curScannedKeys] = getCurrentQueryExecutorStats();
+
+    // For index scan, total scannedObjects should be sum of
+    // (total documents in local collection + total matched documents in foreign collection)
+    assert.eq(localDocCount + localDocCount, curScannedObjects);
+
+    // Number of keys scanned in the foreign collection should be equal number of keys in local
+    // collection.
+    assert.eq(localDocCount, curScannedKeys);
+
+    if (isSBEFullyEnabled || (isSBELookupEnabled && !params.withUnwind)) {
+        checkExplainOutputForAllVerbosityLevels(
+            localColl,
+            fromColl,
+            {
+                // When the SBE lookup is enabled, the execution stats can capture all the scanning
+                // objects. So, totalDocsExmained must be same as
+                // (total docs in local collection + total matched docs in foreign collection)
+                totalDocsExamined: 2 + 2,
+                // One index seek is done per each document in the local collection and one key is
+                // examined per seek = 2.
+                totalKeysExamined: 2,
+                // The local collection get scanned = 1.
+                collectionScans: 1,
+                // For each examined key that matches in the index scan stage, a seek on foreign
+                // collection is done to acquire the corresponding document in the foreign
+                // collection = 2.
+                collectionSeeks: 2,
+                indexScans: 0,
+                // One index seek is done per each document in the local collection = 2
+                indexSeeks: 2,
+                indexesUsed: ["foreignField_1"]
+            },
+            {allowDiskUse: false},
+            params.withUnwind,
+            {strategy: "IndexedLoopJoin", indexName: "foreignField_1"});
+    } else {
+        checkExplainOutputForAllVerbosityLevels(localColl,
+                                                fromColl,
+                                                {
+                                                    totalDocsExamined: 2,
+                                                    totalKeysExamined: 2,
+                                                    collectionScans: 0,
+                                                    indexesUsed: ["foreignField_1"]
+                                                },
+                                                {allowDiskUse: false},
+                                                params.withUnwind);
+    }
+
+    assert.commandWorked(fromColl.dropIndex({foreignField: 1}));
+};
+
+insertDocumentToCollection(fromColl, foreignDocCount, "foreignField");
+insertDocumentToCollection(localColl, localDocCount, "localField");
+
+// This test might be called over an existing MongoD instance. We should populate
+// lastScannedObjects and lastScannedKeys with existing stats values in that case.
+getCurrentQueryExecutorStats();
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// TESTS
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+testQueryExecutorStatsWithCollectionScan({withUnwind: false});
+testQueryExecutorStatsWithHashLookup();
+testQueryExecutorStatsWithIndexScan({withUnwind: false});
+
+// Now test $lookup including an $unwind of the output field. This should result in the unwind
+// taking place within the lookup stage.
+testQueryExecutorStatsWithCollectionScan({withUnwind: true});
+testQueryExecutorStatsWithIndexScan({withUnwind: true});

@@ -1,0 +1,81 @@
+{
+	"folders": [
+		{
+			"path": ".."
+		}
+	],
+	"settings": {
+		"clangd.arguments": [
+			"--query-driver=/opt/mongodbtoolchain/v4/bin/*",
+			"--header-insertion=never",
+			"-j=4"
+		],
+		"clangd.checkUpdates": true,
+		"clang-format.executable": "/opt/mongodbtoolchain/v4/bin/clang-format",
+		"clang-tidy.executable": "buildscripts/clang_tidy_vscode.py",
+		"editor.codeActionsOnSave": {
+			"source.fixAll.eslint": "explicit"
+		},
+		"eslint.validate": [
+			"javascript"
+		],
+		"files.associations": {
+			"SConstruct": "python",
+			"SConscript": "python",
+			"*.idl": "yaml",
+		},
+		"files.insertFinalNewline": true,
+		"js/ts.implicitProjectConfig.target": "ES2020",
+		"pylint.path": [
+			"${interpreter}",
+			"-m",
+			"pylint"
+		],
+		"python.autoComplete.extraPaths": [
+			"/opt/mongodbtoolchain/v4/share/gcc-11.3.0/python",
+			"src/third_party/scons-3.1.2/scons-local-3.1.2"
+		],
+		"python.defaultInterpreterPath": "python3-venv/bin/python",
+		"python.analysis.extraPaths": [
+			"/opt/mongodbtoolchain/v4/share/gcc-11.3.0/python",
+			"src/third_party/scons-3.1.2/scons-local-3.1.2"
+		],
+		"mypy-type-checker.path": [
+			"${interpreter}",
+			"-m",
+			"mypy"
+		],
+		"mypy-type-checker.importStrategy": "fromEnvironment",
+		"editor.defaultFormatter": "esbenp.prettier-vscode",
+		"[c]": {
+			"editor.defaultFormatter": "xaver.clang-format",
+			"editor.formatOnSave": true,
+		},
+		"[cpp]": {
+			"editor.defaultFormatter": "xaver.clang-format",
+			"editor.formatOnSave": true,
+		},
+		"[javascript]": {
+			"editor.defaultFormatter": "xaver.clang-format",
+			"editor.formatOnSave": true,
+		},
+		"[python]": {
+			"editor.formatOnSaveMode": "file",
+			"editor.formatOnSave": true,
+			"editor.defaultFormatter": "eeyore.yapf"
+		},
+	},
+	"extensions": {
+		"recommendations": [
+			"llvm-vs-code-extensions.vscode-clangd",
+			"dbaeumer.vscode-eslint",
+			"ms-python.python",
+			"xaver.clang-format",
+			"cs128.cs128-clang-tidy",
+			"eeyore.yapf",
+			"ms-python.pylint",
+			"ms-python.mypy-type-checker",
+			"esbenp.prettier-vscode"
+		]
+	}
+}
