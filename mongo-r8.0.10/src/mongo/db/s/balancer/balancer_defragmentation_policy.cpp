@@ -1268,6 +1268,7 @@ private:
 
 }  // namespace
 
+//也就是config.collections中对应的defragmentCollection配置   defragmentCollection 字段用于告诉 Balancer 对指定集合进行碎片整理，优化 chunk 的分布和大小，从而提升分片集群的健康和性能。
 void BalancerDefragmentationPolicy::startCollectionDefragmentations(OperationContext* opCtx) {
     stdx::lock_guard<Latch> lk(_stateMutex);
 

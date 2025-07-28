@@ -301,6 +301,7 @@ void PageHeap::Delete(Span* span) {
   ASSERT(span->length > 0);
   ASSERT(GetDescriptor(span->start) == span);
   ASSERT(GetDescriptor(span->start + span->length - 1) == span);
+  //span->length 表示当前被释放的 span（内存块）所包含的页（page）数。
   const Length n = span->length;
   span->sizeclass = 0;
   span->sample = 0;
@@ -336,6 +337,7 @@ Span* PageHeap::CheckAndHandlePreMerge(Span* span, Span* other) {
   return other;
 }
 
+//尝试与前后相邻的空闲 span 合并，减少外部碎片。
 void PageHeap::MergeIntoFreeList(Span* span) {
   ASSERT(span->location != Span::IN_USE);
 
@@ -434,6 +436,8 @@ void PageHeap::RemoveFromFreeList(Span* span) {
   }
 }
 
+//IncrementalScavenge 主要在 PageHeap::Delete 函数中被调用。也就是说，每当有一个 span（大块页内存）被
+// 释放（即调用 Delete，通常是内存归还到 PageHeap 的时候），就会触发一次 IncrementalScavenge
 void PageHeap::IncrementalScavenge(Length n) {
   // Fast path; not yet time to release memory
   scavenge_counter_ -= n;
@@ -457,6 +461,7 @@ void PageHeap::IncrementalScavenge(Length n) {
     // Compute how long to wait until we return memory.
     // FLAGS_tcmalloc_release_rate==1 means wait for 1000 pages
     // after releasing one page.
+    //如果本次释放了 released_pages 页，则下次释放的延迟为 1000.0 / rate * released_pages。例如，rate=1，释放1页，下次延迟1000；rate=10，释放1页，下次延迟100。
     const double mult = 1000.0 / rate;
     double wait = mult * static_cast<double>(released_pages);
     if (wait > kMaxReleaseDelay) {

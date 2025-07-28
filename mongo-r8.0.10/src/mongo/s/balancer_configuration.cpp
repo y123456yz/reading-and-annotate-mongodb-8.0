@@ -235,6 +235,11 @@ bool BalancerConfiguration::attemptToBalanceJumboChunks() const {
     return _balancerSettings.attemptToBalanceJumboChunks();
 }
 
+/*
+从 config server 的配置表（如 config.settings）中拉取最新的 balancer 相关配置（如是否启用均衡、迁移阈值、throttle 策略等）。
+检查这些配置是否合法、可用。
+如果配置拉取或校验失败，返回错误，balancer 本轮会跳过或重试，保证只有在配置有效时才进行 chunk 迁移。
+*/
 Status BalancerConfiguration::refreshAndCheck(OperationContext* opCtx) {
     try {
         Lock::ExclusiveLock settingsRefreshLock(opCtx, _settingsRefreshMutex);

@@ -234,6 +234,7 @@ public:
         };
     }
 
+    //GetNumericProperty 中获取对应的值
     std::vector<StringData> getTCMallocStatNames() const override {
         return {
             "pageheap_free_bytes"_sd,

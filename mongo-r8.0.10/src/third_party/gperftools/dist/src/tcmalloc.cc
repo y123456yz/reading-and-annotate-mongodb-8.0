@@ -346,6 +346,14 @@ size_t InvalidGetAllocatedSize(const void* ptr) {
 }
 }  // unnamed namespace
 
+/*
+MALLOC:     8534472672 ( 8139.1 MiB) Bytes in use by application
+MALLOC: +   1712087040 ( 1632.8 MiB) Bytes in page heap freelist
+MALLOC: +    241422744 (  230.2 MiB) Bytes in central cache freelist
+MALLOC: +         9216 (    0.0 MiB) Bytes in transfer cache freelist
+MALLOC: +      3588744 (    3.4 MiB) Bytes in thread cache freelists
+MALLOC: +     54001664 (   51.5 MiB) Bytes in malloc metadata
+*/
 // Extract interesting stats
 struct TCMallocStats {
   uint64_t thread_bytes;      // Bytes in thread caches
@@ -359,6 +367,7 @@ struct TCMallocStats {
 // will be set to the total number of objects of size class k in the
 // central cache, transfer cache, and per-thread caches. If small_spans
 // is non-NULL, it is filled.  Same for large_spans.
+//mongodb appendHighVerbosityMetrics->SizeClasses
 static void ExtractStats(TCMallocStats* r, uint64_t* class_count,
                          PageHeap::SmallSpanStats* small_spans,
                          PageHeap::LargeSpanStats* large_spans) {
@@ -366,15 +375,20 @@ static void ExtractStats(TCMallocStats* r, uint64_t* class_count,
   r->transfer_bytes = 0;
   for (int cl = 0; cl < Static::num_size_classes(); ++cl) {
     const int length = Static::central_cache()[cl].length();
+    //也就是trasfer cache
     const int tc_length = Static::central_cache()[cl].tc_length();
+    //central cache的元数据管理占用的内存
     const size_t cache_overhead = Static::central_cache()[cl].OverheadBytes();
+    //单个class的固定大小
     const size_t size = static_cast<uint64_t>(
         Static::sizemap()->ByteSizeForClass(cl));
+    //也就是db.serverStatus().tcmalloc.tcmalloc.central_cache_free_bytes，这个多了元数据管理相关的内存
     r->central_bytes += (size * length) + cache_overhead;
     r->transfer_bytes += (size * tc_length);
     if (class_count) {
       // Sum the lengths of all per-class freelists, except the per-thread
       // freelists, which get counted when we call GetThreadStats(), below.
+      //每个class的central + transfer cache统计
       class_count[cl] = length + tc_length;
     }
 
@@ -384,6 +398,7 @@ static void ExtractStats(TCMallocStats* r, uint64_t* class_count,
   r->thread_bytes = 0;
   { // scope
     SpinLockHolder h(Static::pageheap_lock());
+    //thread cache的统计添加到class_count，同时记录到全局r->thread_bytes
     ThreadCache::GetThreadStats(&r->thread_bytes, class_count);
     r->metadata_bytes = tcmalloc::metadata_system_bytes();
     r->pageheap = Static::pageheap()->stats();
@@ -1040,6 +1055,7 @@ class TCMallocImplementation : public MallocExtension {
     }
   }
   
+  //appendHighVerbosityMetrics
   virtual void SizeClasses(void* arg, SizeClassFunction func, PageHeapSizeClassFunction pageFunc) {
     TCMallocStats global_stats;
     base::MallocSizeClass stats;

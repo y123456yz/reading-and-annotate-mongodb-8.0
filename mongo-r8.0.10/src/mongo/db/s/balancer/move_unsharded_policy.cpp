@@ -396,25 +396,30 @@ boost::optional<MigrateInfo> selectUnsplittableCollectionToMove(
         *destinationShardId, collectionToMove, chunkToMove, ForceJumbo::kDoNotForce, boost::none);
 }
 
+/*
+选择需要迁移的未分片集合（unsharded collection），生成对应的迁移任务（MigrateInfo），以实现未分片集合在分片间的均衡分布。
+该函数主要用于测试和特殊场景（如 failpoint 激活时），优先将集合从 draining shard 迁移到可用 shard，或在可用 shard 间随机迁移集合。
+*/
 MigrateInfoVector MoveUnshardedPolicy::selectCollectionsToMove(
     OperationContext* opCtx,
     const std::vector<ClusterStatistics::ShardStatistics>& allShards,
     stdx::unordered_set<ShardId>* availableShards) {
     MigrateInfoVector result;
 
+    // 如果 failpoint balancerShouldReturnRandomMigrations 激活，则进入特殊测试逻辑
     if (auto sfp = fpBalancerShouldReturnRandomMigrations->scoped();
         MONGO_unlikely(sfp.isActive())) {
+        // 可用分片数不足2，无法迁移，直接返回
         if (availableShards->size() < 2) {
             return result;
         }
 
-        // Don't issue moveCollection if reshardingMinimumOperationDuration is greater than 5
-        // seconds to prevent tests from taking too long.
+        // 如果 resharding 操作最小持续时间大于5秒，为防止测试超时则跳过迁移
         if (resharding::gReshardingMinimumOperationDurationMillis.load() > 5000) {
             return result;
         }
 
-        // Separate draining shards so they can be handled separately.
+        // 按 draining 状态将分片分为两组，分别处理
         std::vector<ShardId> randomizedAvailableShards, randomizedDrainingShards;
         for (const auto& shardStat : allShards) {
             if (!availableShards->contains(shardStat.shardId)) {
@@ -426,6 +431,7 @@ MigrateInfoVector MoveUnshardedPolicy::selectCollectionsToMove(
                 randomizedAvailableShards.emplace_back(shardStat.shardId);
             }
         }
+        // 随机打乱 draining 和非 draining 分片列表
         std::shuffle(randomizedDrainingShards.begin(),
                      randomizedDrainingShards.end(),
                      opCtx->getClient()->getPrng().urbg());
@@ -433,7 +439,7 @@ MigrateInfoVector MoveUnshardedPolicy::selectCollectionsToMove(
                      randomizedAvailableShards.end(),
                      opCtx->getClient()->getPrng().urbg());
 
-        // Try to move collections off draining shards first.
+        // 优先尝试将集合从 draining shard 迁移到非 draining shard
         auto drainingShardMigration = selectUnsplittableCollectionToMove(
             opCtx, availableShards, randomizedDrainingShards, randomizedAvailableShards);
         if (drainingShardMigration) {
@@ -441,8 +447,7 @@ MigrateInfoVector MoveUnshardedPolicy::selectCollectionsToMove(
             return result;
         }
 
-
-        // Randomly skip moveCollections if there are sharded collections that could be balanced.
+        // 随机跳过 moveCollection 操作（如果集群有可均衡的分片集合），用于测试场景
         auto drainingShardIter = std::find_if(
             allShards.begin(), allShards.end(), [](const auto& stat) { return stat.isDraining; });
         bool isDraining = drainingShardIter != allShards.end();
@@ -451,6 +456,7 @@ MigrateInfoVector MoveUnshardedPolicy::selectCollectionsToMove(
             return result;
         }
 
+        // 随机选择一个可迁移的未分片集合，在可用分片间迁移
         auto migration = selectUnsplittableCollectionToMove(
             opCtx, availableShards, randomizedAvailableShards, randomizedAvailableShards);
         if (migration) {
@@ -458,6 +464,7 @@ MigrateInfoVector MoveUnshardedPolicy::selectCollectionsToMove(
         }
     }
 
+    // 返回本轮选出的所有可迁移集合的迁移信息
     return result;
 }
 }  // namespace mongo

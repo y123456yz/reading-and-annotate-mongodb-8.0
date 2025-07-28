@@ -683,6 +683,10 @@ void Balancer::onStepUpBegin(OperationContext* opCtx, long long term) {
     joinTermination();
 }
 
+//分片数据的自动均衡（chunk 迁移）是由 config server（主节点）上的 Balancer 线程主动触发和调度的，而不是由 mongos 触发。
+//自动均衡的决策和 chunk 迁移的发起完全由 config server 的 Balancer 线程负责。
+
+//config server 上的 Balancer 线程在每次选举成功后会启动balancer线程，
 void Balancer::onStepUpComplete(OperationContext* opCtx, long long term) {
     initiate(opCtx);
 }
@@ -997,6 +1001,26 @@ void Balancer::_consumeActionStreamLoop() {
     }
 }
 
+/**
+ * 分片均衡器（Balancer）在 config server 上的核心主循环线程。
+ * 它负责自动、周期性地检查集群分片数据分布，并主动发起 chunk 迁移，实现数据均衡。
+ *
+ * 核心流程：
+ * 1. 初始化线程资源，设置不可被 stepdown 杀死。
+ * 2. 循环刷新 balancer 配置，保证配置可用。
+ * 3. 启动均衡命令调度器和 action stream 消费线程。
+ * 4. 进入主循环，每轮称为 balancing round：
+ *    - 刷新分片注册表和 OID 唯一性检查。
+ *    - 刷新 balancer 配置，校验参数。
+ *    - 检查 draining shard 等警告场景。
+ *    - 判断是否需要均衡，启用/禁用自动合并策略。
+ *    - 启动碎片整理、自动合并等异步操作。
+ *    - 强制 chunk 与 zone 边界对齐，必要时拆分 chunk。
+ *    - 选择并迁移 chunk，包括未分片集合、碎片整理、普通均衡三类任务。
+ *    - 记录本轮统计信息，写入日志。
+ *    - 异常处理，记录错误并 sleep 后重试。
+ * 5. 线程退出前清理资源，停止调度器和辅助线程。
+ */
 void Balancer::_mainThread() {
     ON_BLOCK_EXIT([this] {
         {
@@ -1007,11 +1031,12 @@ void Balancer::_mainThread() {
         _joinCond.notify_all();
     });
 
+    // 初始化线程客户端和操作上下文
     ThreadClient threadClient("Balancer",
                               getGlobalServiceContext()->getService(ClusterRole::ShardServer));
     auto opCtx = threadClient->makeOperationContext();
 
-    // TODO(SERVER-74658): Please revisit if this thread could be made killable.
+    // 设置为不可被 stepdown 杀死的系统线程
     {
         stdx::lock_guard<Client> lk(*threadClient);
         threadClient->setSystemOperationUnkillableByStepdown(lk);
@@ -1029,6 +1054,7 @@ void Balancer::_mainThread() {
     const Seconds kInitBackoffInterval(10);
 
     auto balancerConfig = shardingContext->getBalancerConfiguration();
+    // 循环刷新 balancer 配置，保证配置可用
     while (!_terminationRequested()) {
         Status refreshStatus = balancerConfig->refreshAndCheck(opCtx.get());
         if (!refreshStatus.isOK()) {
@@ -1040,19 +1066,18 @@ void Balancer::_mainThread() {
             _sleepFor(opCtx.get(), kInitBackoffInterval);
             continue;
         }
-
         break;
     }
 
     LOGV2(6036605, "Starting command scheduler");
-
+    // 启动均衡命令调度器后台线程
     _commandScheduler->start(opCtx.get());
-
+    // 启动 action stream 消费线程，处理自动合并/碎片整理等异步操作
     _actionStreamConsumerThread = stdx::thread([&] { _consumeActionStreamLoop(); });
 
     LOGV2(6036606, "Balancer worker thread initialised. Entering main loop.");
 
-    // Main balancer loop
+    // 主循环，每轮称为一个 balancing round
     auto lastMigrationTime = Date_t::fromMillisSinceEpoch(0);
     BalancerWarning balancerWarning;
     while (!_terminationRequested()) {
@@ -1061,10 +1086,17 @@ void Balancer::_mainThread() {
         _beginRound(opCtx.get());
 
         try {
+            // 刷新分片注册表，保证 shard 信息最新
             shardingContext->shardRegistry()->reload(opCtx.get());
 
+            // 检查所有分片 OID 唯一性，防止冲突
             uassert(13258, "oids broken after resetting!", _checkOIDs(opCtx.get()));
 
+            /*
+            从 config server 的配置表（如 config.settings）中拉取最新的 balancer 相关配置（如是否启用均衡、迁移阈值、throttle 策略等）。
+            检查这些配置是否合法、可用。
+            如果配置拉取或校验失败，返回错误，balancer 本轮会跳过或重试，保证只有在配置有效时才进行 chunk 迁移。
+            */
             Status refreshStatus = balancerConfig->refreshAndCheck(opCtx.get());
             if (!refreshStatus.isOK()) {
                 LOGV2_WARNING(21877, "Skipping balancing round", "error"_attr = refreshStatus);
@@ -1072,17 +1104,18 @@ void Balancer::_mainThread() {
                 continue;
             }
 
-            // Warn before we skip the iteration due to balancing being disabled.
+            // 检查 draining shard 等警告场景
             balancerWarning.warnIfRequired(opCtx.get(), balancerConfig->getBalancerMode());
 
+            // 如果 balancer 关闭或收到终止请求，跳过本轮
             if (!balancerConfig->shouldBalance() || _terminationRequested()) {
                 _autoMergerPolicy->disable(opCtx.get());
-
                 LOGV2_DEBUG(21859, 1, "Skipping balancing round because balancing is disabled");
                 _endRound(opCtx.get(), kBalanceRoundDefaultInterval);
                 continue;
             }
 
+            // 根据配置启用自动合并策略
             if (balancerConfig->shouldBalanceForAutoMerge()) {
                 _autoMergerPolicy->enable(opCtx.get());
             }
@@ -1093,17 +1126,16 @@ void Balancer::_mainThread() {
                         "waitForDelete"_attr = balancerConfig->waitForDelete(),
                         "secondaryThrottle"_attr = balancerConfig->getSecondaryThrottle().toBSON());
 
-            // Collect and apply up-to-date configuration values on the cluster collections.
+            // 收集并应用最新碎片整理配置
             _defragmentationPolicy->startCollectionDefragmentations(opCtx.get());
 
-            // Reactivate the Automerger if needed.
+            // 检查自动合并策略内部状态
             _autoMergerPolicy->checkInternalUpdates(opCtx.get());
 
-            // The current configuration is allowing the balancer to perform operations.
-            // Unblock the secondary thread if needed.
+            // 唤醒 action stream 消费线程
             _actionStreamCondVar.notify_all();
 
-            // Split chunk to match zones boundaries
+            // 强制 chunk 与 zone 边界对齐，必要时拆分 chunk
             {
                 Status status = _splitChunksIfNeeded(opCtx.get());
                 if (!status.isOK()) {
@@ -1113,47 +1145,52 @@ void Balancer::_mainThread() {
                 }
             }
 
-            // Select and migrate chunks
+            // 选择并迁移 chunk
             {
                 Timer selectionTimer;
 
+                // 收集所有 shard 统计信息
                 const std::vector<ClusterStatistics::ShardStatistics> shardStats =
                     uassertStatusOK(_clusterStats->getStats(opCtx.get()));
 
+                // 选出可用 shard 集合
                 stdx::unordered_set<ShardId> availableShards;
                 availableShards.reserve(shardStats.size());
                 std::transform(
                     shardStats.begin(),
                     shardStats.end(),
                     std::inserter(availableShards, availableShards.end()),
+                    // 该 Lambda 用于批量提取分片ID，便于后续均衡器对分片进行操作。
                     [](const ClusterStatistics::ShardStatistics& shardStatistics) -> ShardId {
                         return shardStatistics.shardId;
                     });
 
+                // 选择需要迁移的未分片集合
                 const auto unshardedToMove = _moveUnshardedPolicy->selectCollectionsToMove(
                     opCtx.get(), shardStats, &availableShards);
 
+                // 选择需要碎片整理的 chunk
                 const auto chunksToDefragment =
                     _defragmentationPolicy->selectChunksToMove(opCtx.get(), &availableShards);
 
+                // 选择需要均衡迁移的 chunk
                 const auto chunksToRebalance =
                     uassertStatusOK(_chunkSelectionPolicy->selectChunksToMove(
                         opCtx.get(), shardStats, &availableShards, &_imbalancedCollectionsCache));
                 const Milliseconds selectionTimeMillis{selectionTimer.millis()};
 
+                // 如果没有需要迁移的 chunk 或集合，本轮结束
                 if (chunksToRebalance.empty() && chunksToDefragment.empty() &&
                     unshardedToMove.empty()) {
                     LOGV2_DEBUG(21862, 1, "No need to move any chunk");
                     _balancedLastTime = {};
                     LOGV2_DEBUG(21863, 1, "End balancing round");
-                    // Set to 100ms when executed in context of a test
                     _endRound(opCtx.get(),
                               TestingProctor::instance().isEnabled()
                                   ? Milliseconds(100)
                                   : kBalanceRoundDefaultInterval);
                 } else {
-
-                    // Sleep according to the migration throttling settings
+                    // 按迁移节流策略 sleep，防止迁移过于频繁
                     const auto throttleTimeMillis = [&] {
                         const auto& minRoundinterval =
                             Milliseconds(balancerMigrationsThrottlingMs.load());
@@ -1166,14 +1203,14 @@ void Balancer::_mainThread() {
                     }();
                     _sleepFor(opCtx.get(), throttleTimeMillis);
 
-                    // Migrate chunks
+                    // 执行 chunk 迁移（包括未分片集合、碎片整理、普通均衡三类任务）
                     Timer migrationTimer;
                     _balancedLastTime = _doMigrations(
                         opCtx.get(), unshardedToMove, chunksToRebalance, chunksToDefragment);
                     lastMigrationTime = Date_t::now();
                     const Milliseconds migrationTimeMillis{migrationTimer.millis()};
 
-                    // Complete round
+                    // 记录本轮统计信息，写入日志
                     roundDetails.setSucceeded(
                         static_cast<int>(chunksToRebalance.size() + chunksToDefragment.size()),
                         _balancedLastTime.rebalancedChunks + _balancedLastTime.defragmentedChunks,
@@ -1195,18 +1232,13 @@ void Balancer::_mainThread() {
                         .ignore();
 
                     LOGV2_DEBUG(6679500, 1, "End balancing round");
-                    // Migration throttling of `balancerMigrationsThrottlingMs` will be applied
-                    // before the next call to _doMigrations, so don't sleep here.
                     _endRound(opCtx.get(), Milliseconds(0));
                 }
             }
         } catch (const DBException& e) {
+            // 异常处理，记录错误日志和统计，sleep 后重试
             LOGV2(21865, "Error while doing balance", "error"_attr = e);
-
-            // Just to match the opening statement if in log level 1
             LOGV2_DEBUG(21866, 1, "End balancing round");
-
-            // This round failed, tell the world!
             roundDetails.setFailed(e.what());
 
             auto catalogManager = ShardingCatalogManager::get(opCtx.get());
@@ -1219,20 +1251,18 @@ void Balancer::_mainThread() {
                             catalogManager->localCatalogClient())
                 .ignore();
 
-            // Sleep a fair amount before retrying because of the error
             _endRound(opCtx.get(), kBalanceRoundDefaultInterval);
         }
     }
 
+    // 线程退出前清理资源，停止调度器和辅助线程
     {
         stdx::lock_guard<Latch> scopedLock(_mutex);
         invariant(_threadSetState == ThreadSetState::Terminating);
     }
 
     _commandScheduler->stop();
-
     _actionStreamConsumerThread.join();
-
 
     {
         stdx::lock_guard<Latch> scopedLock(_mutex);
@@ -1355,6 +1385,18 @@ bool Balancer::_checkOIDs(OperationContext* opCtx) {
     return true;
 }
 
+/**
+ * 检查并强制分片集合的 chunk 边界与 zone（分区）边界对齐，必要时对 chunk 进行拆分。
+ *
+ * 主要流程：
+ * 1. 调用 _chunkSelectionPolicy->selectChunksToSplit，选出需要拆分的 chunk（如 zone 边界不对齐）。
+ * 2. 对每个待拆分 chunk，获取最新的路由信息（RoutingInformationCache），确保操作的元数据是最新的。
+ * 3. 调用 shardutil::splitChunkAtMultiplePoints，按指定 splitKeys 在目标 shard 上拆分 chunk。
+ * 4. 拆分失败时记录警告日志，不影响后续 chunk 的拆分。
+ * 5. 全部分拆完成后返回 OK，若有元数据/路由信息错误则提前返回错误。
+ *
+ * 该函数主要用于在每轮均衡前，确保所有 chunk 的分布满足 zone 约束，避免 zone 违规。
+ */
 Status Balancer::_splitChunksIfNeeded(OperationContext* opCtx) {
     auto chunksToSplitStatus = _chunkSelectionPolicy->selectChunksToSplit(opCtx);
     if (!chunksToSplitStatus.isOK()) {

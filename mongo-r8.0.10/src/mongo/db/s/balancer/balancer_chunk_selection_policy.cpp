@@ -351,18 +351,34 @@ StatusWith<SplitInfoVector> BalancerChunkSelectionPolicy::selectChunksToSplit(
     return _getSplitCandidatesForCollection(opCtx, nss, shardStats);
 }
 
+/**
+ * 选择本轮需要迁移的 chunk，生成对应的迁移任务（MigrateInfoVector），以实现分片集群的负载均衡。
+ * 
+ * 主要流程：
+ * 1. 检查可用分片数，若不足2则无需迁移，直接返回空结果。
+ * 2. 获取所有分片集合元数据（config.collections），如无集合则直接返回。
+ * 3. 批量处理集合，提升统计和迁移候选选择效率：
+ *    - 优先处理缓存中已知不均衡的集合（imbalancedCollectionsCachePtr）。
+ *    - 随机遍历剩余集合，批量收集需要迁移的 chunk。
+ *    - 每批集合统计数据后，调用 _getMigrateCandidatesForCollection 选出迁移候选 chunk。
+ *    - 若集合无迁移候选，则从缓存移除；否则缓存集合名以便后续快速处理。
+ * 4. 若超时或可用分片数不足，则提前返回已选迁移候选。
+ * 5. 返回所有本轮选出的 chunk 迁移任务。
+ */
 StatusWith<MigrateInfoVector> BalancerChunkSelectionPolicy::selectChunksToMove(
     OperationContext* opCtx,
     const std::vector<ClusterStatistics::ShardStatistics>& shardStats,
     stdx::unordered_set<ShardId>* availableShards,
     stdx::unordered_set<NamespaceString>* imbalancedCollectionsCachePtr) {
 
+    // 可用分片数不足2，无需迁移
     if (availableShards->size() < 2) {
         return MigrateInfoVector{};
     }
 
     Timer chunksSelectionTimer;
 
+    // 获取所有分片集合元数据
     const auto catalogClient = ShardingCatalogManager::get(opCtx)->localCatalogClient();
     auto collections =
         catalogClient->getShardedCollections(opCtx,
@@ -375,6 +391,7 @@ StatusWith<MigrateInfoVector> BalancerChunkSelectionPolicy::selectChunksToMove(
 
     MigrateInfoVector candidateChunks;
 
+    // 批次大小，可通过 failpoint 动态调整
     const uint32_t kStatsForBalancingBatchSize = [&]() {
         auto batchSize = 100U;
         overrideStatsForBalancingBatchSize.execute([&batchSize](const BSONObj& data) {
@@ -384,13 +401,12 @@ StatusWith<MigrateInfoVector> BalancerChunkSelectionPolicy::selectChunksToMove(
         return batchSize;
     }();
 
+    // 缓存集合最大数量，提升后续轮次效率
     const uint32_t kMaxCachedCollectionsSize = 0.75 * kStatsForBalancingBatchSize;
 
-    // Lambda function used to get a CollectionType leveraging the `collections` vector
-    // The `collections` vector must be sorted by nss when it is called
+    // Lambda：根据集合命名空间查找集合元数据
     auto getCollectionTypeByNss = [&collections](const NamespaceString& nss)
         -> std::pair<boost::optional<CollectionType>, std::vector<CollectionType>::iterator> {
-        // Using a lower_bound to perform a binary search on the `collections` vector
         const auto collIt =
             std::lower_bound(collections.begin(),
                              collections.end(),
@@ -405,11 +421,13 @@ StatusWith<MigrateInfoVector> BalancerChunkSelectionPolicy::selectChunksToMove(
         return std::make_pair(*collIt, collIt);
     };
 
-    // Lambda function to select migrate candidates from a batch of collections
+    // Lambda：批量处理集合，收集迁移候选 chunk
     const auto processBatch = [&](std::vector<CollectionType>& collBatch) {
+        // 批量获取集合数据大小信息
         const auto collsDataSizeInfo = getDataSizeInfoForCollections(opCtx, collBatch);
 
         auto client = opCtx->getClient();
+        // std::shuffle 是 C++ 标准库中用于随机重排容器元素的函数，需 C++11 或更高版本支持。它通过随机数生成器打乱序列顺序，相比早期 std::random_shuffle 提供了更可控的随机机制
         std::shuffle(collBatch.begin(), collBatch.end(), client->getPrng().urbg());
         for (const auto& coll : collBatch) {
 
@@ -419,10 +437,11 @@ StatusWith<MigrateInfoVector> BalancerChunkSelectionPolicy::selectChunksToMove(
 
             const auto& nss = coll.getNss();
 
+            // 选出集合的迁移候选 chunk
             auto swMigrateCandidates = _getMigrateCandidatesForCollection(
                 opCtx, nss, shardStats, collsDataSizeInfo.at(nss), availableShards);
             if (swMigrateCandidates == ErrorCodes::NamespaceNotFound) {
-                // Namespace got dropped before we managed to get to it, so just skip it
+                // 集合已被删除，移除缓存
                 imbalancedCollectionsCachePtr->erase(nss);
                 continue;
             } else if (!swMigrateCandidates.isOK()) {
@@ -433,12 +452,14 @@ StatusWith<MigrateInfoVector> BalancerChunkSelectionPolicy::selectChunksToMove(
                 continue;
             }
 
+            // 收集迁移候选 chunk
             candidateChunks.insert(
                 candidateChunks.end(),
                 std::make_move_iterator(swMigrateCandidates.getValue().first.begin()),
                 std::make_move_iterator(swMigrateCandidates.getValue().first.end()));
 
             const auto& migrateCandidates = swMigrateCandidates.getValue().first;
+            // 若无迁移候选，则移除缓存；否则缓存集合名
             if (migrateCandidates.empty()) {
                 imbalancedCollectionsCachePtr->erase(nss);
             } else if (imbalancedCollectionsCachePtr->size() < kMaxCachedCollectionsSize) {
@@ -447,12 +468,10 @@ StatusWith<MigrateInfoVector> BalancerChunkSelectionPolicy::selectChunksToMove(
         }
     };
 
-    // To assess if a collection has chunks to migrate, we need to ask shards the size of that
-    // collection. For efficiency, we ask for a batch of collections per every shard request instead
-    // of a single request per collection
+    // 批量处理集合
     std::vector<CollectionType> collBatch;
 
-    // The first batch is partially filled by the imbalanced cached collections
+    // 优先处理缓存中已知不均衡的集合
     for (auto imbalancedNssIt = imbalancedCollectionsCachePtr->begin();
          imbalancedNssIt != imbalancedCollectionsCachePtr->end();) {
 
@@ -460,7 +479,7 @@ StatusWith<MigrateInfoVector> BalancerChunkSelectionPolicy::selectChunksToMove(
 
         if (!imbalancedColl.has_value() ||
             !balancer_policy_utils::canBalanceCollection(imbalancedColl.value())) {
-            // The collection was dropped or is no longer enabled for balancing.
+            // 集合已被删除或不允许均衡，移除缓存
             imbalancedCollectionsCachePtr->erase(imbalancedNssIt++);
             continue;
         }
@@ -468,11 +487,11 @@ StatusWith<MigrateInfoVector> BalancerChunkSelectionPolicy::selectChunksToMove(
         collBatch.push_back(imbalancedColl.value());
         ++imbalancedNssIt;
 
-        // Remove the collection from the whole list of collections to avoid processing it twice
+        // 从集合列表中移除，避免重复处理
         collections.erase(collIt);
     }
 
-    // Iterate all the remaining collections randomly
+    // 随机遍历剩余集合，批量收集迁移候选 chunk
     auto client = opCtx->getClient();
     std::shuffle(collections.begin(), collections.end(), client->getPrng().urbg());
     for (const auto& coll : collections) {
@@ -481,6 +500,7 @@ StatusWith<MigrateInfoVector> BalancerChunkSelectionPolicy::selectChunksToMove(
             collBatch.push_back(coll);
         }
 
+        // 达到批次大小则处理
         if (collBatch.size() == kStatsForBalancingBatchSize) {
             processBatch(collBatch);
             if (availableShards->size() < 2) {
@@ -489,6 +509,7 @@ StatusWith<MigrateInfoVector> BalancerChunkSelectionPolicy::selectChunksToMove(
             collBatch.clear();
         }
 
+        // 超时提前返回已选迁移候选
         const auto maxTimeMs = balancerChunksSelectionTimeoutMs.load();
         if (candidateChunks.size() > 0 && chunksSelectionTimer.millis() > maxTimeMs) {
             LOGV2_DEBUG(
@@ -503,10 +524,12 @@ StatusWith<MigrateInfoVector> BalancerChunkSelectionPolicy::selectChunksToMove(
         }
     }
 
+    // 处理最后一批集合
     if (collBatch.size() > 0) {
         processBatch(collBatch);
     }
 
+    // 返回所有本轮选出的 chunk 迁移任务
     return candidateChunks;
 }
 
@@ -543,6 +566,29 @@ StatusWith<MigrateInfosWithReason> BalancerChunkSelectionPolicy::selectChunksToM
     return candidatesStatus;
 }
 
+/**
+ * 检查指定集合（nss）是否存在违反 zone（分区）边界的 chunk，并为这些 chunk 生成拆分候选点。
+ * 主要流程如下：
+ * 1. 获取集合的最新分片路由信息（RoutingInformationCache），确保操作基于最新元数据。
+ * 2. 获取集合的 zone 信息（ZoneInfo），用于判断 chunk 是否跨 zone 边界。
+ * 3. 遍历所有 zone 范围，查找 chunk 是否有边界不对齐的情况：
+ *    - 如果 chunk 的 minKey 或 maxKey 与 zone 的边界不一致，则需要在该位置拆分 chunk。
+ * 4. 对每个需要拆分的 chunk，收集拆分点，并将同一个 chunk 的所有拆分点合并，避免多次刷新元数据。
+ * 5. 返回所有待拆分 chunk 及其对应的拆分点（SplitInfoVector），供后续分裂操作使用。
+ * 6. 对于特殊集合（如 internal sessions collection），忽略 zone 配置并跳过处理。
+ *
+ * 该函数是分片均衡前 zone 边界强制对齐的核心入口，确保所有 chunk 的分布严格满足 zone 约束。
+ * 
+ *  *
+ * 违反zone场景举例：
+ * 假设原有 zone 配置为：
+ *   zoneA: shard key 范围 [A, M)
+ *   zoneB: shard key 范围 [M, Z)
+ * 某 chunk 范围为 [L, N)，原本属于 zoneA。
+ * 管理员将 zoneB 的起始范围从 M 改为 L，即 zoneB: [L, Z)。
+ *   sh.updateZoneKeyRange("test.coll", { shardKey: "L" }, { shardKey: "Z" }, "zoneB")
+ * 此时 chunk [L, N) 跨越了 zoneA 和 zoneB 的边界，属于 zone违规。
+ */
 StatusWith<SplitInfoVector> BalancerChunkSelectionPolicy::_getSplitCandidatesForCollection(
     OperationContext* opCtx, const NamespaceString& nss, const ShardStatisticsVector& shardStats) {
     auto routingInfoStatus =
@@ -577,12 +623,22 @@ StatusWith<SplitInfoVector> BalancerChunkSelectionPolicy::_getSplitCandidatesFor
     return splitCandidates.done();
 }
 
+/**
+ * 计算指定集合（nss）本轮需要迁移的 chunk，生成迁移候选任务（MigrateInfosWithReason）。
+ * 主要流程：
+ * 1. 获取集合最新路由信息，确保元数据一致。
+ * 2. 构造集合分布状态（DistributionStatus），包含 zone 信息和 chunk 分布。
+ * 3. 检查 zone 边界是否落在 chunk 中间，若有则返回错误并推迟均衡，需先拆分 chunk。
+ * 4. 若所有 zone 边界合法，则调用 BalancerPolicy::balance 计算迁移候选 chunk。
+ * 5. 返回本轮所有可迁移 chunk 及原因。
+ */
 StatusWith<MigrateInfosWithReason> BalancerChunkSelectionPolicy::_getMigrateCandidatesForCollection(
     OperationContext* opCtx,
     const NamespaceString& nss,
     const ShardStatisticsVector& shardStats,
     const CollectionDataSizeInfoForBalancing& collDataSizeInfo,
     stdx::unordered_set<ShardId>* availableShards) {
+    // 获取集合最新路由信息，确保元数据一致
     auto routingInfoStatus =
         RoutingInformationCache::get(opCtx)->getShardedCollectionRoutingInfoWithPlacementRefresh(
             opCtx, nss);
@@ -594,13 +650,15 @@ StatusWith<MigrateInfosWithReason> BalancerChunkSelectionPolicy::_getMigrateCand
 
     const auto& shardKeyPattern = cm.getShardKeyPattern().getKeyPattern();
 
+    // 构造集合分布状态，包含 zone 信息和 chunk 分布
     const auto collInfoStatus = createCollectionDistributionStatus(opCtx, nss, shardStats, cm);
     if (!collInfoStatus.isOK()) {
         return collInfoStatus.getStatus();
     }
-
+å
     const DistributionStatus& distribution = collInfoStatus.getValue();
 
+    // 检查 zone 边界是否落在 chunk 中间，若有则返回错误并推迟均衡
     for (const auto& zoneRangeEntry : distribution.getZoneInfo().zoneRanges()) {
         const auto& zoneRange = zoneRangeEntry.second;
 
@@ -636,6 +694,7 @@ StatusWith<MigrateInfosWithReason> BalancerChunkSelectionPolicy::_getMigrateCand
         }
     }
 
+    // 调用 BalancerPolicy::balance 计算迁移候选 chunk
     return BalancerPolicy::balance(
         shardStats,
         distribution,

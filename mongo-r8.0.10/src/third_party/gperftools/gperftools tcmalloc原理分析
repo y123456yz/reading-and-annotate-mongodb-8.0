@@ -1,0 +1,293 @@
+db.runCommand( { setParameter: 1, diagnosticDataCollectionVerboseTCMalloc:true} )
+db.runCommand( { setParameter: 1, diagnosticDataCollectionVerboseTCMalloc:true} )
+ db.runCommand({getDiagnosticData:1})
+
+ db.runCommand({getDiagnosticData:1}).data.serverStatus.tcmalloc.tcmalloc
+
+
+ 1. span 的定义
+ span 是指一段连续的物理页（page），是 tcmalloc 管理内存的基本单位。
+ 每个 span 可以包含 1 页、2 页、3 页、4 页、8 页……等不同数量的页。
+ span 的元数据通常记录在 Span 结构体中，包括起始页号、页数、所属 size-class、状态（空闲/已分配）等信息。
+ 2. span 的作用
+ 连接操作系统和分配器的桥梁：tcmalloc 从操作系统申请内存时，通常以页为单位，这些页被组织成 span，方便管理和分配。
+ size-class 的内存池：对于小对象分配，tcmalloc 会将一个 span 划分为多个固定大小的小块，每个小块分配给用户。一个 span 只服务于一个 size-class。
+ 大对象分配的载体：对于大对象，tcmalloc 直接分配一个或多个 span，整个 span 只分配给一个对象。
+ 支持批量分配和回收：span 可以被 CentralCache 批量分配给线程缓存，也可以批量回收归还给 PageHeap。
+
+
+ 统计主要来自于tcmalloc的 appendHighVerbosityMetrics->SizeClasses接口
+ size_classes 统计意义:
+ db.runCommand({getDiagnosticData:1}).data.serverStatus.tcmalloc.tcmalloc.size_classes
+[
+        {
+                "bytes_per_object" : 0,
+                "pages_per_span" : 0,
+                "num_spans" : 0,
+                "num_thread_objs" : 0,
+                "num_central_objs" : 0,
+                "num_transfer_objs" : 0,
+                "free_bytes" : 0,
+                "allocated_bytes" : 0
+        },
+        {
+                "bytes_per_object" : 8,
+                "pages_per_span" : 2,
+                "num_spans" : 15,
+                "num_thread_objs" : 784,
+                "num_central_objs" : 9776,
+                "num_transfer_objs" : 0,
+                "free_bytes" : 84480,
+                "allocated_bytes" : 122880
+        },
+        {
+                "bytes_per_object" : 16,
+                "pages_per_span" : 2,
+                "num_spans" : 2232,
+                "num_thread_objs" : 842,
+                "num_central_objs" : 457082,
+                "num_transfer_objs" : 0,
+                "free_bytes" : 7326784,
+                "allocated_bytes" : 18284544
+        }
+ 字段含义说明
+1. bytes_per_object
+含义：该 size-class 实际分配的每个对象的字节数。
+例：8 表示该 size-class 分配的每个小对象为 8 字节。
+2. pages_per_span
+含义：该 size-class 每次从 PageHeap 申请的页数（span 大小）。
+例：2 表示每个 span 有 2 页（假设一页 4KB，则 span 为 8KB）。
+3. num_spans
+含义：当前该 size-class 在 CentralCache/PageHeap 层面上活跃的 span 数量。
+例：15 表示有 15 个 span 正在服务于该 size-class。
+4. num_thread_objs
+含义：该 size-class 当前所有线程本地缓存（ThreadCache）中空闲对象的总数。
+例：784 表示所有线程本地缓存中有 784 个 8 字节对象可用。
+5. num_central_objs
+含义：该 size-class 当前 CentralCache（中央缓存）中空闲对象的总数。
+例：9776 表示 CentralCache 中有 9776 个 8 字节对象可用。
+6. num_transfer_objs
+含义：该 size-class 当前 TransferCache（线程间批量转移缓存）中空闲对象的总数。
+例：0 表示 TransferCache 中没有 8 字节对象。
+7. free_bytes
+含义：该 size-class 所有空闲对象占用的总字节数（包括 ThreadCache、CentralCache、TransferCache）。
+例：84480 字节为所有空闲 8 字节对象占用的总内存。
+8. allocated_bytes
+含义：该 size-class 当前分配出去的总字节数（即所有活跃对象占用的总内存）。
+例：122880 字节为所有已分配 8 字节对象占用的总内存。
+
+free_bytes=bytes_per_object*(num_thread_objs+num_central_objs+num_transfer_objs)
+
+小对象总的span数量=size_classes中所有num_spans之和
+span总数=db.serverStatus().tcmalloc.tcmalloc.formattedString中的“Spans in use”统计
+大对象span数量tcmalloc没有给出统计，但是可以算出来：大对象span = span总数 - 小对象总的span数量
+
+
+db.serverStatus().tcmalloc.tcmalloc.central_cache_free_bytes： size_classes中所有free_bytes之和 + 为了管理元数据占用的内存
+
+
+一个 Size Class 会分配多个 Span，每个 Span 由若干 Page 组成，每个 Span 被切分为多个对象(thread obj、central obj、transfer obj)，这些对象都属于同一个 Size Class。
+
+
+
+
+ page_heap统计意义:
+ 相见 SizeClasses 接口
+
+ db.runCommand({getDiagnosticData:1}).data.serverStatus.tcmalloc.tcmalloc.page_heap
+ {
+    "pages" : 1,
+    "normal_spans" : 14902,
+    "unmapped_spans" : 23013,
+    "normal_bytes" : 61038592,
+    "unmapped_bytes" : 94261248
+},
+{
+    "pages" : 2,
+    "normal_spans" : 8670,
+    "unmapped_spans" : 14205,
+    "normal_bytes" : 71024640,
+    "unmapped_bytes" : 116367360
+},
+......
+ {
+    "pages" : 11,
+    "normal_spans" : 435,
+    "unmapped_spans" : 313,
+    "normal_bytes" : 19599360,
+    "unmapped_bytes" : 14102528
+}
+
+pages: 一个span包含的page数
+normal_spans: 当前page_heap中缓存的可用spans数量
+unmapped_spans: 当前page_heap已释放的spans，物理内存已经释放，虚拟内存保留
+normal_bytes=pages(一个page默认4k) * normal_spans * 4096
+unmapped_bytes=pages(一个page默认4k) * unmapped_spans * 4096
+
+注意，page:256代表的是超过255的所有大page，因此256这里的normal_bytes和unmapped_bytes的page不能用256来计算，256这里的normal_bytes和unmapped_bytes是不准的，可以参考ExtractStats实现
+
+Bytes in page heap freelist=tcmalloc.page_heap中normal_bytes总和
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+内存释放：
+ 自动回收的实际触发点
+  1. ThreadCache::Scavenge()每个线程的本地缓存（ThreadCache）有自己的 Scavenge() 方法。
+   当线程本地缓存过大、空闲对象过多，或者线程变为 idle 时，会调用 Scavenge()，将多余的对象批量归还 CentralCache，进而可能导致 span 被归还 PageHeap。
+   这一步是自动回收的第一步，但还没有归还到操作系统。
+  2 PageHeap::ReleaseAtLeastNPages() / ReleaseFreeMemory()
+   在 PageHeap 层，tcmalloc 会在分配新 span 时、释放 span 时、应用主动调用 ReleaseFreeMemory() 时，检查空闲 span 是否过多，并尝试归还部分 span 给操作系统。
+   这一步才是真正的物理内存释放。
+  3 CentralFreeList::Scavenge()
+   CentralCache 也有自己的 Scavenge()，会定期清理空闲 span，归还给 PageHeap。
+ 回收的“定期性”是如何实现的？
+  tcmalloc 通过分配/释放操作的慢路径，以及线程变 idle 时，周期性地触发回收逻辑。
+  例如，线程空闲时会调用 MallocExtension::instance()->MarkThreadIdle()，这会触发本地缓存的清理和回收。
+  另外，tcmalloc 通过 tcmalloc_release_rate 参数控制回收的“积极程度”，在分配/释放时动态判断是否需要回收。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+db.serverStatus().tcmalloc.tcmalloc
+{       
+        //PageHeap（tcmalloc 的大块页管理器）中空闲但尚未归还给操作系统的内存字节数。说明：这些内存已被应用释放，但仍保留在 tcmalloc 内部，等待后续分配复用。
+        "pageheap_free_bytes" : 1539624960,
+        //ageHeap 中已经被归还给操作系统的空闲内存字节数（unmapped状态）。说明：这些内存 tcmalloc 已经通过 madvise/munmap 等系统调用归还给操作系统，进程虚拟地址空间仍然保留，但物理内存已释放。
+        //这是一个“当前时刻”的统计值（快照），不是累计值。当前 PageHeap 中所有“unmapped”空闲 span 的总字节数。
+        "pageheap_unmapped_bytes" : 1352310784,
+        //所有线程缓存（ThreadCache）允许的最大总字节数。
+        "max_total_thread_cache_bytes" : 32768,
+        //当前所有线程缓存实际占用的总字节数。
+        "current_total_thread_cache_bytes" : 3673048,
+        //central_cache_free_bytes+transfer_cache_free_bytes+thread_cache_free_bytes
+        "total_free_bytes" : 271487552,
+        "central_cache_free_bytes" : 267806312,
+        "transfer_cache_free_bytes" : 8192,
+        "thread_cache_free_bytes" : 3673048,
+        //是否启用激进内存回收
+        "aggressive_memory_decommit" : 0,
+        //一般就是当前进程占用的物理内存量，申请物理内存增加，释放物理内存减少
+        "pageheap_committed_bytes" : NumberLong("10258939904"),
+        //每次 tcmalloc 尝试归还空闲页给操作系统时计数，表示 PageHeap 执行“scavenge”操作的次数。scavenge 是 tcmalloc 检查并尝试归还空闲页给操作系统的过程，每次触发回收逻辑（如 IncrementalScavenge、ReleaseAtLeastNPages）时计数。但一次 scavenge 不一定真的归还了物理内存，可能没有可归还的页。
+        "pageheap_scavenge_count" : 280642,
+        //每次 tcmalloc 向操作系统申请物理内存时计数
+        "pageheap_commit_count" : 595495,
+        //只增不减，代表历史上向操作系统申请的物理内存总量
+        "pageheap_total_commit_bytes" : NumberLong("97465274368"),
+        //每次将空闲页归还给操作系统时计数，decommit 是指真正将空闲页通过 madvise/munmap 等系统调用归还给操作系统，每归还一块物理内存时计数。只有在有可归还页且归还成功时才会增加。
+        "pageheap_decommit_count" : 280642,
+        //PageHeap 历史上累计归还给操作系统的总字节数
+        "pageheap_total_decommit_bytes" : NumberLong("87206334464"),
+        //PageHeap 向操作系统申请虚拟地址空间的次数。每次分配新的大块虚拟内存时计数
+        "pageheap_reserve_count" : 4233,
+        //PageHeap 历史上累计申请的虚拟地址空间总字节数。
+        "pageheap_total_reserve_bytes" : NumberLong("11611250688"),
+        //cmalloc 内部自旋锁累计等待的总纳秒数。反映 tcmalloc 内部锁竞争的严重程度，数值越大说明锁竞争越激烈。
+        "spinlock_total_delay_ns" : NumberLong("28966476583948"),
+        //tcmalloc 内存归还速率参数，数值越大归还越频繁。
+        "release_rate" : 10,
+
+
+
+
+
+
+MALLOC:     8446430768 ( 8055.1 MiB) Bytes in use by application
+        const uint64_t bytes_in_use_by_app = (physical_memory_used
+                                        - stats.metadata_bytes
+                                        - stats.pageheap.free_bytes
+                                        - stats.central_bytes
+                                        - stats.transfer_bytes
+                                        - stats.thread_bytes);
+MALLOC: +   1643319296 ( 1567.2 MiB) Bytes in page heap freelist
+MALLOC: +    268416744 (  256.0 MiB) Bytes in central cache freelist
+MALLOC: +        10752 (    0.0 MiB) Bytes in transfer cache freelist
+MALLOC: +      3952872 (    3.8 MiB) Bytes in thread cache freelists
+MALLOC: +     54001664 (   51.5 MiB) Bytes in malloc metadata
+MALLOC:   ------------
+MALLOC: =  10416132096 ( 9933.6 MiB) Actual memory used (physical + swap)
+MALLOC: +   1249120256 ( 1191.3 MiB) Bytes released to OS (aka unmapped)
+MALLOC:   ------------
+MALLOC: =  11665252352 (11124.9 MiB) Virtual address space used
+MALLOC:
+MALLOC:         495466              Spans in use
+MALLOC:            102              Thread heaps in use
+MALLOC:           4096              Tcmalloc page size
+
+
+
+
+
+
+
+
+
+
+
+
+虚拟内存/物理内存的申请和释放举例:
+ 1. 例子
+  // 申请虚拟内存和物理内存
+  void* ptr = TCMalloc_SystemAlloc(size, &actual_size, alignment);
+  // 只提交物理内存，这个主要针对windows平台,linux平台实际上啥也没做
+  TCMalloc_SystemCommit(ptr, size);
+  // 归还物理内存
+  TCMalloc_SystemRelease(ptr, size);
+ 2. tcmalloc底层实现
+  TCMalloc_SystemAlloc：通常会调用 mmap，既分配虚拟地址空间，也可能直接分配物理内存（取决于系统和参数）。
+  TCMalloc_SystemCommit：确保虚拟地址空间映射到物理内存（如 Windows 下的 MEM_COMMIT）。
+  TCMalloc_SystemRelease：归还物理内存（如 madvise+MADV_DONTNEED 或 Windows 下的 MEM_DECOMMIT）。
+ 3. 统计指标的对应
+  pageheap_reserve_count / pageheap_total_reserve_bytes：统计虚拟内存的申请次数和总量。
+  pageheap_commit_count / pageheap_total_commit_bytes：统计物理内存的提交次数和总量。

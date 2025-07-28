@@ -68,6 +68,7 @@ struct SpanBestFitLess {
 // Information kept for a span (a contiguous run of pages).
 struct Span {
   PageID        start;          // Starting page number
+  //span->length 表示当前被释放的 span（内存块）所包含的页（page）数。
   Length        length;         // Number of pages in span
   Span*         next;           // Used when in link list
   Span*         prev;           // Used when in link list

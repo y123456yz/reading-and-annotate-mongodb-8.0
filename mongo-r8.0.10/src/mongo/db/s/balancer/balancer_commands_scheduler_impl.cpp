@@ -131,6 +131,8 @@ BalancerCommandsSchedulerImpl::~BalancerCommandsSchedulerImpl() {
     stop();
 }
 
+//Balancer::_mainThread()
+//启动后台线程 _workerThread，该线程负责异步处理和下发所有均衡相关命令（如 chunk 迁移、合并等）。
 void BalancerCommandsSchedulerImpl::start(OperationContext* opCtx) {
     LOGV2(5847200, "Balancer command scheduler start requested");
     stdx::lock_guard<Latch> lg(_mutex);
@@ -142,6 +144,7 @@ void BalancerCommandsSchedulerImpl::start(OperationContext* opCtx) {
     _state = SchedulerState::Recovering;
 
     try {
+        //在 Balancer 命令调度器（BalancerCommandsSchedulerImpl）启动时，确保整个分片集群处于“静默”或“安静”状态，即所有分片（shard）上没有正在进行的迁移操作（如 chunk migration）。
         waitForQuiescedCluster(opCtx);
     } catch (const DBException& e) {
         LOGV2_WARNING(
@@ -394,6 +397,7 @@ void BalancerCommandsSchedulerImpl::_applyCommandResponse(
                 "response"_attr = response);
 }
 
+//该线程负责异步处理和下发所有均衡相关命令（如 chunk 迁移、合并等）。
 void BalancerCommandsSchedulerImpl::_workerThread() {
     ON_BLOCK_EXIT([this] {
         LOGV2(5847208, "Leaving balancer command scheduler thread");

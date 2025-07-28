@@ -369,6 +369,7 @@ int CentralFreeList::tc_length() {
   return used_slots_ * Static::sizemap()->num_objects_to_move(size_class_);
 }
 
+// 自身的元数据内存开销。它的值代表了CentralFreeList 结构体本身及其管理空闲对象所需的辅助数据结构占用的内存字节数，而不是用户数据。
 size_t CentralFreeList::OverheadBytes() {
   SpinLockHolder h(&lock_);
   if (size_class_ == 0) {  // 0 holds the 0-sized allocations
