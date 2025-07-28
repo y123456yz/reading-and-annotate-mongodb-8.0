@@ -183,22 +183,57 @@ void BalancerCommandsSchedulerImpl::disableBalancerForCollection(OperationContex
         .getAsync([](auto) {});
 }
 
+/**
+ * BalancerCommandsSchedulerImpl::requestMoveRange 的作用：
+ * 异步提交 chunk 迁移请求到均衡器命令调度器，实现非阻塞的 chunk 迁移操作。
+ * 
+ * 核心功能：
+ * 1. 接收来自均衡器的 ShardsvrMoveRange 命令请求
+ * 2. 封装迁移命令信息，包括写入关注点和客户端信息
+ * 3. 将请求提交到内部工作线程队列进行异步处理
+ * 4. 返回 SemiFuture 对象，供调用方异步等待迁移结果
+ * 5. 处理远程命令响应，解析执行状态
+ * 
+ * 参数说明：
+ * @param opCtx 操作上下文，包含请求的认证和会话信息
+ * @param request ShardsvrMoveRange 命令对象，包含迁移的完整参数
+ * @param secondaryThrottleWC 副本集写入关注点设置，控制写入节流
+ * @param issuedByRemoteUser 标识请求是否来自远程用户（影响权限检查）
+ * 
+ * @return SemiFuture<void> 异步 Future 对象，调用方可等待迁移完成
+ * 
+ * 该函数是 chunk 迁移命令的统一入口，负责将同步的迁移请求转换为异步执行模式。
+ * 请求提交 → 工作线程队列 → 异步执行 → 回调处理
+ * _buildAndEnqueueNewRequest() → _workerThread() → _submit() → _applyCommandResponse()
+ */
 SemiFuture<void> BalancerCommandsSchedulerImpl::requestMoveRange(
     OperationContext* opCtx,
     const ShardsvrMoveRange& request,
     const WriteConcernOptions& secondaryThrottleWC,
     bool issuedByRemoteUser) {
+    
+    // 根据请求来源决定是否保存外部客户端信息
+    // 如果是远程用户发起的请求，需要保存客户端上下文用于权限验证和审计
     auto externalClientInfo =
         issuedByRemoteUser ? boost::optional<ExternalClientInfo>(opCtx) : boost::none;
 
+    // 创建 MoveRangeCommandInfo 封装完整的迁移命令信息
+    // 包含：迁移请求参数、写入关注点配置、客户端信息等
     auto commandInfo = std::make_shared<MoveRangeCommandInfo>(
-        request, secondaryThrottleWC, std::move(externalClientInfo));
+        request,                      // ShardsvrMoveRange 命令对象
+        secondaryThrottleWC,          // 副本集写入节流配置
+        std::move(externalClientInfo) // 外部客户端信息（可选）
+    );
 
+    // 构建并入队新的命令请求到内部工作线程
+    // _buildAndEnqueueNewRequest 将请求加入队列，由 _workerThread 异步处理
     return _buildAndEnqueueNewRequest(opCtx, std::move(commandInfo))
         .then([](const executor::RemoteCommandResponse& remoteResponse) {
+            // 处理远程命令执行结果的回调函数
+            // processRemoteResponse 解析响应状态，提取错误信息
             return processRemoteResponse(remoteResponse);
         })
-        .semi();
+        .semi(); // 转换为 SemiFuture 类型返回
 }
 
 SemiFuture<void> BalancerCommandsSchedulerImpl::requestMergeChunks(OperationContext* opCtx,
@@ -284,9 +319,33 @@ SemiFuture<void> BalancerCommandsSchedulerImpl::requestMoveCollection(
         .semi();
 }
 
+/**
+ * BalancerCommandsSchedulerImpl::_buildAndEnqueueNewRequest 的作用：
+ * 构建新的命令请求并将其加入调度器的处理队列，是所有均衡命令进入异步执行流程的统一入口。
+ * 
+ * 核心功能：
+ * 1. 为每个命令请求生成唯一的请求ID，用于跟踪和管理命令生命周期
+ * 2. 封装命令信息为 RequestData 对象，包含执行所需的完整元数据
+ * 3. 等待调度器就绪状态，确保在正确的时机接受新请求
+ * 4. 将请求加入内部队列，由工作线程异步处理
+ * 5. 返回 Future 对象，供调用方异步等待命令执行结果
+ * 
+ * 参数说明：
+ * @param opCtx 操作上下文，提供请求的认证和会话信息
+ * @param commandInfo 具体的命令信息对象（如 MoveRangeCommandInfo、MergeChunksCommandInfo 等）
+ * 
+ * @return Future<executor::RemoteCommandResponse> 异步Future对象，包含远程命令执行结果
+ * 
+ * 该函数实现了从同步接口到异步执行的转换，是调度器架构的关键枢纽：
+ * 同步调用 → 请求入队 → 异步执行 → 结果回调
+ */
 Future<executor::RemoteCommandResponse> BalancerCommandsSchedulerImpl::_buildAndEnqueueNewRequest(
     OperationContext* opCtx, std::shared_ptr<CommandInfo>&& commandInfo) {
+    
+    // 为每个新请求生成唯一标识符，用于请求跟踪、日志记录和结果关联
     const auto newRequestId = UUID::gen();
+    
+    // 记录请求入队的详细信息，包括命令内容和是否需要恢复支持
     LOGV2_DEBUG(5847202,
                 2,
                 "Enqueuing new Balancer command request",
@@ -294,29 +353,81 @@ Future<executor::RemoteCommandResponse> BalancerCommandsSchedulerImpl::_buildAnd
                 "command"_attr = redact(commandInfo->serialise().toString()),
                 "recoveryDocRequired"_attr = commandInfo->requiresRecoveryOnCrash());
 
+    // 创建 RequestData 对象封装请求信息
+    // RequestData 包含：请求ID、命令信息、执行状态、结果Future等
     RequestData pendingRequest(newRequestId, std::move(commandInfo));
 
+    // 获取互斥锁，确保对调度器状态和请求队列的线程安全访问
     stdx::unique_lock<Latch> ul(_mutex);
+    
+    // 等待调度器退出恢复状态，确保在稳定状态下接受新请求
+    // 在恢复状态期间，调度器可能正在重建内部状态，不适合处理新请求
     _stateUpdatedCV.wait(ul, [this] { return _state != SchedulerState::Recovering; });
+    
+    // 获取请求的结果Future，调用方将通过此Future异步等待执行结果
     auto outcomeFuture = pendingRequest.getOutcomeFuture();
+    
+    // 将请求加入调度器的内部处理队列
+    // _enqueueRequest 会根据当前状态决定是否接受请求或直接拒绝
     _enqueueRequest(ul, std::move(pendingRequest));
+    
+    // 返回Future对象，调用方可以：
+    // 1. 立即返回，实现非阻塞调用
+    // 2. 调用.get()等待结果  
+    // 3. 添加.then()回调处理结果
     return outcomeFuture;
 }
 
+/**
+ * BalancerCommandsSchedulerImpl::_enqueueRequest 的作用：
+ * 将构建好的命令请求加入调度器的内部处理队列，根据调度器当前状态决定是否接受请求。
+ * 
+ * 核心功能：
+ * 1. 检查调度器当前状态，只在运行或恢复状态下接受新请求
+ * 2. 避免重复入队：检查请求ID是否已存在，防止重复处理
+ * 3. 维护内部数据结构：更新请求映射表和待提交队列
+ * 4. 通知工作线程：唤醒等待的工作线程处理新请求
+ * 5. 拒绝无效请求：在停止状态下直接拒绝新请求并设置错误状态
+ * 
+ * 参数说明：
+ * @param WithLock 编译时锁检查，确保调用时已持有互斥锁
+ * @param request 要入队的请求数据对象，包含完整的命令信息
+ * 
+ * 该函数是调度器请求管理的核心，确保请求在正确的状态下被接受和处理。
+ */
 void BalancerCommandsSchedulerImpl::_enqueueRequest(WithLock, RequestData&& request) {
+    // 获取请求的唯一标识符，用于后续跟踪和管理
     auto requestId = request.getId();
+    
+    // 检查调度器状态：只在恢复或运行状态下接受新请求
     if (_state == SchedulerState::Recovering || _state == SchedulerState::Running) {
         // A request with persisted recovery info may be enqueued more than once when received while
         // the node is transitioning from Stopped to Recovering; if this happens, just resolve as a
         // no-op.
+        // 防止重复入队：在节点从停止状态转换到恢复状态期间，
+        // 带有持久化恢复信息的请求可能被多次入队，此时需要跳过重复请求
         if (_requests.find(requestId) == _requests.end()) {
+            // 将请求加入主要的请求映射表，使用移动语义避免拷贝
+            // _requests 维护所有活跃请求的完整信息
             _requests.emplace(std::make_pair(requestId, std::move(request)));
+            
+            // 将请求ID加入待提交队列，供工作线程按顺序处理
+            // _unsubmittedRequestIds 记录尚未提交执行的请求队列
             _unsubmittedRequestIds.push_back(requestId);
+            
+            // 通知等待的工作线程有新请求可处理
+            // 唤醒在 _stateUpdatedCV.wait() 上等待的工作线程
             _stateUpdatedCV.notify_all();
         }
+        // 如果请求ID已存在，则静默跳过（作为无操作处理）
+        // 这种情况通常发生在系统恢复期间的重复请求
     } else {
+        // 调度器处于停止或停止中状态，拒绝新请求
+        // 直接设置请求结果为错误状态，通知调用方请求被拒绝
         request.setOutcome(Status(ErrorCodes::BalancerInterrupted,
                                   "Request rejected - balancer scheduler is stopped"));
+        // 注意：被拒绝的请求不会加入 _requests 映射表，
+        // 其 Future 会立即被设置为错误状态供调用方获取
     }
 }
 
@@ -397,15 +508,36 @@ void BalancerCommandsSchedulerImpl::_applyCommandResponse(
                 "response"_attr = response);
 }
 
-//该线程负责异步处理和下发所有均衡相关命令（如 chunk 迁移、合并等）。
+/**
+ * BalancerCommandsSchedulerImpl::_workerThread 的作用：
+ * 均衡器命令调度器的后台工作线程，负责异步处理和执行所有均衡相关命令（如 chunk 迁移、合并等）。
+ * 
+ * 核心功能：
+ * 1. 循环监听和处理命令队列中的待提交请求
+ * 2. 将抽象的命令请求转换为具体的远程命令并异步提交
+ * 3. 处理命令提交结果，更新请求状态和调度器内部状态
+ * 4. 管理请求生命周期：从队列获取 → 提交执行 → 处理结果 → 清理资源
+ * 5. 响应调度器状态变更：支持优雅停止和恢复机制
+ * 
+ * 工作流程：
+ * 1. 状态检查和请求规划：等待新的未提交请求或完成的请求
+ * 2. 命令提交：将待处理请求转换为远程命令并提交到执行器
+ * 3. 结果处理：处理提交结果，更新请求状态
+ * 4. 资源清理：清理已完成的请求，释放相关资源
+ * 
+ * 该线程是调度器的核心执行引擎，实现了生产者-消费者模式的异步命令处理架构。
+ */
 void BalancerCommandsSchedulerImpl::_workerThread() {
+    // 设置线程退出时的清理逻辑：更新调度器状态为停止，通知等待的线程
     ON_BLOCK_EXIT([this] {
         LOGV2(5847208, "Leaving balancer command scheduler thread");
         stdx::lock_guard<Latch> lg(_mutex);
-        _state = SchedulerState::Stopped;
-        _stateUpdatedCV.notify_all();
+        _state = SchedulerState::Stopped;  // 标记调度器已停止
+        _stateUpdatedCV.notify_all();       // 通知所有等待状态变更的线程
     });
 
+    // 初始化工作线程：设置线程名称和服务上下文
+    // 工作线程归属于 ShardServer 角色，专门处理分片相关的命令
     Client::initThread("BalancerCommandsScheduler",
                        getGlobalServiceContext()->getService(ClusterRole::ShardServer));
 
@@ -413,20 +545,30 @@ void BalancerCommandsSchedulerImpl::_workerThread() {
     // interruptible. Marking it so here is safe, since the replica set changes are also notified by
     // the Balancer (a PrimaryOnlyService) and tracked through the _state field (which is checked
     // right after).
+    // 创建可中断的操作上下文：工作线程可能执行远程请求，需要在复制集状态变更时能被中断
+    // 这确保了在主从切换时能够及时响应并停止处理
     auto opCtxHolder = cc().makeOperationContext();
     opCtxHolder.get()->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
 
     bool stopWorkerRequested = false;
     LOGV2(5847205, "Balancer scheduler thread started");
 
+    // 主工作循环：持续处理命令直到收到停止请求
     while (!stopWorkerRequested) {
-        std::vector<CommandSubmissionParameters> commandsToSubmit;
-        std::vector<CommandSubmissionResult> submissionResults;
+        // 定义本轮处理的数据结构
+        std::vector<CommandSubmissionParameters> commandsToSubmit;  // 待提交的命令参数
+        std::vector<CommandSubmissionResult> submissionResults;     // 命令提交结果
 
         // 1. Check the internal state and plan for the actions to be taken ont this round.
+        // 第一阶段：检查内部状态，规划本轮要执行的操作
         {
             stdx::unique_lock<Latch> ul(_mutex);
             tassert(8245209, "Scheduler is stopped", _state != SchedulerState::Stopped);
+            
+            // 等待以下任一条件满足才继续执行：
+            // 1. 有未提交的请求且不在暂停状态
+            // 2. 调度器正在停止
+            // 3. 有最近完成的请求需要清理
             _stateUpdatedCV.wait(ul, [this] {
                 return ((!_unsubmittedRequestIds.empty() &&
                          !MONGO_likely(pauseSubmissionsFailPoint.shouldFail())) ||
@@ -434,33 +576,43 @@ void BalancerCommandsSchedulerImpl::_workerThread() {
                         !_recentlyCompletedRequestIds.empty());
             });
 
+            // 清理已完成的请求：从请求映射表中移除，释放内存资源
             for (const auto& requestId : _recentlyCompletedRequestIds) {
                 auto it = _requests.find(requestId);
-                _requests.erase(it);
+                _requests.erase(it);  // 删除请求数据，释放相关资源
             }
-            _recentlyCompletedRequestIds.clear();
+            _recentlyCompletedRequestIds.clear();  // 清空完成列表
 
+            // 处理待提交的请求：根据调度器状态决定提交还是取消
             for (const auto& requestId : _unsubmittedRequestIds) {
                 auto& requestData = _requests.at(requestId);
                 if (_state != SchedulerState::Stopping) {
+                    // 调度器正常运行：准备提交命令
                     commandsToSubmit.push_back(requestData.getSubmissionParameters());
                 } else {
+                    // 调度器正在停止：取消请求并设置中断错误
                     requestData.setOutcome(
                         Status(ErrorCodes::BalancerInterrupted,
                                "Request cancelled - balancer scheduler is stopping"));
-                    _requests.erase(requestId);
+                    _requests.erase(requestId);  // 立即清理被取消的请求
                 }
             }
-            _unsubmittedRequestIds.clear();
-            stopWorkerRequested = _state == SchedulerState::Stopping;
+            _unsubmittedRequestIds.clear();  // 清空待提交队列
+            stopWorkerRequested = _state == SchedulerState::Stopping;  // 检查是否需要停止
         }
 
         // 2. Serve the picked up requests, submitting their related commands.
+        // 第二阶段：处理选中的请求，提交相关命令到远程分片
         for (auto& submissionInfo : commandsToSubmit) {
+            // 为命令附加操作元数据（如客户端信息、认证信息等）
             if (submissionInfo.commandInfo) {
                 submissionInfo.commandInfo.get()->attachOperationMetadataTo(opCtxHolder.get());
             }
+            
+            // 调用 _submit 将命令提交到目标分片，返回提交结果
             submissionResults.push_back(_submit(opCtxHolder.get(), submissionInfo));
+            
+            // 记录提交失败的命令，便于调试和监控
             if (!submissionResults.back().outcome.isOK()) {
                 LOGV2(5847206,
                       "Submission for scheduler command request failed",
@@ -470,24 +622,30 @@ void BalancerCommandsSchedulerImpl::_workerThread() {
         }
 
         // 3. Process the outcome of each submission.
+        // 第三阶段：处理每个命令的提交结果，更新内部状态
         if (!submissionResults.empty()) {
             stdx::lock_guard<Latch> lg(_mutex);
             for (auto& submissionResult : submissionResults) {
+                // 应用提交结果：更新请求状态，处理失败情况
                 _applySubmissionResult(lg, std::move(submissionResult));
             }
         }
     }
+    
+    // 工作线程退出前的清理工作：
+    
     // Wait for each outstanding command to complete, clean out its resources and leave.
-    (*_executor)->shutdown();
-    (*_executor)->join();
+    // 等待所有未完成的命令执行完毕，清理资源后退出
+    (*_executor)->shutdown();  // 关闭任务执行器，停止接受新任务
+    (*_executor)->join();      // 等待所有正在执行的任务完成
 
+    // 最终清理：重置调度器内部状态
     {
         stdx::unique_lock<Latch> ul(_mutex);
-        _requests.clear();
-        _recentlyCompletedRequestIds.clear();
-        _executor.reset();
+        _requests.clear();                    // 清空所有请求
+        _recentlyCompletedRequestIds.clear(); // 清空完成队列
+        _executor.reset();                    // 重置执行器
     }
 }
-
 
 }  // namespace mongo

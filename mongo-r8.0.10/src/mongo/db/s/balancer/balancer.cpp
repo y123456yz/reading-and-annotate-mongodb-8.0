@@ -389,28 +389,52 @@ void enqueueCollectionMigrations(OperationContext* opCtx,
     }
 }
 
+/**
+ * enqueueChunkMigrations 的作用：
+ * 将 chunk 迁移任务批量提交到均衡器命令调度器的执行队列中，实现异步并发的 chunk 迁移。
+ * 
+ * 核心功能：
+ * 1. 为每个 MigrateInfo 构建完整的 ShardsvrMoveRange 命令请求
+ * 2. 设置迁移相关的配置参数（waitForDelete、secondaryThrottle、maxChunkSize 等）
+ * 3. 通过 BalancerCommandsScheduler 异步调度迁移任务
+ * 4. 返回 SemiFuture 对象，供调用方等待和处理迁移结果
+ * 
+ * 参数说明：
+ * @param opCtx 操作上下文
+ * @param scheduler 均衡器命令调度器，负责异步执行迁移命令
+ * @param migrationsAndResponses 迁移任务和响应的配对列表，函数会填充响应部分
+ * 
+ * 该函数是 chunk 迁移执行的关键入口，将迁移决策转换为实际的异步迁移操作。
+ */
 void enqueueChunkMigrations(OperationContext* opCtx,
                             BalancerCommandsScheduler& scheduler,
                             MigrationsAndResponses& migrationsAndResponses) {
+    // 定义迁移请求构建函数，为每个 MigrateInfo 创建完整的迁移命令
     auto requestMigration = [&](const MigrateInfo& migrateInfo) -> SemiFuture<void> {
+        // 获取 catalog client 和 balancer 配置
         auto catalogClient = ShardingCatalogManager::get(opCtx)->localCatalogClient();
         auto balancerConfig = Grid::get(opCtx)->getBalancerConfiguration();
 
+        // 确定最大 chunk 大小限制，优先使用 MigrateInfo 中的设置，否则使用集合或全局配置
         auto maxChunkSizeBytes = [&]() {
+            // 如果 MigrateInfo 中已设置最大 chunk 大小，直接使用
             if (migrateInfo.optMaxChunkSizeBytes.has_value()) {
                 return *migrateInfo.optMaxChunkSizeBytes;
             }
 
+            // 否则从集合配置中获取，如无设置则使用全局默认值
             auto coll = catalogClient->getCollection(
                 opCtx, migrateInfo.nss, repl::ReadConcernLevel::kMajorityReadConcern);
             return coll.getMaxChunkSizeBytes().value_or(balancerConfig->getMaxChunkSizeBytes());
         }();
 
+        // 构建迁移请求的基础部分
         MoveRangeRequestBase requestBase(migrateInfo.to);
         requestBase.setWaitForDelete(balancerConfig->waitForDelete());
         requestBase.setMin(migrateInfo.minKey);
         requestBase.setMax(migrateInfo.maxKey);
 
+        // 构建完整的 ShardsvrMoveRange 命令请求
         ShardsvrMoveRange shardSvrRequest(migrateInfo.nss);
         shardSvrRequest.setDbName(DatabaseName::kAdmin);
         shardSvrRequest.setMoveRangeRequestBase(requestBase);
@@ -419,15 +443,21 @@ void enqueueChunkMigrations(OperationContext* opCtx,
         shardSvrRequest.setCollectionTimestamp(migrateInfo.version.getTimestamp());
         shardSvrRequest.setEpoch(migrateInfo.version.epoch());
         shardSvrRequest.setForceJumbo(migrateInfo.forceJumbo);
+        
+        // 获取副本集写入节流配置和写入关注点设置
         const auto [secondaryThrottle, wc] =
             getSecondaryThrottleAndWriteConcern(balancerConfig->getSecondaryThrottle());
         shardSvrRequest.setSecondaryThrottle(secondaryThrottle);
 
+        // 通过调度器异步提交迁移请求，返回 SemiFuture 用于异步等待结果
         return scheduler.requestMoveRange(
             opCtx, shardSvrRequest, wc, false /* issuedByRemoteUser */);
     };
 
+    // 遍历所有迁移任务，为每个任务构建请求并提交到调度器
     for (auto& migrationAndResponse : migrationsAndResponses) {
+        // 调用 requestMigration 为当前 MigrateInfo 生成异步迁移请求
+        // 将返回的 SemiFuture 存储在 migrationAndResponse.second 中
         migrationAndResponse.second = requestMigration(migrationAndResponse.first);
     }
 }
@@ -1223,7 +1253,32 @@ void Balancer::_mainThread() {
                     lastMigrationTime = Date_t::now();
                     const Milliseconds migrationTimeMillis{migrationTimer.millis()};
 
-                    // 记录本轮统计信息，写入日志
+                    /*
+                    {
+                        _id: 'VM-242-181-tencentos-2025-07-28T19:10:52.257+08:00-68875abc5b065dc36e05fa15',
+                        server: 'VM-242-181-tencentos',
+                        shard: 'config',
+                        clientAddr: '',
+                        time: ISODate('2025-07-28T11:10:52.257Z'),
+                        what: 'balancer.round',
+                        ns: '',
+                        details: {
+                        executionTimeMillis: 50965,
+                        errorOccurred: false,
+                        candidateChunks: 1,
+                        chunksMoved: 1,
+                        candidateUnshardedCollections: 0,
+                        unshardedCollectionsMoved: 0,
+                        imbalancedCachedCollections: 1,
+                        times: {
+                            selectionTimeMillis: Long('25'),
+                            throttleTimeMillis: Long('0'),
+                            migrationTimeMillis: Long('50904')
+                        }
+                        }
+                    }
+                    */
+                    // 记录本轮统计信息，写入日志到config.actionlog
                     roundDetails.setSucceeded(
                         static_cast<int>(chunksToRebalance.size() + chunksToDefragment.size()),
                         _balancedLastTime.rebalancedChunks + _balancedLastTime.defragmentedChunks,
@@ -1446,6 +1501,28 @@ Status Balancer::_splitChunksIfNeeded(OperationContext* opCtx) {
     return Status::OK();
 }
 
+//Balancer::_mainThread() 
+/**
+ * Balancer::_doMigrations 的作用：
+ * 执行分片集群的 chunk 迁移任务，包括未分片集合迁移、普通负载均衡迁移和碎片整理迁移三类操作。
+ * 
+ * 核心功能：
+ * 1. 创建三种不同类型的迁移任务（未分片集合、负载均衡、碎片整理）
+ * 2. 异步执行所有迁移任务，提高迁移并发性和效率
+ * 3. 等待所有迁移任务完成并处理响应结果
+ * 4. 统计迁移成功数量，清理失败的集合缓存
+ * 5. 返回本轮迁移的详细统计信息
+ * 
+ * 参数说明：
+ * @param opCtx 操作上下文
+ * @param unshardedToMove 需要迁移的未分片集合列表
+ * @param chunksToRebalance 需要负载均衡迁移的 chunk 列表
+ * @param chunksToDefragment 需要碎片整理迁移的 chunk 列表
+ * 
+ * @return MigrationStats 包含三类迁移任务的成功数量统计
+ * 
+ * 该函数是均衡器执行实际迁移操作的核心入口，协调不同类型的迁移策略。
+ */
 Balancer::MigrationStats Balancer::_doMigrations(OperationContext* opCtx,
                                                  const MigrateInfoVector& unshardedToMove,
                                                  const MigrateInfoVector& chunksToRebalance,
@@ -1453,6 +1530,7 @@ Balancer::MigrationStats Balancer::_doMigrations(OperationContext* opCtx,
     auto balancerConfig = Grid::get(opCtx)->getBalancerConfiguration();
 
     // If the balancer was disabled since we started this round, don't start new chunk moves
+    // 在开始迁移前再次检查均衡器状态，防止配置在本轮执行过程中被禁用
     if (const bool terminating = _terminationRequested(), enabled = balancerConfig->shouldBalance();
         terminating || !enabled) {
         LOGV2_DEBUG(21870,
@@ -1460,32 +1538,48 @@ Balancer::MigrationStats Balancer::_doMigrations(OperationContext* opCtx,
                     "Skipping balancing round",
                     "terminating"_attr = terminating,
                     "balancerEnabled"_attr = enabled);
-        return {};
+        return {};  // 返回空的迁移统计，表示没有执行任何迁移
     }
 
+    // 创建三种不同类型的迁移任务数组
+    // 每种任务类型都有专门的处理逻辑和响应处理方式
     std::array<std::unique_ptr<MigrationTask>, 3> allMigrationTasks = {
+        // 未分片集合迁移任务：处理整个集合在分片间的移动
         make_unique<MigrateUnshardedCollectionTask>(
             opCtx, *_moveUnshardedPolicy, *_commandScheduler, unshardedToMove),
+        
+        // 普通负载均衡迁移任务：处理 chunk 在分片间的均衡分布
         make_unique<RebalanceChunkTask>(opCtx, *_commandScheduler, chunksToRebalance),
+        
+        // 碎片整理迁移任务：处理 chunk 的碎片整理和优化
         make_unique<DefragmentChunkTask>(
             opCtx, *_defragmentationPolicy, *_commandScheduler, chunksToDefragment)};
 
+    // 第一阶段：将所有迁移任务入队，启动异步执行
+    // 这里采用异步执行模式，提高迁移的并发性和整体效率
     for (const auto& migrationTask : allMigrationTasks) {
-        migrationTask->enqueue();
+        migrationTask->enqueue();  // 将迁移任务提交到命令调度器的执行队列
     }
 
+    // 第二阶段：等待所有迁移任务完成并处理响应结果
     for (const auto& migrationTask : allMigrationTasks) {
+        // 等待当前任务类型的所有迁移操作完成，并处理每个迁移的响应
         migrationTask->waitForQueuedAndProcessResponses();
+        
         // Remove from the imbalancedCache the failed migrations. Regardless of the reason, we
         // prevent failed migrations from being prioritized next round.
+        // 清理失败迁移的集合缓存：无论失败原因如何，都要防止失败的迁移在下一轮中被优先处理
+        // 这避免了重复尝试可能持续失败的迁移任务，提高均衡器效率
         for (const auto& nss : migrationTask->getNamespacesFromFailedMigrations()) {
             _imbalancedCollectionsCache.erase(nss);
         }
     }
 
-    return MigrationStats{allMigrationTasks[0]->getNumCompleted(),
-                          allMigrationTasks[1]->getNumCompleted(),
-                          allMigrationTasks[2]->getNumCompleted()};
+    // 返回本轮迁移的详细统计信息
+    // 包含三种迁移类型的成功数量：未分片集合迁移、负载均衡迁移、碎片整理迁移
+    return MigrationStats{allMigrationTasks[0]->getNumCompleted(),  // 未分片集合迁移成功数量
+                          allMigrationTasks[1]->getNumCompleted(),  // 负载均衡迁移成功数量  
+                          allMigrationTasks[2]->getNumCompleted()};  // 碎片整理迁移成功数量
 }
 
 void Balancer::_onActionsStreamPolicyStateUpdate() {

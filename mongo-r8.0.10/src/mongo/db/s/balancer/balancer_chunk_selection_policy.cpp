@@ -628,8 +628,6 @@ StatusWith<SplitInfoVector> BalancerChunkSelectionPolicy::_getSplitCandidatesFor
 /*
 Balancer::_mainThread()
     ↓
-Balancer::_doBalanceRound()
-    ↓
 BalancerChunkSelectionPolicy::selectChunksToMove()  ← 这里是实际的类名
     ↓
 BalancerChunkSelectionPolicy::_getMigrateCandidatesForCollection()
