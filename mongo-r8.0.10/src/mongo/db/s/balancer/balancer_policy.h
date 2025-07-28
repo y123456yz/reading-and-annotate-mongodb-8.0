@@ -75,13 +75,50 @@ struct ZoneRange {
     std::string zone;
 };
 
+/**
+ * MigrateInfo 结构体的作用：
+ * 描述一个完整的 chunk 迁移任务，包含迁移操作所需的所有元数据信息。
+ * 
+ * 核心功能：
+ * 1. 封装单个 chunk 迁移的完整信息（源分片、目标分片、chunk范围等）
+ * 2. 支持不同类型的迁移操作（普通迁移、moveRange操作等）
+ * 3. 提供迁移任务的标识和描述信息
+ * 4. 控制是否强制迁移 jumbo chunk
+ * 5. 支持数据大小感知的迁移策略
+ * 
+ * 主要用途：
+ * - 作为负载均衡器生成的迁移计划的基本单元
+ * - 传递给迁移执行器进行实际的 chunk 迁移操作
+ * - 记录和追踪迁移任务的状态和进度
+ */
 struct MigrateInfo {
+    /**
+     * 构造函数1：基于 ChunkType 创建迁移信息
+     * @param a_to 目标分片ID
+     * @param a_nss 集合命名空间
+     * @param a_chunk 要迁移的 chunk 对象
+     * @param a_forceJumbo 是否强制迁移 jumbo chunk
+     * @param maxChunkSizeBytes 可选的最大 chunk 大小限制
+     */
     MigrateInfo(const ShardId& a_to,
                 const NamespaceString& a_nss,
                 const ChunkType& a_chunk,
                 ForceJumbo a_forceJumbo,
                 boost::optional<int64_t> maxChunkSizeBytes = boost::none);
 
+    /**
+     * 构造函数2：基于详细参数创建迁移信息
+     * 用于更灵活的迁移任务创建，特别是 moveRange 操作
+     * @param a_to 目标分片ID
+     * @param a_from 源分片ID
+     * @param a_nss 集合命名空间
+     * @param a_uuid 集合UUID
+     * @param a_min chunk的最小键值
+     * @param a_max chunk的最大键值（可选，用于moveRange）
+     * @param a_version chunk版本信息
+     * @param a_forceJumbo 是否强制迁移 jumbo chunk
+     * @param maxChunkSizeBytes 可选的最大 chunk 大小限制
+     */
     MigrateInfo(const ShardId& a_to,
                 const ShardId& a_from,
                 const NamespaceString& a_nss,
@@ -92,33 +129,125 @@ struct MigrateInfo {
                 ForceJumbo a_forceJumbo,
                 boost::optional<int64_t> maxChunkSizeBytes = boost::none);
 
+    /**
+     * 获取迁移任务的唯一标识名称
+     * @return 迁移任务的字符串标识
+     */
     std::string getName() const;
 
+    /**
+     * 获取迁移任务的详细描述
+     * @return 包含所有迁移信息的字符串表示
+     */
     std::string toString() const;
 
+    /**
+     * 获取最大 chunk 大小限制
+     * @return 可选的最大 chunk 大小（字节）
+     */
     boost::optional<int64_t> getMaxChunkSizeBytes() const;
 
+    // ========== 成员变量 ==========
+
+    /**
+     * 集合命名空间
+     * 作用：标识要迁移的 chunk 属于哪个数据库和集合
+     */
     NamespaceString nss;
+
+    /**
+     * 集合的唯一标识符
+     * 作用：确保迁移操作针对正确的集合版本，避免并发 DDL 操作的冲突
+     */
     UUID uuid;
+
+    /**
+     * 目标分片ID
+     * 作用：指定 chunk 迁移的目标分片
+     */
     ShardId to;
+
+    /**
+     * 源分片ID  
+     * 作用：指定 chunk 当前所在的源分片
+     */
     ShardId from;
+
+    /**
+     * chunk 的最小键值
+     * 作用：定义要迁移的 chunk 范围的下边界（包含）
+     */
     BSONObj minKey;
 
     // May be optional in case of moveRange
+    /**
+     * chunk 的最大键值（可选）
+     * 作用：
+     * - 对于普通 chunk 迁移：定义 chunk 范围的上边界（不包含）
+     * - 对于 moveRange 操作：可能为空，表示迁移到集合末尾
+     * - boost::optional 允许处理不同类型的迁移场景
+     */
     boost::optional<BSONObj> maxKey;
+
+    /**
+     * chunk 版本信息
+     * 作用：
+     * - 确保迁移操作基于最新的 chunk 版本
+     * - 防止并发操作导致的版本冲突
+     * - 支持分片集群的一致性控制
+     */
     ChunkVersion version;
+
+    /**
+     * 强制迁移 jumbo chunk 的标志
+     * 作用：
+     * - ForceJumbo::kDoNotForce：不强制迁移，跳过 jumbo chunk
+     * - ForceJumbo::kForceBalancer：强制迁移，用于特殊场景（如分片下线）
+     * - 控制是否迁移超过大小限制的 chunk
+     */
     ForceJumbo forceJumbo;
 
     // Set only in case of data-size aware balancing
+    /**
+     * 可选的最大 chunk 大小限制（字节）
+     * 作用：
+     * - 仅在数据大小感知均衡时设置
+     * - 用于验证 chunk 是否超过大小限制
+     * - 影响迁移策略和性能预期
+     * - 支持细粒度的大小控制
+     */
     boost::optional<int64_t> optMaxChunkSizeBytes;
 };
 
-enum MigrationReason { none, drain, zoneViolation, chunksImbalance };
+/**
+ * MigrationReason 枚举的作用：
+ * 定义触发 chunk 迁移的原因类型，用于分类和优先级排序不同的迁移场景。
+ */
+enum MigrationReason { 
+    none,               // 无迁移原因
+    drain,              // 分片下线，需要迁移数据
+    zoneViolation,      // zone 约束违规，需要重新分布
+    chunksImbalance     // chunk 负载不均衡
+};
 
+/**
+ * MigrateInfoVector 类型别名的作用：
+ * 表示一组迁移任务的集合，通常为同一轮均衡操作生成的所有迁移计划。
+ */
 typedef std::vector<MigrateInfo> MigrateInfoVector;
 
+/**
+ * MigrateInfosWithReason 类型别名的作用：
+ * 将迁移任务列表与触发原因打包，提供完整的迁移计划上下文信息。
+ * 第一个元素：迁移任务列表
+ * 第二个元素：触发这批迁移的主要原因
+ */
 typedef std::pair<MigrateInfoVector, MigrationReason> MigrateInfosWithReason;
 
+/**
+ * SplitPoints 类型别名的作用：
+ * 定义 chunk 拆分的分割点集合，每个 BSONObj 代表一个拆分边界。
+ */
 typedef std::vector<BSONObj> SplitPoints;
 
 /**
@@ -235,12 +364,46 @@ using NamespaceStringToShardDataSizeMap = stdx::unordered_map<NamespaceString, S
 /*
  * Keeps track of info needed for data size aware balancing.
  */
+/**
+ * CollectionDataSizeInfoForBalancing 结构体的作用：
+ * 存储用于数据大小感知负载均衡的集合统计信息，包含各分片的数据大小映射和最大chunk大小限制。
+ * 
+ * 主要用途：
+ * 1. 提供负载均衡算法所需的数据大小统计信息
+ * 2. 支持基于数据量而非chunk数量的均衡策略
+ * 3. 确保迁移决策考虑实际数据分布情况
+ * 4. 为chunk拆分和合并提供大小约束
+ */
 struct CollectionDataSizeInfoForBalancing {
+    /**
+     * 构造函数：初始化集合的数据大小信息
+     * @param shardToDataSizeMap 分片到数据大小的映射，移动语义避免拷贝
+     * @param maxChunkSizeBytes 最大chunk大小限制（字节）
+     */
     CollectionDataSizeInfoForBalancing(ShardDataSizeMap&& shardToDataSizeMap,
                                        long maxChunkSizeBytes)
         : shardToDataSizeMap(std::move(shardToDataSizeMap)), maxChunkSizeBytes(maxChunkSizeBytes) {}
 
+    /**
+     * 分片到数据大小的映射表
+     * 类型：std::map<ShardId, int64_t>
+     * 作用：
+     * - 记录每个分片上该集合的实际数据大小（字节）
+     * - 用于计算负载均衡时的数据量差异
+     * - 帮助选择过载和轻载的分片
+     * - 支持基于数据大小而非chunk数量的均衡策略
+     */
     ShardDataSizeMap shardToDataSizeMap;
+    
+    /**
+     * 最大chunk大小限制（字节）
+     * 作用：
+     * - 定义单个chunk允许的最大数据量
+     * - 用于判断chunk是否为jumbo chunk
+     * - 影响chunk拆分和迁移决策
+     * - 确保迁移操作不会因chunk过大而失败
+     * - 在均衡算法中作为数据量差异的比较基准
+     */
     const int64_t maxChunkSizeBytes;
 };
 
@@ -361,60 +524,100 @@ public:
      * Effectively, return of 'true' means all chunks were visited and none matched, and
      * 'false' means the hanlder return 'false' before visiting all chunks.
      */
+
+    /**
+     * forEachChunkOnShardInZone 的作用：
+     * 遍历指定分片在指定 zone 内的所有 chunk，对每个 chunk 执行用户提供的处理函数。
+     * 
+     * 核心功能：
+     * 1. 在指定分片和 zone 的交集范围内查找所有 chunk
+     * 2. 对找到的每个 chunk 调用用户提供的处理函数（handler）
+     * 3. 支持提前终止遍历：当 handler 返回 false 时停止遍历
+     * 4. 利用预缓存的索引信息优化遍历性能，避免全集合扫描
+     * 
+     * 返回值语义：
+     * - true：所有 chunk 都被访问完毕，或该分片在该 zone 内没有 chunk
+     * - false：handler 在某个 chunk 上返回了 false，提前终止了遍历
+     * 
+     * 主要用于负载均衡算法中快速定位和处理特定分片特定 zone 的 chunk。
+     */
     template <typename Callable>
     bool forEachChunkOnShardInZone(const ShardId& shardId,
                                    const std::string& zoneName,
                                    Callable&& handler) const {
-
+    
         bool shouldContinue = true;
-
+    
+        // 获取指定分片的所有 zone 信息映射
         const auto& shardZoneInfoMap = getZoneInfoForShard(shardId);
+        // 查找指定 zone 在该分片上的信息
         auto shardZoneInfoIt = shardZoneInfoMap.find(zoneName);
         if (shardZoneInfoIt == shardZoneInfoMap.end()) {
+            // 该分片在指定 zone 内没有 chunk，直接返回 true
             return shouldContinue;
         }
         const auto& shardZoneInfo = shardZoneInfoIt->second;
-
+    
         // Start from the first normalized zone that contains chunks for this shard
+        // 从包含该分片 chunk 的第一个规范化 zone 开始
+        // 利用预缓存的索引 firstNormalizedZoneIdx 直接定位，避免从头扫描
         const auto initialZoneIt = _normalizedZones.cbegin() + shardZoneInfo.firstNormalizedZoneIdx;
-
+    
+        // 遍历从初始 zone 开始的所有规范化 zone 范围
         for (auto normalizedZoneIt = initialZoneIt; normalizedZoneIt < _normalizedZones.cend();
              normalizedZoneIt++) {
             const auto& zoneRange = *normalizedZoneIt;
-
+    
+            // 判断是否为该分片在目标 zone 的第一个范围
             const auto isFirstRange = (normalizedZoneIt == initialZoneIt);
-
+    
             if (isFirstRange) {
+                // 第一个范围必须与目标 zone 匹配（数据一致性检查）
                 tassert(
                     8236530,
                     "Unexpected first normalized zone for shard '{}'. Expected '{}' but found '{}'"_format(
                         shardId.toString(), zoneName, zoneRange.zone),
                     zoneRange.zone == zoneName);
             } else if (zoneRange.zone != zoneName) {
+                // 跳过不匹配的 zone 范围，继续查找目标 zone 的下一个范围
                 continue;
             }
-
+    
             // For the first range in zone we have pre-cached the minKey of the first chunk,
             // thus we can start iterating from that one.
             // For the subsequent ranges in this zone we start iterating from the minKey of
             // the range itself.
+            // 
+            // 优化遍历起点：
+            // - 对于第一个范围：使用预缓存的 firstChunkMinKey，直接定位到该分片的第一个 chunk
+            // - 对于后续范围：从 zone 范围的 minKey 开始遍历
             const auto firstKey = isFirstRange ? shardZoneInfo.firstChunkMinKey : zoneRange.min;
-
+    
+            // 在当前 zone 范围内查找与指定分片相关的所有 chunk
             getChunkManager().forEachOverlappingChunk(
                 firstKey, zoneRange.max, false /* isMaxInclusive */, [&](const auto& chunk) {
+                    // 过滤：只处理属于目标分片的 chunk
                     if (chunk.getShardId() != shardId) {
-                        return true;  // continue
+                        return true;  // continue - 跳过不属于目标分片的 chunk
                     }
+                    
+                    // 调用用户提供的处理函数
                     if (!handler(chunk)) {
+                        // handler 返回 false，标记需要停止遍历
                         shouldContinue = false;
                     };
-                    return shouldContinue;
+                    return shouldContinue; // 返回是否继续遍历的标志
                 });
-
+    
+            // 如果 handler 要求停止遍历，则跳出外层循环
             if (!shouldContinue) {
                 break;
             }
         }
+        
+        // 返回遍历结果：
+        // true  - 所有 chunk 都被访问，没有提前终止
+        // false - handler 在某个 chunk 上返回 false，提前终止
         return shouldContinue;
     }
 

@@ -1119,10 +1119,23 @@ void Balancer::_mainThread() {
             if (balancerConfig->shouldBalanceForAutoMerge()) {
                 _autoMergerPolicy->enable(opCtx.get());
             }
-
+            
+            /* waitForDelete 的作用
+            * waitForDelete 控制负载均衡器是否等待 chunk 迁移的删除阶段完成后再开始下一个迁移。
+            * 具体行为：
+            * 默认值：false - 负载均衡器在开始下一个 chunk 迁移之前不会等待进行中迁移的删除阶段完成
+            * 设为 true - 删除阶段会阻止下一个 chunk 迁移开始，确保迁移更加保守和安全
+            * 
+            * secondaryThrottle 控制 chunk 迁移过程中的副本集写入节流策略，影响迁移的写入关注点（write concern）。
+            * 具体作用：
+            * 启用时： 迁移操作会等待指定数量的副本节点确认写入，确保数据安全性
+            * 禁用时： 迁移操作只需要主节点确认，提高迁移速度但降低安全性
+            * 可配置写入关注点： 支持自定义需要确认的副本节点数量
+            */
             LOGV2_DEBUG(21860,
                         1,
                         "Start balancing round",
+                        //默认情况下，负载均衡器在开始下一数据段迁移之前不会等待进行中迁移的删除阶段完成。要让删除阶段阻止下一数据段迁移开始，可将 _waitForDelete 设为 true。
                         "waitForDelete"_attr = balancerConfig->waitForDelete(),
                         "secondaryThrottle"_attr = balancerConfig->getSecondaryThrottle().toBSON());
 

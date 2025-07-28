@@ -460,6 +460,7 @@ StatusWith<MigrateInfoVector> BalancerChunkSelectionPolicy::selectChunksToMove(
 
             const auto& migrateCandidates = swMigrateCandidates.getValue().first;
             // 若无迁移候选，则移除缓存；否则缓存集合名
+            // 把需要balance的表名加入缓存
             if (migrateCandidates.empty()) {
                 imbalancedCollectionsCachePtr->erase(nss);
             } else if (imbalancedCollectionsCachePtr->size() < kMaxCachedCollectionsSize) {
@@ -492,6 +493,7 @@ StatusWith<MigrateInfoVector> BalancerChunkSelectionPolicy::selectChunksToMove(
     }
 
     // 随机遍历剩余集合，批量收集迁移候选 chunk
+    // 选出100个可 balance 的集合，这100个集合执行 processBatch 选出候选chunk, 每一批集合中挑选候选 chunk 的时间不超过 balancerChunksSelectionTimeoutMs 毫秒，避免挑选chunk耗时太长
     auto client = opCtx->getClient();
     std::shuffle(collections.begin(), collections.end(), client->getPrng().urbg());
     for (const auto& coll : collections) {
@@ -623,6 +625,17 @@ StatusWith<SplitInfoVector> BalancerChunkSelectionPolicy::_getSplitCandidatesFor
     return splitCandidates.done();
 }
 
+/*
+Balancer::_mainThread()
+    ↓
+Balancer::_doBalanceRound()
+    ↓
+BalancerChunkSelectionPolicy::selectChunksToMove()  ← 这里是实际的类名
+    ↓
+BalancerChunkSelectionPolicy::_getMigrateCandidatesForCollection()
+    ↓
+BalancerPolicy::balance()
+*/
 /**
  * 计算指定集合（nss）本轮需要迁移的 chunk，生成迁移候选任务（MigrateInfosWithReason）。
  * 主要流程：

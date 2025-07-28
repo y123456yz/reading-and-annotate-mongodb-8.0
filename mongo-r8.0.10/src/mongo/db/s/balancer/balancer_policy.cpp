@@ -299,6 +299,18 @@ Status BalancerPolicy::isShardSuitableReceiver(const ClusterStatistics::ShardSta
     return Status::OK();
 }
 
+/**
+ * BalancerPolicy::_getLeastLoadedReceiverShard 的作用：
+ * 在指定 zone 内查找数据量最小且适合作为迁移目标的分片，用于负载均衡中选择最佳的 chunk 接收方。
+ * 
+ * 核心逻辑：
+ * 1. 遍历所有可用分片，检查分片是否适合作为接收方（非 draining 状态，符合 zone 约束）。
+ * 2. 获取各分片在指定集合的数据大小统计信息。
+ * 3. 比较各分片的数据量，选择数据量最小的分片作为最佳接收候选。
+ * 4. 返回负载最轻的分片ID及其数据大小，供后续迁移决策使用。
+ * 
+ * 注意：该函数会进行 zone 约束和 draining 状态检查，确保选出的分片能安全接收数据。
+ */
 std::tuple<ShardId, int64_t> BalancerPolicy::_getLeastLoadedReceiverShard(
     const ShardStatisticsVector& shardStats,
     const CollectionDataSizeInfoForBalancing& collDataSizeInfo,
@@ -307,31 +319,48 @@ std::tuple<ShardId, int64_t> BalancerPolicy::_getLeastLoadedReceiverShard(
     ShardId best;
     int64_t currentMin = numeric_limits<int64_t>::max();
 
+    // 遍历所有分片统计信息，寻找数据量最小且适合的接收分片
     for (const auto& stat : shardStats) {
+        // 跳过不在可用分片集合中的分片
         if (!availableShards.count(stat.shardId))
             continue;
 
+        // 检查分片是否适合作为接收方（非 draining 状态，符合 zone 约束）
         auto status = isShardSuitableReceiver(stat, zone);
         if (!status.isOK()) {
             continue;
         }
 
+        // 从集合数据大小信息中查找该分片的数据统计
         const auto& shardSizeIt = collDataSizeInfo.shardToDataSizeMap.find(stat.shardId);
         if (shardSizeIt == collDataSizeInfo.shardToDataSizeMap.end()) {
             // Skip if stats not available (may happen if add|remove shard during a round)
             continue;
         }
 
+        // 获取该分片的数据大小，并与当前最小值比较
         const auto shardSize = shardSizeIt->second;
         if (shardSize < currentMin) {
-            best = stat.shardId;
-            currentMin = shardSize;
+            best = stat.shardId;        // 更新负载最轻的分片ID
+            currentMin = shardSize;     // 更新当前最小数据量
         }
     }
 
+    // 返回负载最轻的分片ID及其数据大小
     return {best, currentMin};
 }
 
+/**
+ * BalancerPolicy::_getMostOverloadedShard 的作用：
+ * 在指定 zone 内查找数据量最大（过载最严重）的分片，用于负载均衡中选择需要减负的源分片。
+ * 
+ * 核心逻辑：
+ * 1. 遍历所有可用分片，获取各分片在指定集合的数据大小统计信息。
+ * 2. 比较各分片的数据量，选择数据量最大的分片作为候选。
+ * 3. 返回过载最严重的分片ID及其数据大小，供后续迁移决策使用。
+ * 
+ * 注意：该函数不考虑 zone 约束检查，只是单纯基于数据量大小选择分片。
+ */
 std::tuple<ShardId, int64_t> BalancerPolicy::_getMostOverloadedShard(
     const ShardStatisticsVector& shardStats,
     const CollectionDataSizeInfoForBalancing& collDataSizeInfo,
@@ -340,23 +369,28 @@ std::tuple<ShardId, int64_t> BalancerPolicy::_getMostOverloadedShard(
     ShardId worst;
     long long currentMax = numeric_limits<long long>::min();
 
+    // 遍历所有分片统计信息，寻找数据量最大的分片
     for (const auto& stat : shardStats) {
+        // 跳过不在可用分片集合中的分片
         if (!availableShards.count(stat.shardId))
             continue;
 
+        // 从集合数据大小信息中查找该分片的数据统计
         const auto& shardSizeIt = collDataSizeInfo.shardToDataSizeMap.find(stat.shardId);
         if (shardSizeIt == collDataSizeInfo.shardToDataSizeMap.end()) {
             // Skip if stats not available (may happen if add|remove shard during a round)
             continue;
         }
 
+        // 获取该分片的数据大小，并与当前最大值比较
         const auto shardSize = shardSizeIt->second;
         if (shardSize > currentMax) {
-            worst = stat.shardId;
-            currentMax = shardSize;
+            worst = stat.shardId;        // 更新过载最严重的分片ID
+            currentMax = shardSize;      // 更新当前最大数据量
         }
     }
 
+    // 返回过载最严重的分片ID及其数据大小
     return {worst, currentMax};
 }
 
@@ -443,6 +477,19 @@ boost::optional<MigrateInfo> chooseRandomMigration(
         recipientShard.get(), distribution.nss(), randomChunk, ForceJumbo::kDoNotForce};
 }
 
+/*
+Balancer::_mainThread()
+    ↓
+Balancer::_doBalanceRound()
+    ↓
+BalancerChunkSelectionPolicy::selectChunksToMove()  ← 这里是实际的类名
+    ↓
+BalancerChunkSelectionPolicy::_getMigrateCandidatesForCollection()
+    ↓
+BalancerPolicy::balance()
+*/
+// BalancerChunkSelectionPolicyImpl::selectChunksToMove 调用
+// 返回需要迁移的 chunk 列表和迁移原因
 MigrateInfosWithReason BalancerPolicy::balance(
     const ShardStatisticsVector& shardStats,
     const DistributionStatus& distribution,
@@ -454,6 +501,7 @@ MigrateInfosWithReason BalancerPolicy::balance(
 
     // 1) Check for shards, which are in draining mode
     {
+        // 遍历所有分片，优先处理 draining 状态分片上的 chunk
         for (const auto& stat : shardStats) {
             if (!stat.isDraining)
                 continue;
@@ -469,6 +517,7 @@ MigrateInfosWithReason BalancerPolicy::balance(
             for (const auto& shardZone : shardZones) {
                 const auto& zoneName = shardZone.first;
 
+                // 遍历该分片该zone下的所有chunk，优先迁移非jumbo chunk
                 const auto chunkFoundForShard = !distribution.forEachChunkOnShardInZone(
                     stat.shardId, zoneName, [&](const auto& chunk) {
                         if (chunk.isJumbo()) {
@@ -476,6 +525,7 @@ MigrateInfosWithReason BalancerPolicy::balance(
                             return true;  // continue
                         }
 
+                        // 选择负载最轻的目标分片
                         const auto [to, _] = _getLeastLoadedReceiverShard(
                             shardStats, collDataSizeInfo, zoneName, *availableShards);
                         if (!to.isValid()) {
@@ -494,6 +544,7 @@ MigrateInfosWithReason BalancerPolicy::balance(
                         tassert(
                             8245225, "Destination shard is a draining shard", to != stat.shardId);
 
+                        // 生成迁移任务，强制迁移jumbo chunk
                         migrations.emplace_back(
                             to,
                             chunk.getShardId(),
@@ -510,6 +561,7 @@ MigrateInfosWithReason BalancerPolicy::balance(
                             firstReason = MigrationReason::drain;
                         }
 
+                        // 从可用分片集合中移除已迁移的分片，避免重复迁移
                         tassert(8245226,
                                 "Migration's source shard does not exist in available shards",
                                 availableShards->erase(stat.shardId));
@@ -531,6 +583,7 @@ MigrateInfosWithReason BalancerPolicy::balance(
                               "numJumboChunks"_attr = numJumboChunks);
             }
 
+            // 可用分片数不足2时提前返回
             if (availableShards->size() < 2) {
                 return std::make_pair(std::move(migrations), firstReason);
             }
@@ -540,16 +593,19 @@ MigrateInfosWithReason BalancerPolicy::balance(
     // Select random migrations after checking for draining shards so tests with removeShard or
     // transitionToDedicatedConfigServer can eventually drain shards.
     // NOTE: randomly chosen migrations do not respect zones.
+    // 2) 支持 failpoint 测试场景下的随机迁移（不考虑 zone）
     if (MONGO_unlikely(balancerShouldReturnRandomMigrations.shouldFail()) &&
         !distribution.nss().isConfigDB()) {
         LOGV2_DEBUG(21881, 1, "balancerShouldReturnRandomMigrations failpoint is set");
 
+        // 随机选择迁移任务用于测试
         auto migration = chooseRandomMigration(shardStats, *availableShards, distribution);
 
         if (migration) {
             migrations.push_back(migration.get());
             firstReason = MigrationReason::chunksImbalance;
 
+            // 从可用分片集合中移除已迁移的分片，避免重复迁移
             tassert(8245223,
                     "Migration's from shard does not exist in available shards",
                     availableShards->erase(migration.get().from));
@@ -561,7 +617,7 @@ MigrateInfosWithReason BalancerPolicy::balance(
         }
     }
 
-    // 2) Check for chunks, which are on the wrong shard and must be moved off of it
+    // 3) 检查 zone 约束，迁移落在错误分片上的 chunk，使其分布满足 zone 规则
     if (!distribution.zones().empty()) {
         for (const auto& stat : shardStats) {
 
@@ -643,29 +699,37 @@ MigrateInfosWithReason BalancerPolicy::balance(
         }
     }
 
-    // 3) for each zone balance
-
+    // 4) 按 zone 逐步均衡数据量，迁移 chunk 以实现 zone 内负载均衡
     vector<string> zonesPlusEmpty(distribution.zones().begin(), distribution.zones().end());
     zonesPlusEmpty.push_back(ZoneInfo::kNoZoneName);
-
+    
     for (const auto& zone : zonesPlusEmpty) {
         size_t numShardsInZone = 0;
         int64_t totalDataSizeOfShardsWithZone = 0;
-
+    
+        // 统计当前 zone 内分片数量和总数据量
         for (const auto& stat : shardStats) {
+            // 检查分片是否属于当前 zone
+            // 如果是 kNoZoneName（无zone），则所有分片都算在内
+            // 如果是具体 zone，则只统计属于该 zone 的分片
             if (zone == ZoneInfo::kNoZoneName || stat.shardZones.count(zone)) {
+                // 从集合数据大小信息中查找该分片的数据统计
                 const auto& shardSizeIt = collDataSizeInfo.shardToDataSizeMap.find(stat.shardId);
                 if (shardSizeIt == collDataSizeInfo.shardToDataSizeMap.end()) {
                     // Skip if stats not available (may happen if add|remove shard during a round)
+                    // 跳过统计信息不可用的分片（可能在均衡轮次中添加或移除分片）
                     continue;
                 }
+                // 累加该 zone 内所有分片的数据量
                 totalDataSizeOfShardsWithZone += shardSizeIt->second;
+                // 累计该 zone 内的分片数量
                 numShardsInZone++;
             }
         }
-
+    
         // Skip zones which have no shards assigned to them. This situation is not harmful, but
         // should not be possible so warn the operator to correct it.
+        // 跳过没有分配分片的 zone。这种情况无害，但不应该发生，因此警告操作员纠正它
         if (numShardsInZone == 0) {
             if (zone != ZoneInfo::kNoZoneName) {
                 LOGV2_WARNING(21893,
@@ -675,24 +739,31 @@ MigrateInfosWithReason BalancerPolicy::balance(
                               "zone"_attr = redact(zone),
                               logAttrs(distribution.nss()));
             }
-            continue;
+            continue; // 跳过这个 zone，处理下一个
         }
-
+    
+        // 断言：确保 zone 内的总数据量不为负数
         tassert(ErrorCodes::BadValue,
                 str::stream() << "Total data size for shards in zone " << zone << " and collection "
                               << distribution.nss().toStringForErrorMsg()
                               << " must be greater or equal than zero but is "
                               << totalDataSizeOfShardsWithZone,
                 totalDataSizeOfShardsWithZone >= 0);
-
+    
         if (totalDataSizeOfShardsWithZone == 0) {
             // No data to balance within this zone
+            // 该 zone 内没有数据需要均衡，跳过
             continue;
         }
-
+    
+        // 计算该 zone 内每个分片的理想数据量
+        // 理想数据量 = zone 内总数据量 / zone 内分片数量
         const int64_t idealDataSizePerShardForZone =
             totalDataSizeOfShardsWithZone / numShardsInZone;
-
+    
+        // 在该 zone 内重复执行单轮均衡，直到无法找到更多迁移候选
+        // _singleZoneBalanceBasedOnDataSize 返回 true 表示找到了一个迁移任务
+        // 返回 false 表示该 zone 已经均衡或无法找到合适的迁移候选
         while (_singleZoneBalanceBasedOnDataSize(shardStats,
                                                  distribution,
                                                  collDataSizeInfo,
@@ -702,15 +773,28 @@ MigrateInfosWithReason BalancerPolicy::balance(
                                                  availableShards,
                                                  forceJumbo ? ForceJumbo::kForceBalancer
                                                             : ForceJumbo::kDoNotForce)) {
+            // 如果这是第一个迁移任务，设置迁移原因为 chunksImbalance
             if (firstReason == MigrationReason::none) {
                 firstReason = MigrationReason::chunksImbalance;
             }
+            // 继续下一轮均衡，直到该 zone 内无法找到更多迁移候选
         }
     }
 
     return std::make_pair(std::move(migrations), firstReason);
 }
 
+/**
+ * BalancerPolicy::_singleZoneBalanceBasedOnDataSize 的作用：
+ * 在指定 zone 内基于数据大小进行单轮负载均衡，通过迁移 chunk 使分片间数据分布更加均衡。
+ * 
+ * 核心逻辑：
+ * 1. 找出该 zone 内数据量最大的分片（donor）和数据量最小的分片（recipient）。
+ * 2. 判断是否满足迁移条件：donor 数据量超过理想值，recipient 数据量低于理想值，且两者差距足够大。
+ * 3. 从 donor 分片选择一个非 jumbo chunk 迁移到 recipient 分片。
+ * 4. 生成迁移任务并更新可用分片集合，避免重复迁移。
+ * 5. 返回是否成功找到并生成了迁移任务。
+ */
 bool BalancerPolicy::_singleZoneBalanceBasedOnDataSize(
     const ShardStatisticsVector& shardStats,
     const DistributionStatus& distribution,
@@ -720,11 +804,14 @@ bool BalancerPolicy::_singleZoneBalanceBasedOnDataSize(
     vector<MigrateInfo>* migrations,
     stdx::unordered_set<ShardId>* availableShards,
     ForceJumbo forceJumbo) {
+    
+    // 找出该 zone 内数据量最大的分片作为 donor
     const auto [from, fromSize] =
         _getMostOverloadedShard(shardStats, collDataSizeInfo, zone, *availableShards);
     if (!from.isValid())
         return false;
 
+    // 找出该 zone 内数据量最小且可接收数据的分片作为 recipient
     const auto [to, toSize] =
         _getLeastLoadedReceiverShard(shardStats, collDataSizeInfo, zone, *availableShards);
     if (!to.isValid()) {
@@ -734,6 +821,7 @@ bool BalancerPolicy::_singleZoneBalanceBasedOnDataSize(
         return false;
     }
 
+    // 源分片和目标分片相同，无需迁移
     if (from == to) {
         return false;
     }
@@ -750,15 +838,18 @@ bool BalancerPolicy::_singleZoneBalanceBasedOnDataSize(
                 "toShardDataSize"_attr = toSize,
                 "maxChunkSizeBytes"_attr = collDataSizeInfo.maxChunkSizeBytes);
 
+    // 源分片数据量未超过理想值，无需迁移
     if (fromSize <= idealDataSizePerShardForZone) {
         return false;
     }
 
+    // 目标分片数据量已达到或超过理想值，不适合作为接收方
     if (toSize >= idealDataSizePerShardForZone) {
         // Do not use a shard if it already has more data than the ideal per-shard size
         return false;
     }
 
+    // 两个分片间数据量差距不够大（小于3个chunk大小），不值得迁移
     if (fromSize - toSize < 3 * collDataSizeInfo.maxChunkSizeBytes) {
         // Do not balance if the collection's size differs too few between the chosen shards
         return false;
@@ -770,13 +861,16 @@ bool BalancerPolicy::_singleZoneBalanceBasedOnDataSize(
 
     unsigned numJumboChunks = 0;
 
+    // 遍历源分片在该 zone 下的所有 chunk，寻找可迁移的非 jumbo chunk
+    //  找到一个可迁移的 chunk 即可，跳出循环
     const auto chunkFound =
         !distribution.forEachChunkOnShardInZone(fromShardId, zone, [&](const auto& chunk) {
             if (chunk.isJumbo()) {
                 numJumboChunks++;
-                return true;  // continue
+                return true;  // continue - jumbo chunk 无法迁移，继续寻找下一个
             }
 
+            // 生成迁移任务：将该 chunk 从源分片迁移到目标分片
             migrations->emplace_back(toShardId,
                                      chunk.getShardId(),
                                      distribution.nss(),
@@ -786,15 +880,18 @@ bool BalancerPolicy::_singleZoneBalanceBasedOnDataSize(
                                      chunk.getLastmod(),
                                      forceJumbo,
                                      collDataSizeInfo.maxChunkSizeBytes);
+            
+            // 从可用分片集合中移除源分片和目标分片，避免本轮重复迁移
             tassert(8245231,
                     "Source shard does not exist in available shards",
                     availableShards->erase(chunk.getShardId()));
             tassert(8245232,
                     "Target shard does not exist in available shards",
                     availableShards->erase(toShardId));
-            return false;  // break
+            return false;  // break - 找到一个可迁移的 chunk 即可，跳出循环
         });
 
+    // 如果源分片只有 jumbo chunk 且无法找到可迁移的 chunk，记录警告
     if (!chunkFound && numJumboChunks) {
         LOGV2_WARNING(6581602,
                       "Shard has only jumbo chunks for this collection and cannot be balanced",
@@ -804,6 +901,7 @@ bool BalancerPolicy::_singleZoneBalanceBasedOnDataSize(
                       "numJumboChunks"_attr = numJumboChunks);
     }
 
+    // 返回是否成功找到并生成了迁移任务
     return chunkFound;
 }
 
