@@ -434,7 +434,7 @@ void enqueueChunkMigrations(OperationContext* opCtx,
         requestBase.setMin(migrateInfo.minKey);
         requestBase.setMax(migrateInfo.maxKey);
 
-        // 构建完整的 ShardsvrMoveRange 命令请求
+        // 构建完整的 ShardsvrMoveRange 命令请求, 原分片收到该命令后执行 ShardsvrMoveRangeCommand doRun接口启动真正的数据迁移
         ShardsvrMoveRange shardSvrRequest(migrateInfo.nss);
         shardSvrRequest.setDbName(DatabaseName::kAdmin);
         shardSvrRequest.setMoveRangeRequestBase(requestBase);
