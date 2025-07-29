@@ -96,6 +96,7 @@ const WriteConcernOptions kMajorityWriteConcern(WriteConcernOptions::kMajority,
                                                 WriteConcernOptions::SyncMode::UNSET,
                                                 WriteConcernOptions::kWriteConcernTimeoutSharding);
 
+// _shardsvrMoveRange命令处理，config server发送给数据迁移的原分片
 class ShardsvrMoveRangeCommand final : public TypedCommand<ShardsvrMoveRangeCommand> {
 public:
     using Request = ShardsvrMoveRange;
@@ -319,7 +320,7 @@ public:
      */
     static void _runImpl(OperationContext* opCtx,
                          ShardsvrMoveRange&& request,
-                         WriteConcernOptions&& writeConcern) {
+                         WriteConcernOptions&& writeConcern) {//ShardsvrMoveRangeCommand::_runImpl
         // 早期返回检查：如果源分片和目标分片相同，无需执行迁移
         // 这是一种优化，避免不必要的处理开销
         if (request.getFromShard() == request.getToShard()) {

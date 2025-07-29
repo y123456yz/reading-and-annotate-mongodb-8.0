@@ -323,6 +323,38 @@ void setPrepareConflictBehaviorForReadConcernImpl(OperationContext* opCtx,
     shard_role_details::getRecoveryUnit(opCtx)->setPrepareConflictBehavior(prepareConflictBehavior);
 }
 
+/**
+ * waitForReadConcernImpl 函数的作用：
+ * MongoDB mongod 环境中读关注点的具体实现，确保读操作满足指定的一致性级别要求。
+ * 
+ * 核心功能：
+ * 1. 读关注点级别验证：验证并处理不同级别的读关注点（local、majority、linearizable、snapshot）
+ * 2. 集群时间协调：处理 afterClusterTime 和 atClusterTime 参数，确保因果一致性
+ * 3. 复制集状态等待：与复制协调器交互，等待指定的 OpTime 或快照可用
+ * 4. 存储引擎集成：设置适当的时间戳读取源，确保读取一致性
+ * 5. 线性化读取支持：为 linearizable 读关注点提供特殊处理
+ * 6. 推测性读取优化：支持推测性 majority 读取以提高性能
+ * 
+ * 一致性保证：
+ * - local：读取本地最新数据，无需等待复制
+ * - available：读取可用数据，适用于分片环境
+ * - majority：等待数据被大多数节点确认
+ * - linearizable：提供线性化一致性保证
+ * - snapshot：在指定时间戳提供快照隔离
+ * 
+ * 时间戳处理：
+ * - afterClusterTime：等待集群时间达到指定值后读取
+ * - atClusterTime：在精确的集群时间点读取
+ * - 自动生成 noop 写入以推进集群时间（如需要）
+ * 
+ * 特殊场景处理：
+ * - 独立节点的限制检查
+ * - 复制集成员状态验证
+ * - 事务中的读关注点处理
+ * - 租户迁移期间的特殊逻辑
+ * 
+ * 该函数是 mongod 读一致性的核心实现，通过弱符号注册机制被统一接口调用。
+ */
 Status waitForReadConcernImpl(OperationContext* opCtx,
                               const repl::ReadConcernArgs& readConcernArgs,
                               const DatabaseName& dbName,
@@ -331,14 +363,27 @@ Status waitForReadConcernImpl(OperationContext* opCtx,
     // wait for read concern. This is fine, since the outer operation should have handled waiting
     // for read concern. We don't want to ignore prepare conflicts because reads in transactions
     // should block on prepared transactions.
+    //
+    // 直接客户端锁定检查：
+    // 功能：检测是否在持有全局锁的直接客户端中执行
+    // 原理：直接客户端表示内部操作，外层操作应已处理读关注点等待
+    // 目的：避免嵌套等待导致的死锁，确保事务中读取正确阻塞预备事务
     if (opCtx->getClient()->isInDirectClient() &&
         shard_role_details::getLocker(opCtx)->isLocked()) {
         return Status::OK();
     }
 
+    // 获取复制协调器：
+    // 功能：获取当前节点的复制集协调器实例
+    // 用途：后续的读关注点处理需要与复制集状态交互
+    // 要求：在 mongod 环境中，复制协调器必须存在
     repl::ReplicationCoordinator* const replCoord = repl::ReplicationCoordinator::get(opCtx);
     invariant(replCoord);
 
+    // 线性化读关注点特殊处理：
+    // 功能：对 linearizable 读关注点进行预检查和限制
+    // 要求：必须在复制集环境中，且必须在主节点上执行
+    // 限制：不支持 afterOpTime 参数，因为线性化读取有特殊的时序要求
     if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kLinearizableReadConcern) {
         if (!replCoord->getSettings().isReplSet()) {
             // For standalone nodes, Linearizable Read is not supported.
@@ -357,6 +402,10 @@ Status waitForReadConcernImpl(OperationContext* opCtx,
         }
     }
 
+    // 快照读关注点特殊处理：
+    // 功能：对 snapshot 读关注点进行环境检查
+    // 要求：必须在复制集环境中，且需要启用 majority 读关注点支持
+    // 例外：多文档事务中可以使用，即使 enableMajorityReadConcern=false
     if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern) {
         if (!replCoord->getSettings().isReplSet()) {
             return {ErrorCodes::NotAReplicaSet,
@@ -369,22 +418,40 @@ Status waitForReadConcernImpl(OperationContext* opCtx,
         }
     }
 
+    // 集群时间参数提取：
+    // 功能：从读关注点参数中提取时间戳相关设置
+    // afterClusterTime：指定读取的最小集群时间（因果一致性）
+    // atClusterTime：指定读取的精确集群时间（快照读取）
     auto afterClusterTime = readConcernArgs.getArgsAfterClusterTime();
     auto atClusterTime = readConcernArgs.getArgsAtClusterTime();
 
+    // afterClusterTime 权限检查：
+    // 功能：检查当前命令是否允许使用 afterClusterTime 参数
+    // 目的：某些命令不支持因果一致性，需要在此处阻止
     if (afterClusterTime) {
         if (!allowAfterClusterTime) {
             return {ErrorCodes::InvalidOptions, "afterClusterTime is not allowed for this command"};
         }
     }
 
+    // 主要的读关注点处理逻辑：
+    // 功能：处理非空的读关注点参数
+    // 包括：集群时间验证、noop 写入、OpTime 等待等
     if (!readConcernArgs.isEmpty()) {
+        // 时间戳互斥性检查：
+        // 功能：确保 afterClusterTime 和 atClusterTime 不能同时指定
+        // 原理：这两个参数有不同的语义，不能混合使用
         invariant(!afterClusterTime || !atClusterTime);
         auto targetClusterTime = afterClusterTime ? afterClusterTime : atClusterTime;
 
+        // 集群时间相关处理：
+        // 功能：验证和处理指定的集群时间参数
         if (targetClusterTime) {
             std::string readConcernName = afterClusterTime ? "afterClusterTime" : "atClusterTime";
 
+            // 复制集环境检查：
+            // 功能：确保只有在复制集环境中才能使用集群时间
+            // 原理：独立节点没有集群时间概念
             if (!replCoord->getSettings().isReplSet()) {
                 return {ErrorCodes::IllegalOperation,
                         str::stream() << "Cannot specify " << readConcernName
@@ -395,10 +462,19 @@ Status waitForReadConcernImpl(OperationContext* opCtx,
             // run into a race where the cluster time is read as uninitialized, but the member state
             // is set to RECOVERING by another thread before we invariant that the node is in
             // STARTUP or STARTUP2.
+            //
+            // 成员状态和集群时间获取：
+            // 功能：按正确顺序获取成员状态和集群时间，避免竞争条件
+            // 原理：必须先读取成员状态，再获取集群时间，防止状态不一致
+            // 目的：确保在启动阶段正确处理未初始化的集群时间
             const auto memberState = replCoord->getMemberState();
 
             const auto currentTime = VectorClock::get(opCtx)->getTime();
             const auto clusterTime = currentTime.clusterTime();
+            
+            // 集群时间有效性检查：
+            // 功能：检查当前集群时间是否已初始化
+            // 条件：只有在 STARTUP 或 STARTUP2 状态下，集群时间才允许未初始化
             if (!VectorClock::isValidComponentTime(clusterTime)) {
                 // currentTime should only be uninitialized if we are in startup recovery or initial
                 // sync.
@@ -409,6 +485,10 @@ Status waitForReadConcernImpl(OperationContext* opCtx,
                                       << targetClusterTime->toString()
                                       << "; current clusterTime: " << clusterTime.toString()};
             }
+            
+            // 集群时间范围检查：
+            // 功能：确保请求的集群时间不超过当前集群时间
+            // 原理：不能读取"未来"的数据，只能读取已经发生的数据
             if (clusterTime < *targetClusterTime) {
                 return {ErrorCodes::InvalidOptions,
                         str::stream() << "readConcern " << readConcernName
@@ -418,6 +498,10 @@ Status waitForReadConcernImpl(OperationContext* opCtx,
                                       << "; current clusterTime: " << clusterTime.toString()};
             }
 
+            // Noop 写入生成（如需要）：
+            // 功能：如果目标集群时间超过本地最后写入时间，生成 noop 写入
+            // 目的：确保本地 oplog 时间戳满足读关注点要求
+            // 机制：向主节点发送 appendOplogNote 命令
             auto status = makeNoopWriteIfNeeded(opCtx, *targetClusterTime, dbName);
             if (!status.isOK()) {
                 LOGV2(20990,
@@ -427,6 +511,10 @@ Status waitForReadConcernImpl(OperationContext* opCtx,
             }
         }
 
+        // OpTime 等待处理：
+        // 功能：等待复制集达到指定的 OpTime 或读关注点条件
+        // 适用：复制集环境，或非 afterClusterTime 的情况
+        // 原理：通过复制协调器等待数据复制到足够多的节点
         if (replCoord->getSettings().isReplSet() || !afterClusterTime) {
             auto status = replCoord->waitUntilOpTimeForRead(opCtx, readConcernArgs);
             if (!status.isOK()) {
@@ -435,11 +523,23 @@ Status waitForReadConcernImpl(OperationContext* opCtx,
         }
     }
 
+    // 存储引擎读取源设置：
+    // 功能：根据读关注点类型设置合适的时间戳读取源
+    // 目的：确保存储引擎在正确的时间点读取数据
     auto ru = shard_role_details::getRecoveryUnit(opCtx);
+    
+    // atClusterTime 精确时间戳读取：
+    // 功能：设置存储引擎在指定的精确时间戳读取
+    // 用途：支持快照隔离和时间点恢复
     if (atClusterTime) {
         ru->setTimestampReadSource(RecoveryUnit::ReadSource::kProvided,
                                    atClusterTime->asTimestamp());
-    } else if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern &&
+    } 
+    // 快照读关注点的自动时间戳选择：
+    // 功能：为 snapshot 读关注点自动选择合适的快照时间戳
+    // 条件：复制集环境且不在多文档事务中
+    // 原理：使用当前提交的快照 OpTime
+    else if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern &&
                replCoord->getSettings().isReplSet() && !opCtx->inMultiDocumentTransaction()) {
         auto opTime = replCoord->getCurrentCommittedSnapshotOpTime();
         uassert(ErrorCodes::SnapshotUnavailable,
@@ -447,7 +547,11 @@ Status waitForReadConcernImpl(OperationContext* opCtx,
                 !opTime.isNull());
         ru->setTimestampReadSource(RecoveryUnit::ReadSource::kProvided, opTime.getTimestamp());
         repl::ReadConcernArgs::get(opCtx).setArgsAtClusterTimeForSnapshot(opTime.getTimestamp());
-    } else if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kMajorityReadConcern &&
+    } 
+    // Majority 读关注点的特殊处理：
+    // 功能：为 majority 读关注点设置合适的读取源和等待逻辑
+    // 排除：snapshot 读关注点（有自己的处理逻辑）和 atClusterTime（已在上面处理）
+    else if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kMajorityReadConcern &&
                replCoord->getSettings().isReplSet()) {
         // This block is not used for kSnapshotReadConcern because snapshots are always speculative;
         // we wait for majority when the transaction commits.
@@ -455,6 +559,10 @@ Status waitForReadConcernImpl(OperationContext* opCtx,
         // the majority snapshot in that case.
 
         // Handle speculative majority reads.
+        // 推测性 majority 读取处理：
+        // 功能：优化 majority 读取性能，在确认前开始读取
+        // 原理：使用 "no overlap" 读取源，读取 all-committed 和 lastApplied 的最小值
+        // 优势：在主节点和从节点上都能安全工作
         if (readConcernArgs.getMajorityReadMechanism() ==
             repl::ReadConcernArgs::MajorityReadMechanism::kSpeculative) {
             // For speculative majority reads, we utilize the "no overlap" read source as a means of
@@ -467,6 +575,9 @@ Status waitForReadConcernImpl(OperationContext* opCtx,
             return Status::OK();
         }
 
+        // 标准 majority 读取处理：
+        // 功能：等待 majority 提交的快照可用
+        // 日志级别：配置服务器使用级别1，其他使用级别2
         const int debugLevel =
             serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer) ? 1 : 2;
 
@@ -476,10 +587,17 @@ Status waitForReadConcernImpl(OperationContext* opCtx,
             "Waiting for 'committed' snapshot to be available for reading: {readConcernArgs}",
             "readConcernArgs"_attr = readConcernArgs);
 
+        // 设置 majority 提交读取源：
+        // 功能：指示存储引擎使用 majority 提交的快照
+        // 等待：如果快照不可用，会循环等待直到可用
         ru->setTimestampReadSource(RecoveryUnit::ReadSource::kMajorityCommitted);
         Status status = ru->majorityCommittedSnapshotAvailable();
 
         // Wait until a snapshot is available.
+        // 快照可用性等待循环：
+        // 功能：循环等待直到 majority 提交的快照可用
+        // 机制：通过复制协调器等待快照提交
+        // 退出：快照可用或发生错误
         while (status == ErrorCodes::ReadConcernMajorityNotAvailableYet) {
             LOGV2_DEBUG(20992, debugLevel, "Snapshot not available yet.");
             replCoord->waitUntilSnapshotCommitted(opCtx, Timestamp());
@@ -496,6 +614,10 @@ Status waitForReadConcernImpl(OperationContext* opCtx,
                     "operation_description"_attr = CurOp::get(opCtx)->opDescription());
     }
 
+    // 最后稳定恢复时间戳等待（特殊功能）：
+    // 功能：等待存储引擎的最后稳定恢复时间戳达到指定值
+    // 用途：主要用于内部操作和数据一致性检查
+    // 要求：需要 snapshot 读关注点、atClusterTime 参数和内部权限
     if (readConcernArgs.waitLastStableRecoveryTimestamp()) {
         uassert(8138101,
                 "readConcern level 'snapshot' is required when specifying "
@@ -510,6 +632,11 @@ Status waitForReadConcernImpl(OperationContext* opCtx,
             AuthorizationSession::get(opCtx->getClient())
                 ->isAuthorizedForActionsOnResource(
                     ResourcePattern::forClusterResource(dbName.tenantId()), ActionType::internal));
+        
+        // 存储引擎最后稳定时间戳检查和等待：
+        // 功能：确保存储引擎的稳定恢复时间戳达到要求
+        // 机制：如果不满足，触发 flushAllFiles 并循环等待
+        // 目的：确保数据的持久化和恢复一致性
         auto* const storageEngine = opCtx->getServiceContext()->getStorageEngine();
         Lock::GlobalLock global(opCtx,
                                 MODE_IS,

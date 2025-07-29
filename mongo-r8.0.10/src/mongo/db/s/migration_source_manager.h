@@ -110,6 +110,7 @@ struct ShardingStatistics;
  * At any point in time it is safe to let the MigrationSourceManager object go out of scope in which
  * case the desctructor will take care of clean up based on how far we have advanced. One exception
  * is the commitDonateChunk and its comments explain the reasoning.
+ * ShardsvrMoveRangeCommand::_runImpl中构造 MigrationSourceManager
  */
 class MigrationSourceManager {
     MigrationSourceManager(const MigrationSourceManager&) = delete;

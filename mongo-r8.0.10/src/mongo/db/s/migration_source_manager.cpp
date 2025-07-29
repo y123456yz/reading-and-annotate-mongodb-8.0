@@ -191,6 +191,35 @@ std::shared_ptr<MigrationChunkClonerSource> MigrationSourceManager::getCurrentCl
     return msm->_cloneDriver;
 }
 
+//ShardsvrMoveRangeCommand::_runImpl中构造 MigrationSourceManager
+
+
+/**
+ * MigrationSourceManager::MigrationSourceManager 构造函数的作用：
+ * 创建和初始化 chunk 迁移源端管理器，负责整个迁移过程的协调和状态管理。
+ * 
+ * 核心功能：
+ * 1. 迁移参数验证：验证并设置迁移请求的各项参数，包括源分片、目标分片、chunk范围等
+ * 2. 元数据检查和锁定：获取并验证集合的分片元数据，确保迁移条件满足
+ * 3. 冲突检测和处理：检查是否存在重叠的范围删除任务，等待冲突解决
+ * 4. 范围边界计算：对于 moveRange 操作，自动计算缺失的最大值或最小值边界
+ * 5. 注册管理器：在集合分片运行时注册当前管理器，建立迁移上下文
+ * 6. 状态初始化：设置初始迁移状态和相关的时间统计、版本信息
+ * 
+ * 预检查项目：
+ * - 分片键模式验证：确保请求的范围与分片键模式兼容
+ * - chunk 边界验证：确保请求的范围在有效的 chunk 边界内
+ * - 并发操作检查：确保没有冲突的迁移或删除操作
+ * - 权限和状态验证：确保集合允许迁移操作
+ * 
+ * 资源管理：
+ * - 异常安全：通过 ScopeGuard 确保异常时正确清理资源
+ * - 锁管理：合理使用锁层次，避免死锁
+ * - 状态跟踪：建立完整的迁移状态跟踪机制
+ * 
+ * 该构造函数是整个 chunk 迁移流程的起点，为后续的克隆、提交等阶段奠定基础。
+ */
+//ShardsvrMoveRangeCommand::_runImpl中构造 MigrationSourceManager
 MigrationSourceManager::MigrationSourceManager(OperationContext* opCtx,
                                                ShardsvrMoveRange&& request,
                                                WriteConcernOptions&& writeConcern,
@@ -214,56 +243,90 @@ MigrationSourceManager::MigrationSourceManager(OperationContext* opCtx,
                         6,  // Total number of steps
                         _args.getToShard(),
                         _args.getFromShard()) {
+    // 前置条件检查：确保构造时没有持有任何锁，避免死锁和不必要的锁争用
     invariant(!shard_role_details::getLocker(_opCtx)->isLocked());
+    
     // Since the MigrationSourceManager is registered on the CSR from the constructor, another
     // thread can get it and abort the migration (and get a reference to the completion promise's
     // future). When this happens, since we throw an exception from the constructor, the destructor
     // will not run, so we have to do complete it here, otherwise we get a BrokenPromise
     // TODO (SERVER-92531): Use existing clean up infrastructure when aborting in early stages
+    // 异常安全保护：由于 MigrationSourceManager 在构造函数中就会注册到 CSR 上，
+    // 其他线程可能获取它并中止迁移（并获得完成 promise 的 future 引用）。
+    // 当这种情况发生时，由于我们从构造函数抛出异常，析构函数不会运行，
+    // 所以我们必须在这里完成它，否则会得到 BrokenPromise
     ScopeGuard scopedGuard([&] { _completion.emplaceValue(); });
 
+    // 记录迁移开始日志：包含完整的请求参数，用于调试和审计
     LOGV2(22016,
           "Starting chunk migration donation",
           "requestParameters"_attr = redact(_args.toBSON({})));
 
+    // 完成第一步时间统计并检查测试断点
     _moveTimingHelper.done(1);
     moveChunkHangAtStep1.pauseWhileSet();
 
     // Make sure the latest placement version is recovered as of the time of the invocation of the
     // command.
+    // 确保在命令调用时恢复最新的放置版本：
+    // 功能：强制刷新当前分片的路由表缓存
+    // 目的：确保迁移基于最新的集群元数据进行
+    // 参数：boost::none 表示强制刷新而不检查特定版本
     onCollectionPlacementVersionMismatch(_opCtx, nss(), boost::none);
 
+    // 获取当前分片ID，用于后续的迁移验证和日志记录
     const auto shardId = ShardingState::get(opCtx)->shardId();
 
     // Complete any unfinished migration pending recovery
+    // 完成任何待恢复的未完成迁移：
+    // 功能：清理和恢复之前中断的迁移操作
+    // 重要性：确保不会有多个并发迁移操作干扰
     {
+        // 排空待恢复的迁移：处理之前因故障中断的迁移
         migrationutil::drainMigrationsPendingRecovery(opCtx);
 
         // Since the moveChunk command is holding the ActiveMigrationRegistry and we just drained
         // all migrations pending recovery, now there cannot be any document in
         // config.migrationCoordinators.
+        // 由于 moveChunk 命令持有 ActiveMigrationRegistry，并且我们刚刚排空了
+        // 所有待恢复的迁移，现在 config.migrationCoordinators 中不能有任何文档。
+        
+        // 验证迁移协调器集合为空：确保没有残留的迁移状态
         PersistentTaskStore<MigrationCoordinatorDocument> store(
             NamespaceString::kMigrationCoordinatorsNamespace);
         invariant(store.count(opCtx) == 0);
     }
 
     // Compute the max or min bound in case only one is set (moveRange)
+    // 计算最大或最小边界，以防只设置了一个（moveRange 操作）：
+    // 功能：对于部分指定范围的 moveRange 操作，自动计算缺失的边界
+    // 场景：用户只指定了 min 或只指定了 max，需要自动确定另一个边界
     if (!_args.getMax().has_value() || !_args.getMin().has_value()) {
 
+        // 获取集合元数据：用于边界计算和验证
         const auto metadata = [&]() {
+            // 获取集合的共享锁，允许并发读取但防止结构变更
             AutoGetCollection autoColl(_opCtx, nss(), MODE_IS);
+            // 获取集合分片运行时的共享访问权限
             const auto scopedCsr =
                 CollectionShardingRuntime::assertCollectionLockedAndAcquireShared(opCtx, nss());
+            // 检查集合身份一致性，确保版本匹配
             const auto [metadata, _] = checkCollectionIdentity(
                 _opCtx, nss(), _args.getEpoch(), _args.getCollectionTimestamp());
             return metadata;
         }();
 
+        // 如果未指定最大值，根据最小值计算最大值
         if (!_args.getMax().has_value()) {
             const auto& min = *_args.getMin();
 
+            // 获取 chunk 管理器和包含最小值的 chunk
             const auto cm = metadata.getChunkManager();
             const auto owningChunk = cm->findIntersectingChunkWithSimpleCollation(min);
+            
+            // 计算最优的最大边界：
+            // 考虑分片键模式、chunk 大小限制等因素
+            // needMaxBound=true 表示需要计算最大边界
             const auto max = computeOtherBound(_opCtx,
                                                nss(),
                                                min,
@@ -272,14 +335,21 @@ MigrationSourceManager::MigrationSourceManager(OperationContext* opCtx,
                                                _args.getMaxChunkSizeBytes(),
                                                true /* needMaxBound */);
 
+            // 线程安全地更新参数：使用互斥锁保护并发访问
             stdx::lock_guard<Latch> lg(_mutex);
             _args.getMoveRangeRequestBase().setMax(max);
             _moveTimingHelper.setMax(max);
-        } else if (!_args.getMin().has_value()) {
+        } 
+        // 如果未指定最小值，根据最大值计算最小值
+        else if (!_args.getMin().has_value()) {
             const auto& max = *_args.getMax();
 
+            // 获取最大边界对应的 chunk
             const auto cm = metadata.getChunkManager();
             const auto owningChunk = getChunkForMaxBound(*cm, max);
+            
+            // 计算最优的最小边界：
+            // needMaxBound=false 表示需要计算最小边界
             const auto min = computeOtherBound(_opCtx,
                                                nss(),
                                                owningChunk.getMin(),
@@ -288,6 +358,7 @@ MigrationSourceManager::MigrationSourceManager(OperationContext* opCtx,
                                                _args.getMaxChunkSizeBytes(),
                                                false /* needMaxBound */);
 
+            // 线程安全地更新参数
             stdx::lock_guard<Latch> lg(_mutex);
             _args.getMoveRangeRequestBase().setMin(min);
             _moveTimingHelper.setMin(min);
@@ -296,28 +367,44 @@ MigrationSourceManager::MigrationSourceManager(OperationContext* opCtx,
 
     // Snapshot the committed metadata from the time the migration starts and register the
     // MigrationSourceManager on the CSR.
+    // 从迁移开始时快照已提交的元数据，并在 CSR 上注册 MigrationSourceManager：
+    // 功能：获取集合元数据快照并注册迁移管理器
+    // 原子性：整个操作在排他锁保护下进行，确保一致性
     const auto [collectionMetadata, collectionIndexInfo, collectionUUID] = [&] {
         // TODO (SERVER-71444): Fix to be interruptible or document exception.
+        // 使用不可中断锁守护：确保关键操作的原子性
         UninterruptibleLockGuard noInterrupt(_opCtx);  // NOLINT.
+        // 获取集合的共享锁进行元数据读取
         AutoGetCollection autoColl(_opCtx, nss(), MODE_IS);
+        // 获取集合分片运行时的排他访问权限
         auto scopedCsr =
             CollectionShardingRuntime::assertCollectionLockedAndAcquireExclusive(opCtx, nss());
 
+        // 检查并获取集合身份信息：确保集合版本一致性
         auto [metadata, indexInfo] = checkCollectionIdentity(
             _opCtx, nss(), _args.getEpoch(), _args.getCollectionTimestamp());
 
+        // 获取集合UUID：用于标识特定的集合实例
         UUID collectionUUID = autoColl.getCollection()->uuid();
 
         // Atomically (still under the CSR lock held above) check whether migrations are allowed and
         // register the MigrationSourceManager on the CSR. This ensures that interruption due to the
         // change of allowMigrations to false will properly serialise and not allow any new MSMs to
         // be running after the change.
+        // 原子地（仍在上面持有的 CSR 锁下）检查是否允许迁移并在 CSR 上注册 MigrationSourceManager。
+        // 这确保由于 allowMigrations 更改为 false 而导致的中断将正确序列化，
+        // 并且在更改后不允许任何新的 MSM 运行。
+        
+        // 检查集合是否允许迁移操作
         uassert(ErrorCodes::ConflictingOperationInProgress,
                 "Collection is undergoing changes so moveChunk is not allowed.",
                 metadata.allowMigrations());
 
+        // 注册当前迁移源管理器到集合分片运行时
+        // 这建立了迁移上下文，允许其他组件感知正在进行的迁移
         _scopedRegisterer.emplace(this, *scopedCsr);
 
+        // 返回获取的元数据信息
         return std::make_tuple(
             std::move(metadata), std::move(indexInfo), std::move(collectionUUID));
     }();
@@ -325,28 +412,43 @@ MigrationSourceManager::MigrationSourceManager(OperationContext* opCtx,
     // Drain the execution/cancellation of any existing range deletion task overlapping with the
     // targeted range (a task issued by a previous migration may still be present when the migration
     // gets interrupted post-commit).
+    // 排空与目标范围重叠的任何现有范围删除任务的执行/取消
+    // （当迁移在提交后被中断时，之前迁移发出的任务可能仍然存在）。
+    
+    // 构建目标迁移范围
     const ChunkRange range(*_args.getMin(), *_args.getMax());
+    // 设置范围删除等待的截止时间
     const auto rangeDeletionWaitDeadline = opCtx->getServiceContext()->getFastClockSource()->now() +
         Milliseconds(drainOverlappingRangeDeletionsOnStartTimeoutMS.load());
+        
     // CollectionShardingRuntime::waitForClean() allows to sync on tasks already registered on the
     // RangeDeleterService, but may miss pending ones in case this code runs after a failover. The
     // enclosing while loop allows to address such a gap.
+    // CollectionShardingRuntime::waitForClean() 允许同步已在 RangeDeleterService 上注册的任务，
+    // 但在故障转移后运行此代码时可能会错过待处理的任务。
+    // 包围的 while 循环允许解决这种间隙。
+    
+    // 冲突检测和等待循环：确保没有重叠的删除任务
     while (rangedeletionutil::checkForConflictingDeletions(opCtx, range, collectionUUID)) {
+        // 检查范围删除器是否被禁用
         uassert(ErrorCodes::ResumableRangeDeleterDisabled,
                 "Failing migration because the disableResumableRangeDeleter server "
                 "parameter is set to true on the donor shard, which contains range "
                 "deletion tasks overlapping with the incoming range.",
                 !disableResumableRangeDeleter.load());
 
+        // 记录延迟原因：帮助调试和监控
         LOGV2(9197000,
               "Migration start deferred because the requested range overlaps with one or more "
               "ranges already scheduled for deletion",
               logAttrs(nss()),
               "range"_attr = redact(range.toString()));
 
+        // 等待冲突的范围删除任务完成
         auto status = CollectionShardingRuntime::waitForClean(
             opCtx, nss(), collectionUUID, range, rangeDeletionWaitDeadline);
 
+        // 检查是否超时
         if (status.isOK() &&
             opCtx->getServiceContext()->getFastClockSource()->now() >= rangeDeletionWaitDeadline) {
             status = Status(
@@ -354,36 +456,49 @@ MigrationSourceManager::MigrationSourceManager(OperationContext* opCtx,
                 "Failed to start new migration - a conflicting range deletion is still pending");
         }
 
+        // 确保等待操作成功
         uassertStatusOK(status);
 
         // If the filtering metadata was cleared while the range deletion task was ongoing, then
         // 'waitForClean' would return immediately even though there really is an ongoing range
         // deletion task. For that case, we loop again until there is no conflicting task in
         // config.rangeDeletions
+        // 如果在范围删除任务进行时清除了过滤元数据，那么即使确实有正在进行的范围删除任务，
+        // 'waitForClean' 也会立即返回。对于这种情况，我们再次循环直到 config.rangeDeletions 中没有冲突任务
+        
+        // 短暂休眠后重新检查，避免忙等待
         opCtx->sleepFor(Milliseconds(1000));
     }
 
+    // 验证分片键模式：确保请求的范围与分片键兼容
     checkShardKeyPattern(_opCtx,
                          nss(),
                          collectionMetadata,
                          collectionIndexInfo,
                          ChunkRange(*_args.getMin(), *_args.getMax()));
+                         
+    // 验证范围边界：确保请求的范围在有效的 chunk 边界内
     checkRangeWithinChunk(_opCtx,
                           nss(),
                           collectionMetadata,
                           collectionIndexInfo,
                           ChunkRange(*_args.getMin(), *_args.getMax()));
 
+    // 保存关键的版本和标识信息：用于后续的一致性检查
     _collectionEpoch = _args.getEpoch();
     _collectionUUID = collectionUUID;
     _collectionTimestamp = _args.getCollectionTimestamp();
 
+    // 获取当前 chunk 的版本信息：用于版本控制和冲突检测
     _chunkVersion = collectionMetadata.getChunkManager()
                         ->findIntersectingChunkWithSimpleCollation(*_args.getMin())
                         .getLastmod();
 
+    // 完成第二步时间统计并检查测试断点
     _moveTimingHelper.done(2);
     moveChunkHangAtStep2.pauseWhileSet();
+    
+    // 取消异常保护：表示构造函数成功完成
     scopedGuard.dismiss();
 }
 

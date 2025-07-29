@@ -107,16 +107,6 @@ Status waitForReadConcern(OperationContext* opCtx,
                           const repl::ReadConcernArgs& readConcernArgs,
                           const DatabaseName& dbName,
                           bool allowAfterClusterTime) {
-    // 使用弱符号链接机制调用具体实现
-    // 设计原理：
-    // 1. 接口统一：所有组件使用相同的函数签名和语义
-    // 2. 实现分离：不同组件根据自身特点提供具体实现
-    //    - mongod: 直接与存储引擎和复制集交互
-    //    - mongos: 可能将请求转发给分片或提供代理实现
-    //    - 测试: 提供可控的 mock 实现
-    // 3. 编译时优化：链接器在构建时选择正确的实现
-    // 4. 运行时缓存：静态变量避免重复的符号解析开销
-    //
     // 参数说明：
     // - opCtx: 操作上下文，包含会话、事务、锁定状态等
     // - readConcernArgs: 读关注点参数，包含级别、时间戳、超时等
@@ -127,6 +117,7 @@ Status waitForReadConcern(OperationContext* opCtx,
     // - Status::OK(): 读关注点条件已满足，可以安全读取
     // - 错误状态: 包含具体的失败原因和错误码
     static auto w = MONGO_WEAK_FUNCTION_DEFINITION(waitForReadConcern);
+    //waitForReadConcernImpl
     return w(opCtx, readConcernArgs, dbName, allowAfterClusterTime);
 }
 
