@@ -404,28 +404,70 @@ MigrationSourceManager::~MigrationSourceManager() {
     }
 }
 
+
+/**
+ * MigrationSourceManager::startClone 的作用：
+ * 启动 chunk 迁移的数据克隆阶段，这是迁移状态机的第三个阶段（创建 → 克隆 → 追赶 → 临界区 → 提交）。
+ * 
+ * 核心功能：
+ * 1. 迁移状态管理：将迁移状态从 kCreated 转换为 kCloning，标记克隆阶段开始
+ * 2. 克隆驱动器创建：初始化 MigrationChunkClonerSource，负责实际的数据传输
+ * 3. 迁移协调器初始化：创建 MigrationCoordinator 管理整个迁移生命周期
+ * 4. 日志记录：记录迁移开始事件到 config.changelog 集合，用于审计和监控
+ * 5. 读关注点设置：确保克隆过程中的数据一致性和可见性
+ * 6. 数据克隆启动：调用克隆驱动器开始实际的数据传输过程
+ * 
+ * 执行流程：
+ * 1. 状态验证和错误处理准备
+ * 2. 统计计数器更新和变更日志记录
+ * 3. 元数据获取和集合锁定
+ * 4. 克隆驱动器创建和注册
+ * 5. 迁移协调器初始化
+ * 6. 路由信息刷新和读关注点设置
+ * 7. 协调器和克隆驱动器启动
+ * 
+ * 该方法是 chunk 迁移数据传输阶段的核心入口，确保了迁移过程的正确性和一致性。
+ */
 void MigrationSourceManager::startClone() {
+    // 确保调用时没有持有任何锁，避免死锁
     invariant(!shard_role_details::getLocker(_opCtx)->isLocked());
+    // 确保当前状态为 kCreated，即迁移刚刚创建完成
     invariant(_state == kCreated);
+    
+    // 错误处理守护：如果函数执行过程中发生异常，自动清理资源
     ScopeGuard scopedGuard([&] { _cleanupOnError(); });
+    
+    // 更新统计计数器：记录开始的迁移数量
+    // 这个计数器用于监控和性能分析，包括成功和失败的迁移
     _stats.countDonorMoveChunkStarted.addAndFetch(1);
 
+    // 记录迁移开始事件到 config.changelog 集合
+    // 这是一个持久化的变更日志，用于审计、监控和问题追踪
+    // 使用 majority 写关注点确保日志在大多数节点上持久化
     uassertStatusOK(ShardingLogging::get(_opCtx)->logChangeChecked(
         _opCtx,
-        "moveChunk.start",
-        nss(),
+        "moveChunk.start",  // 事件类型
+        nss(),             // 命名空间
         BSON("min" << *_args.getMin() << "max" << *_args.getMax() << "from" << _args.getFromShard()
-                   << "to" << _args.getToShard()),
-        ShardingCatalogClient::kMajorityWriteConcern));
+                   << "to" << _args.getToShard()),  // 迁移详细信息
+        ShardingCatalogClient::kMajorityWriteConcern));  // 写关注点
 
+    // 重置克隆和提交阶段的计时器，用于性能监控
     _cloneAndCommitTimer.reset();
 
+    // 获取复制集配置，确定是否启用了复制
     auto replCoord = repl::ReplicationCoordinator::get(_opCtx);
     auto replEnabled = replCoord->getSettings().isReplSet();
 
     {
+        // 获取当前集合的元数据并检查冲突错误
+        // 这确保迁移开始时集合状态是一致的
         const auto metadata = _getCurrentMetadataAndCheckForConflictingErrors();
 
+        // 获取集合锁：
+        // - 如果启用复制：使用 MODE_IX (意向排他锁)，允许并发读
+        // - 如果未启用复制：使用 MODE_X (排他锁)，独占访问
+        // 设置锁获取超时，避免无限等待
         AutoGetCollection autoColl(_opCtx,
                                    nss(),
                                    replEnabled ? MODE_IX : MODE_X,
@@ -433,6 +475,8 @@ void MigrationSourceManager::startClone() {
                                        _opCtx->getServiceContext()->getPreciseClockSource()->now() +
                                        Milliseconds(migrationLockAcquisitionMaxWaitMS.load())));
 
+        // 获取集合分片运行时的排他访问权限
+        // 这确保对集合分片状态的修改是原子性的
         auto scopedCsr =
             CollectionShardingRuntime::assertCollectionLockedAndAcquireExclusive(_opCtx, nss());
 
@@ -440,53 +484,79 @@ void MigrationSourceManager::startClone() {
         // that a chunk on that collection is being migrated to the OpObservers. With an active
         // migration, write operations require the cloner to be present in order to track changes to
         // the chunk which needs to be transmitted to the recipient.
+        // 在集合分片状态上注册元数据管理器表明该集合上的 chunk 正在迁移给 OpObservers。
+        // 有了活跃的迁移，写操作需要克隆器的存在来跟踪需要传输给接收方的 chunk 变更。
         {
+            // 保护克隆驱动器的创建和赋值，确保线程安全
             stdx::lock_guard<Latch> lg(_mutex);
+            
+            // 创建 chunk 克隆源驱动器：负责实际的数据传输逻辑
+            // 包含迁移参数、写关注点、分片键模式、网络连接信息等
             _cloneDriver = std::make_shared<MigrationChunkClonerSource>(_opCtx,
-                                                                        _args,
-                                                                        _writeConcern,
-                                                                        metadata.getKeyPattern(),
-                                                                        _donorConnStr,
-                                                                        _recipientHost);
+                                                                        _args,              // 迁移参数
+                                                                        _writeConcern,      // 写关注点
+                                                                        metadata.getKeyPattern(),  // 分片键模式
+                                                                        _donorConnStr,      // 源分片连接串
+                                                                        _recipientHost);    // 目标分片主机
         }
 
-        _coordinator.emplace(_cloneDriver->getSessionId(),
-                             _args.getFromShard(),
-                             _args.getToShard(),
-                             nss(),
-                             *_collectionUUID,
-                             ChunkRange(*_args.getMin(), *_args.getMax()),
-                             *_chunkVersion,
-                             KeyPattern(metadata.getKeyPattern()),
-                             _args.getWaitForDelete());
+        // 创建迁移协调器：管理整个迁移过程的状态和协调
+        // 包含会话ID、分片信息、集合信息、chunk版本等关键元数据
+        _coordinator.emplace(_cloneDriver->getSessionId(),     // 会话标识
+                             _args.getFromShard(),             // 源分片
+                             _args.getToShard(),               // 目标分片
+                             nss(),                            // 命名空间
+                             *_collectionUUID,                 // 集合UUID
+                             ChunkRange(*_args.getMin(), *_args.getMax()),  // chunk范围
+                             *_chunkVersion,                   // chunk版本
+                             KeyPattern(metadata.getKeyPattern()),  // 键模式
+                             _args.getWaitForDelete());        // 是否等待删除
 
+        // 更新迁移状态为克隆中
         _state = kCloning;
     }
 
     // Refreshing the collection routing information after starting the clone driver will give us a
     // stable view on whether the recipient is owning other chunks of the collection (a condition
     // that will be later evaluated).
+    // 在启动克隆驱动器后刷新集合路由信息将给我们一个稳定的视图，
+    // 了解接收方是否拥有该集合的其他 chunk（这是一个稍后会被评估的条件）。
     uassertStatusOK(Grid::get(_opCtx)->catalogCache()->getCollectionRoutingInfoWithPlacementRefresh(
         _opCtx, nss()));
 
+    // 如果启用了复制，设置适当的读关注点
     if (replEnabled) {
+        // 创建本地读关注点参数，使用最后应用的操作时间
+        // 这确保克隆过程看到一致的数据视图
         auto const readConcernArgs = repl::ReadConcernArgs(
-            replCoord->getMyLastAppliedOpTime(), repl::ReadConcernLevel::kLocalReadConcern);
+            replCoord->getMyLastAppliedOpTime(),           // 最后应用的操作时间
+            repl::ReadConcernLevel::kLocalReadConcern);    // 本地读关注级别
+        
+        // 等待读关注点满足，确保数据可见性
         uassertStatusOK(waitForReadConcern(_opCtx, readConcernArgs, DatabaseName(), false));
 
+        // 设置准备冲突行为，处理事务相关的读冲突
         setPrepareConflictBehaviorForReadConcern(
             _opCtx, readConcernArgs, PrepareConflictBehavior::kEnforce);
     }
 
+    // 启动迁移协调器：初始化迁移状态并持久化相关信息
     _coordinator->startMigration(_opCtx);
 
+    // 启动实际的数据克隆过程
+    // 传入迁移ID、会话信息和事务号，确保克隆过程的可追踪性和一致性
     uassertStatusOK(_cloneDriver->startClone(_opCtx,
-                                             _coordinator->getMigrationId(),
-                                             _coordinator->getLsid(),
-                                             _coordinator->getTxnNumber()));
+                                             _coordinator->getMigrationId(),   // 迁移唯一标识
+                                             _coordinator->getLsid(),          // 逻辑会话ID
+                                             _coordinator->getTxnNumber()));   // 事务号
 
+    // 更新时间统计：标记第3步完成
     _moveTimingHelper.done(3);
+    
+    // 测试断点：允许在步骤3暂停，用于测试和调试
     moveChunkHangAtStep3.pauseWhileSet();
+    
+    // 取消错误清理守护，表示函数成功执行
     scopedGuard.dismiss();
 }
 
@@ -797,21 +867,64 @@ SharedSemiFuture<void> MigrationSourceManager::abort() {
     return _completion.getFuture();
 }
 
+
+/**
+ * MigrationSourceManager::_getCurrentMetadataAndCheckForConflictingErrors 的作用：
+ * 获取当前集合的分片元数据并检查是否存在可能导致迁移冲突的错误状态。
+ * 
+ * 核心功能：
+ * 1. 元数据获取：安全地获取集合当前的分片元数据信息
+ * 2. 状态一致性检查：验证集合的分片状态在迁移过程中未被并发操作修改
+ * 3. 时间戳/纪元验证：确保迁移开始时的集合版本与当前版本一致
+ * 4. 并发冲突检测：检测可能影响迁移正确性的并发操作
+ * 5. 异常安全保证：通过不可中断锁确保元数据读取的原子性
+ * 
+ * 检查类型：
+ * - 集合状态清除检查：防止分片状态被并发清理操作清除
+ * - 时间戳一致性检查：验证集合版本的时间戳未发生变化
+ * - 纪元一致性检查：验证集合版本的纪元未发生变化
+ * - 分片状态验证：确保集合仍处于分片状态
+ * 
+ * 该方法是迁移过程中关键的安全检查点，确保迁移操作基于正确和一致的元数据进行。
+ */
 CollectionMetadata MigrationSourceManager::_getCurrentMetadataAndCheckForConflictingErrors() {
+    // 获取当前集合的分片元数据
+    // 使用 lambda 表达式封装获取逻辑，确保锁的正确管理
     auto metadata = [&] {
         // TODO (SERVER-71444): Fix to be interruptible or document exception.
+        // 使用不可中断锁守护：确保元数据读取操作的原子性
+        // 防止在读取过程中被中断，保证数据一致性
         UninterruptibleLockGuard noInterrupt(_opCtx);  // NOLINT.
+        
+        // 获取集合的共享锁：MODE_IS（意向共享锁）允许并发读取
+        // 这里只需要读取元数据，不需要修改集合状态
         AutoGetCollection autoColl(_opCtx, _args.getCommandParameter(), MODE_IS);
+        
+        // 获取集合分片运行时的共享访问权限
+        // 确保能够安全地读取当前的分片元数据
         const auto scopedCsr = CollectionShardingRuntime::assertCollectionLockedAndAcquireShared(
             _opCtx, _args.getCommandParameter());
 
+        // 获取当前已知的元数据（如果存在）
+        // 这个调用是非阻塞的，如果元数据不可用会返回 boost::none
         const auto optMetadata = scopedCsr->getCurrentMetadataIfKnown();
+        
+        // 检查分片状态是否被并发操作清除
+        // 如果元数据为空，说明集合的分片状态可能被其他操作清理了
         uassert(ErrorCodes::ConflictingOperationInProgress,
                 "The collection's sharding state was cleared by a concurrent operation",
                 optMetadata);
+        
+        // 返回有效的元数据对象
         return *optMetadata;
     }();
+    
+    // 执行版本一致性检查：确保迁移期间集合版本未发生变化
+    
+    // 如果迁移开始时记录了集合时间戳，进行时间戳一致性检查
     if (_collectionTimestamp) {
+        // 验证当前集合的时间戳与迁移开始时记录的时间戳一致
+        // 时间戳变化意味着集合的版本发生了重大变更
         uassert(ErrorCodes::ConflictingOperationInProgress,
                 str::stream()
                     << "The collection's timestamp has changed since the migration began. Expected "
@@ -820,9 +933,14 @@ CollectionMetadata MigrationSourceManager::_getCurrentMetadataAndCheckForConflic
                     << (metadata.isSharded()
                             ? metadata.getCollPlacementVersion().getTimestamp().toStringPretty()
                             : "unsharded collection"),
+                // 检查条件：
+                // 1. 集合必须仍然是分片的
+                // 2. 当前时间戳必须与记录的时间戳匹配
                 metadata.isSharded() &&
                     *_collectionTimestamp == metadata.getCollPlacementVersion().getTimestamp());
     } else {
+        // 如果没有时间戳（旧版本兼容），使用纪元进行一致性检查
+        // 纪元变化同样表示集合版本的重大变更
         uassert(
             ErrorCodes::ConflictingOperationInProgress,
             str::stream()
@@ -830,9 +948,13 @@ CollectionMetadata MigrationSourceManager::_getCurrentMetadataAndCheckForConflic
                 << _collectionEpoch->toString() << ", but found: "
                 << (metadata.isSharded() ? metadata.getCollPlacementVersion().toString()
                                          : "unsharded collection"),
+            // 检查条件：
+            // 1. 集合必须仍然是分片的
+            // 2. 当前纪元必须与记录的纪元匹配
             metadata.isSharded() && metadata.getCollPlacementVersion().epoch() == _collectionEpoch);
     }
 
+    // 返回验证后的元数据，确保其一致性和有效性
     return metadata;
 }
 

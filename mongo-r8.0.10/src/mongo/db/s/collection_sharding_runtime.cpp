@@ -172,10 +172,56 @@ CollectionShardingRuntime::assertCollectionLockedAndAcquireShared(OperationConte
         ScopedCollectionShardingState::acquireScopedCollectionShardingState(opCtx, nss, MODE_IS));
 }
 
+
+/**
+ * CollectionShardingRuntime::assertCollectionLockedAndAcquireExclusive 的作用：
+ * 断言集合已被锁定并获取排他性的集合分片运行时访问权限。
+ * 
+ * 核心功能：
+ * 1. 锁定状态验证：确保调用者已经持有集合的至少 MODE_IS（意向共享）锁
+ * 2. 排他访问获取：获得对 CollectionShardingRuntime 的排他性访问权限
+ * 3. 分片状态保护：确保对集合分片状态的修改是线程安全的
+ * 4. RAII 资源管理：返回 RAII 风格的作用域对象，自动管理访问权限
+ * 5. 调试验证：在调试模式下验证锁定前置条件
+ * 
+ * 使用场景：
+ * - 迁移状态管理：在 chunk 迁移过程中修改集合的分片状态
+ * - 元数据更新：更新集合的分片元数据和路由信息
+ * - 临界区管理：进入/退出分片迁移临界区
+ * - 分片配置变更：修改集合的分片键、版本等配置
+ * - 清理操作：清理过期的分片状态和元数据
+ * 
+ * 安全保证：
+ * - 排他性访问：确保同时只有一个线程能修改分片状态
+ * - 锁定验证：防止在未锁定集合的情况下访问分片状态
+ * - 异常安全：通过 RAII 确保即使发生异常也能正确释放权限
+ * 
+ * 该方法是访问和修改集合分片运行时状态的安全入口点，确保了分片操作的线程安全性。
+ */
 CollectionShardingRuntime::ScopedExclusiveCollectionShardingRuntime
 CollectionShardingRuntime::assertCollectionLockedAndAcquireExclusive(OperationContext* opCtx,
                                                                      const NamespaceString& nss) {
+    // 调试模式下验证集合锁定状态：
+    // 确保调用者已经持有集合的至少 MODE_IS（意向共享）锁
+    // 这是获取分片运行时排他访问权限的前置条件
+    // MODE_IS 锁保证了集合的基本稳定性，避免在访问分片状态时集合被删除或重命名
     dassert(shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(nss, MODE_IS));
+    
+    // 获取作用域化的集合分片状态，使用排他模式（MODE_X）
+    // 功能说明：
+    // 1. 通过 ScopedCollectionShardingState 获取对特定集合分片状态的访问权限
+    // 2. MODE_X（排他锁）确保同时只有一个线程能修改分片状态
+    // 3. 防止并发的分片操作（如迁移、元数据更新）产生竞争条件
+    // 4. 保护集合的分片元数据、临界区状态、迁移状态等关键信息
+    //
+    // 锁定层次：
+    // - 外层：集合锁（MODE_IS 或更强）- 保护集合本身
+    // - 内层：分片状态锁（MODE_X）- 保护分片相关状态
+    //
+    // RAII 设计：
+    // - 构造时获取排他访问权限
+    // - 析构时自动释放权限
+    // - 异常安全：即使发生异常也能正确清理
     return ScopedExclusiveCollectionShardingRuntime(
         ScopedCollectionShardingState::acquireScopedCollectionShardingState(opCtx, nss, MODE_X));
 }
