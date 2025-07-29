@@ -120,21 +120,48 @@ void ActiveMigrationsRegistry::unlock(StringData reason) {
     _chunkOperationsStateChangedCV.notify_all();
 }
 
+/**
+ * ActiveMigrationsRegistry::registerDonateChunk 的作用：
+ * 在活跃迁移注册表中注册一个 chunk 迁移任务，确保同一时间只有一个迁移操作能够进行。
+ * 
+ * 核心功能：
+ * 1. 冲突检测：检查是否存在并发的迁移、接收或拆分/合并操作
+ * 2. 重复请求处理：支持对相同迁移请求的幂等处理，避免重复执行
+ * 3. 迁移状态管理：维护当前活跃的迁移状态，防止并发冲突
+ * 4. 阻塞状态检查：确保注册表未被管理操作锁定
+ * 5. 生命周期控制：返回 ScopedDonateChunk 对象管理迁移的完整生命周期
+ * 
+ * 返回值说明：
+ * - 成功：返回 ScopedDonateChunk 对象，包含执行标志和完成通知
+ * - 冲突：返回错误状态，描述具体的冲突原因
+ * - 重复：返回已存在迁移的等待句柄，实现幂等性
+ * 
+ * 该函数是 MongoDB 分片迁移并发控制的核心，确保迁移操作的安全性和一致性。
+ */
 StatusWith<ScopedDonateChunk> ActiveMigrationsRegistry::registerDonateChunk(
     OperationContext* opCtx, const ShardsvrMoveRange& args) {
+    
+    // 获取互斥锁，确保对注册表状态的线程安全访问
     stdx::unique_lock<Latch> ul(_mutex);
 
+    // 等待任何活跃的拆分/合并操作完成
+    // 拆分/合并操作会修改 chunk 的边界，必须等待其完成才能进行迁移
     opCtx->waitForConditionOrInterrupt(_chunkOperationsStateChangedCV, ul, [&] {
         return !_activeSplitMergeChunkStates.count(args.getCommandParameter());
     });
 
+    // 检查是否存在活跃的接收 chunk 操作
+    // 一个分片不能同时作为迁移的接收方和发送方
     if (_activeReceiveChunkState) {
         return _activeReceiveChunkState->constructErrorStatus();
     }
 
+    // 检查是否存在活跃的迁移操作
     if (_activeMoveChunkState) {
+        // 将当前活跃迁移和新请求转换为 BSON 进行比较
         auto activeMoveChunkStateBSON = _activeMoveChunkState->args.toBSON({});
 
+        // 如果请求参数完全相同，说明是重复请求，支持幂等处理
         if (activeMoveChunkStateBSON.woCompare(args.toBSON({})) == 0) {
             LOGV2(6386800,
                   "Registering new chunk donation",
@@ -142,9 +169,13 @@ StatusWith<ScopedDonateChunk> ActiveMigrationsRegistry::registerDonateChunk(
                   "min"_attr = args.getMin(),
                   "max"_attr = args.getMax(),
                   "toShardId"_attr = args.getToShard());
+            
+            // 返回等待句柄，允许新请求等待已存在迁移的完成
+            // shouldExecute=false 表示不需要执行新的迁移
             return {ScopedDonateChunk(nullptr, false, _activeMoveChunkState->notification)};
         }
 
+        // 存在不同的迁移操作，记录冲突日志并返回错误
         LOGV2(6386801,
               "Rejecting donate chunk due to conflicting migration in progress",
               logAttrs(args.getCommandParameter()),
@@ -154,14 +185,21 @@ StatusWith<ScopedDonateChunk> ActiveMigrationsRegistry::registerDonateChunk(
         return _activeMoveChunkState->constructErrorStatus();
     }
 
+    // 检查迁移是否被管理操作临时阻塞
+    // 当需要执行维护操作（如分片下线）时，可能会临时阻塞新的迁移
     if (_migrationsBlocked) {
         return {ErrorCodes::ConflictingOperationInProgress,
                 "Unable to start new balancer operation because the ActiveMigrationsRegistry of "
                 "this shard is temporarily locked"};
     }
 
+    // 所有检查通过，注册新的迁移操作
+    // 使用 emplace 在原地构造 ActiveMoveChunkState 对象
     _activeMoveChunkState.emplace(args);
 
+    // 返回成功的 ScopedDonateChunk 对象
+    // shouldExecute=true 表示需要执行迁移
+    // 传入注册表指针和完成通知，用于后续的状态管理和结果通知
     return {ScopedDonateChunk(this, true, _activeMoveChunkState->notification)};
 }
 
