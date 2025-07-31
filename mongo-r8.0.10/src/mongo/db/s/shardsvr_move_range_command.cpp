@@ -356,7 +356,8 @@ public:
             ShardingStatistics::get(opCtx).countBytesClonedOnDonor.load();       // 已克隆字节总数  
         long long totalCloneTime =
             ShardingStatistics::get(opCtx).totalDonorChunkCloneTimeMillis.load(); // 总克隆时间
-    
+        
+        // 阶段1：创建迁移源管理器
         // 创建迁移源管理器：负责协调整个迁移过程的状态机
         // 传入迁移请求、写入关注点、源分片连接信息和目标分片主机
         MigrationSourceManager migrationSourceManager(
@@ -364,26 +365,26 @@ public:
     
         // 迁移状态机执行序列：按照严格的顺序执行各个阶段
     
-        // 阶段1：启动克隆阶段
+        // 阶段2：启动克隆阶段
         // 开始将源分片上的 chunk 数据复制到目标分片
         // 这个阶段允许并发读写，不会阻塞业务操作
         migrationSourceManager.startClone();
         
-        // 阶段2：等待追赶完成
+        // 阶段3：等待追赶完成
         // 同步迁移开始后产生的增量变更，确保目标分片数据最新
         // 这个阶段仍然允许并发操作
         migrationSourceManager.awaitToCatchUp();
         
-        // 阶段3：进入临界区
+        // 阶段4：进入临界区
         // 阻塞对该 chunk 范围的所有写操作，确保数据一致性
         // 这是迁移过程中最关键的步骤，会短暂影响写入性能
         migrationSourceManager.enterCriticalSection();
         
-        // 阶段4：在目标分片上提交 chunk
+        // 阶段5：在目标分片上提交 chunk
         // 通知目标分片 chunk 数据接收完成，可以开始服务请求
         migrationSourceManager.commitChunkOnRecipient();
         
-        // 阶段5：在 Config Server 上更新元数据
+        // 阶段6：在 Config Server 上更新元数据
         // 更新分片集群的路由表，将 chunk 的所有权转移到目标分片
         // 这是迁移的最后一步，完成后迁移正式生效
         migrationSourceManager.commitChunkMetadataOnConfig();

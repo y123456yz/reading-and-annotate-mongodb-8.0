@@ -134,15 +134,58 @@ void MigrationCoordinator::setShardKeyPattern(const boost::optional<KeyPattern>&
     _shardKeyPattern = shardKeyPattern;
 }
 
+/**
+ * MigrationCoordinator::startMigration 函数的作用：
+ * 启动迁移过程的初始化阶段，建立迁移所需的持久化状态和元数据。
+ * 
+ * 核心功能：
+ * 1. 持久化协调器状态：将迁移协调器文档写入 config.migrationCoordinators 集合
+ * 2. 创建源端删除任务：在源分片创建 pending 状态的范围删除任务
+ * 3. 故障恢复准备：确保在节点故障后能够恢复迁移状态
+ * 4. 元数据一致性：设置分片键模式、时间戳等关键元数据
+ * 5. 写关注点保证：使用 majority 写关注点确保数据持久化
+ * 
+ * 持久化组件：
+ * - config.migrationCoordinators：存储完整的迁移协调器状态
+ * - config.rangeDeletions：存储源端的范围删除任务（pending 状态）
+ * 
+ * 执行顺序：
+ * 1. 首先持久化迁移协调器文档，建立迁移的身份标识
+ * 2. 然后创建源端范围删除任务，为后续清理做准备
+ * 3. 所有操作使用强一致性写关注点确保持久化
+ * 
+ * 状态设置：
+ * - 范围删除任务设置为 pending：防止立即执行删除
+ * - 设置集群时间戳：确保时间一致性
+ * - 配置清理策略：根据 waitForDelete 参数决定清理时机
+ * 
+ * 该函数是迁移协调器生命周期的第一个阶段，为后续的数据克隆、决策制定和状态清理奠定基础。
+ */
 void MigrationCoordinator::startMigration(OperationContext* opCtx) {
+    // 持久化迁移协调器文档：
+    // 功能：将协调器的完整状态信息写入 config.migrationCoordinators 集合
+    // 目的：建立迁移的身份标识和核心元数据，支持故障恢复
+    // 内容：包含迁移ID、会话信息、源端和目标端分片、chunk范围等
     LOGV2_DEBUG(
         23889, 2, "Persisting migration coordinator doc", "migrationDoc"_attr = _migrationInfo);
     migrationutil::persistMigrationCoordinatorLocally(opCtx, _migrationInfo);
 
+    // 持久化源端范围删除任务：
+    // 功能：在源分片创建范围删除任务，为迁移完成后的数据清理做准备
+    // 状态：设置为 pending，防止在迁移完成前执行删除操作
+    // 重要性：确保在迁移失败时能够正确清理或保留数据
     LOGV2_DEBUG(23890,
                 2,
                 "Persisting range deletion task on donor",
                 "migrationId"_attr = _migrationInfo.getId());
+    
+    // 构建范围删除任务对象：
+    // 参数设置：
+    // - 迁移ID：关联到特定的迁移操作
+    // - 命名空间和集合UUID：标识要操作的集合
+    // - 源分片ID：标识执行删除的分片
+    // - 范围：要删除的文档范围
+    // - 清理时机：根据 waitForDelete 参数决定立即或延迟清理
     RangeDeletionTask donorDeletionTask(_migrationInfo.getId(),
                                         _migrationInfo.getNss(),
                                         _migrationInfo.getCollectionUuid(),
@@ -150,10 +193,31 @@ void MigrationCoordinator::startMigration(OperationContext* opCtx) {
                                         _migrationInfo.getRange(),
                                         _waitForDelete ? CleanWhenEnum::kNow
                                                        : CleanWhenEnum::kDelayed);
+    
+    // 设置任务为 pending 状态：
+    // 功能：防止任务立即被执行，确保迁移过程的正确顺序
+    // 原理：pending 任务不会被范围删除服务自动处理
+    // 时机：只有在迁移决策确定后才会被标记为 ready
     donorDeletionTask.setPending(true);
+    
+    // 设置分片键模式：
+    // 功能：为范围删除任务提供分片键信息
+    // 用途：删除操作需要分片键来正确识别和过滤文档
+    // 要求：分片键模式必须在此时已经设置
     donorDeletionTask.setKeyPattern(*_shardKeyPattern);
+    
+    // 设置集群时间戳：
+    // 功能：为删除任务设置当前的集群时间戳
+    // 目的：确保时间一致性，支持基于时间的操作排序
+    // 来源：从向量时钟获取当前的集群时间
     const auto currentTime = VectorClock::get(opCtx)->getTime();
     donorDeletionTask.setTimestamp(currentTime.clusterTime().asTimestamp());
+    
+    // 持久化范围删除任务：
+    // 功能：将构建的删除任务写入 config.rangeDeletions 集合
+    // 写关注点：使用 majority 写关注点确保数据持久化
+    // 超时设置：使用分片操作的标准超时时间
+    // 本地性：写入本地（源分片）的 rangeDeletions 集合
     rangedeletionutil::persistRangeDeletionTaskLocally(
         opCtx, donorDeletionTask, WriteConcerns::kMajorityWriteConcernShardingTimeout);
 }

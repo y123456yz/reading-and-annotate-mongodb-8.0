@@ -452,6 +452,7 @@ ExecutorFuture<void> MovePrimaryCoordinator::_cleanupOnAbort(
         });
 }
 
+//MoveTimingHelper::~MoveTimingHelper()->MovePrimaryCoordinator::logChange
 void MovePrimaryCoordinator::logChange(OperationContext* opCtx,
                                        const std::string& what,
                                        const Status& status) const {

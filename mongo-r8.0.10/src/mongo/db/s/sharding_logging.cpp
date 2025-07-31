@@ -154,6 +154,7 @@ Status ShardingLogging::logChangeChecked(OperationContext* opCtx,
         opCtx, ChangeLogType::ConfigNS.coll(), what, ns, detail, writeConcern, catalogClientToUse);
 }
 
+// 参数来源在 MoveTimingHelper::~MoveTimingHelper()->MovePrimaryCoordinator::logChange逐步到这里
 Status ShardingLogging::_log(OperationContext* opCtx,
                              const StringData logCollName,
                              const StringData what,

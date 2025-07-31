@@ -148,6 +148,8 @@ private:
     std::shared_ptr<MigrationChunkClonerSource> _chunkCloner;
 };
 
+// 接收端接收到发送端发送的 _recvChunkStart 命令后启动克隆流程，接收端通过MigrationDestinationManager::_migrateDriver发送_migrateClone给发送端，
+// 发送端接收到 _migrateClone 命令后，启动克隆流程，调用nextCloneBatch发送数据给客户端
 class InitialCloneCommand : public BasicCommand {
 public:
     InitialCloneCommand() : BasicCommand("_migrateClone") {}
@@ -185,37 +187,116 @@ public:
         return Status::OK();
     }
 
-    bool run(OperationContext* opCtx,
-             const DatabaseName&,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) override {
+    /**
+     * InitialCloneCommand::run 函数的作用：
+     * 处理接收端发送的 _migrateClone 命令，负责源端向目标分片发送初始克隆数据的核心逻辑。
+     * 
+     * 核心功能：
+     * 1. 会话验证：验证迁移会话ID的有效性，确保命令来源合法
+     * 2. 活跃克隆器获取：获取当前正在进行迁移的克隆器实例
+     * 3. 批量数据收集：通过循环调用优化单次传输的数据量
+     * 4. 缓冲区管理：动态调整缓冲区大小以最大化传输效率
+     * 5. 数据返回：将收集到的文档数组返回给接收端
+     * 
+     * 执行流程：
+     * - 解析迁移会话ID并验证其合法性
+     * - 获取活跃的迁移克隆器和集合锁
+     * - 循环调用 nextCloneBatch 直到无法获取更多数据
+     * - 优化传输批次大小以减少网络往返次数
+     * - 构建响应对象并返回文档数组
+     * 
+     * 优化策略：
+     * - 缓冲区大小优化：使用克隆器推荐的初始缓冲区大小
+     * - 循环收集机制：持续收集数据直到批次大小不再增长
+     * - 锁持有优化：在数据收集期间持有必要的集合锁
+     * 
+     * 错误处理：
+     * - 会话ID不匹配：返回 IllegalOperation 错误
+     * - 集合不存在：返回 NamespaceNotFound 错误
+     * - 权限检查失败：返回未授权错误
+     * - 克隆器状态异常：返回相应的状态错误
+     * 
+     * 该函数是 chunk 迁移数据传输的关键入口点，确保数据能够高效、安全地从源分片传输到目标分片。
+     */
+    bool InitialCloneCommand::run(OperationContext* opCtx,
+                                  const DatabaseName&,
+                                  const BSONObj& cmdObj,
+                                  BSONObjBuilder& result) override {
+        // 迁移会话ID提取和验证：
+        // 功能：从命令对象中提取迁移会话标识符
+        // 安全性：确保命令来自合法的迁移会话，防止非法访问
+        // 错误处理：如果会话ID格式不正确或缺失，会抛出异常
         const MigrationSessionId migrationSessionId(
             uassertStatusOK(MigrationSessionId::extractFromBSON(cmdObj)));
-
+    
+        // 数组构建器初始化：
+        // 目的：用于收集要传输的文档数据
+        // 延迟初始化：在获取克隆器后才创建，使用优化的缓冲区大小
+        // 类型：boost::optional 允许延迟构造和条件检查
         boost::optional<BSONArrayBuilder> arrBuilder;
-
+    
         // Try to maximize on the size of the buffer, which we are returning in order to have less
         // round-trips
+        // 批次大小跟踪变量：
+        // 功能：记录上一次迭代时数组的大小，用于循环终止条件判断
+        // 优化目标：最大化缓冲区使用率，减少网络往返次数
+        // 初始值：-1 确保第一次循环能够执行
         int arrSizeAtPrevIteration = -1;
-
+    
+        // 批量数据收集的优化循环：
+        // 终止条件1：arrBuilder 未初始化（首次执行）
+        // 终止条件2：当前批次大小大于上次迭代（还有数据可收集）
+        // 目标：在单次命令响应中传输尽可能多的数据，减少网络往返
         while (!arrBuilder || arrBuilder->arrSize() > arrSizeAtPrevIteration) {
+            // 获取活跃克隆器：
+            // 功能：验证迁移会话并获取对应的克隆器实例
+            // 参数1：操作上下文，用于权限检查和锁管理
+            // 参数2：迁移会话ID，确保访问正确的迁移实例
+            // 参数3：true 表示需要持有集合锁，保证迁移状态稳定
+            // 安全性：自动验证会话ID匹配性和集合存在性
             AutoGetActiveCloner autoCloner(opCtx, migrationSessionId, true);
-
+    
+            // 数组构建器的延迟初始化：
+            // 时机：在获取到克隆器后进行初始化
+            // 优化：使用克隆器推荐的缓冲区分配大小
+            // 好处：避免频繁的内存重新分配，提高性能
             if (!arrBuilder) {
                 arrBuilder.emplace(autoCloner.getCloner()->getCloneBatchBufferAllocationSize());
             }
-
+    
+            // 记录当前迭代的数组大小：
+            // 用途：为下次循环条件判断提供基准
+            // 逻辑：如果下次调用后大小没有增长，说明没有更多数据
             arrSizeAtPrevIteration = arrBuilder->arrSize();
-
+    
+            // ★ 核心数据获取调用：
+            // 功能：从克隆器获取下一批要迁移的文档数据
+            // 参数1：操作上下文，提供事务和锁上下文
+            // 参数2：集合对象，用于数据读取
+            // 参数3：数组构建器指针，用于接收文档数据
+            // 重要性：这是实际数据传输的关键调用点
             uassertStatusOK(autoCloner.getCloner()->nextCloneBatch(
                 opCtx, autoCloner.getColl(), arrBuilder.get_ptr()));
         }
-
+    
+        // 数组构建器有效性验证：
+        // 目的：确保在循环过程中数组构建器已被正确初始化
+        // 防护：避免在异常情况下返回空响应
         invariant(arrBuilder);
+        
+        // 构建命令响应：
+        // 功能：将收集到的文档数组添加到响应对象中
+        // 字段名："objects" - 接收端期望的文档数组字段
+        // 数据：arrBuilder->arr() 返回构建的BSON数组
+        // 用途：接收端将解析此数组并插入到本地集合中
         result.appendArray("objects", arrBuilder->arr());
-
+    
+        // 命令执行成功标识：
+        // 返回值：true 表示命令成功执行
+        // 效果：MongoDB 会将 result 对象作为成功响应返回给客户端
         return true;
     }
+
 };
 MONGO_REGISTER_COMMAND(InitialCloneCommand).forShard();
 

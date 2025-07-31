@@ -128,6 +128,7 @@ const WriteConcernOptions kMajorityWriteConcern(WriteConcernOptions::kMajority,
  * Calculates the max or min bound perform split+move in case the chunk in question is splittable.
  * If the chunk is not splittable, returns the bound of the existing chunk for the max or min.Finds
  * a max bound if needMaxBound is true and a min bound if forward is false.
+ * MigrationSourceManager::MigrationSourceManager调用
  */
 BSONObj computeOtherBound(OperationContext* opCtx,
                           const NamespaceString& nss,
@@ -219,7 +220,7 @@ std::shared_ptr<MigrationChunkClonerSource> MigrationSourceManager::getCurrentCl
  * 
  * 该构造函数是整个 chunk 迁移流程的起点，为后续的克隆、提交等阶段奠定基础。
  */
-//ShardsvrMoveRangeCommand::_runImpl中构造 MigrationSourceManager
+// ShardsvrMoveRangeCommand::_runImpl 中构造 MigrationSourceManager
 MigrationSourceManager::MigrationSourceManager(OperationContext* opCtx,
                                                ShardsvrMoveRange&& request,
                                                WriteConcernOptions&& writeConcern,
@@ -256,7 +257,8 @@ MigrationSourceManager::MigrationSourceManager(OperationContext* opCtx,
     // 当这种情况发生时，由于我们从构造函数抛出异常，析构函数不会运行，
     // 所以我们必须在这里完成它，否则会得到 BrokenPromise
     ScopeGuard scopedGuard([&] { _completion.emplaceValue(); });
-
+    
+    // {"t":{"$date":"2025-07-29T19:47:55.204+08:00"},"s":"I",  "c":"MIGRATE",  "id":22016,   "svc":"S", "ctx":"MoveChunk","msg":"Starting chunk migration donation","attr":{"requestParameters":{"_shardsvrMoveRange":"benchmark.yyztest","toShard":"shard2ReplSet","min":{"_id":{"$minKey":1}},"waitForDelete":false,"epoch":{"$oid":"6888b23d9b404274eb601360"},"collectionTimestamp":{"$timestamp":{"t":1753788989,"i":10}},"fromShard":"shard3ReplSet","maxChunkSizeBytes":10485760,"forceJumbo":0,"secondaryThrottle":false}}}
     // 记录迁移开始日志：包含完整的请求参数，用于调试和审计
     LOGV2(22016,
           "Starting chunk migration donation",

@@ -148,6 +148,7 @@ auto orderShardKeyFields(const BSONObj& keyPattern, const BSONObj& key) {
  * 
  * 该函数是分片集群自动平衡和 chunk 分裂的核心算法，确保数据在分片间的均匀分布。
  */
+// MigrationSourceManager::MigrationSourceManager->computeOtherBound 调用
 std::pair<std::vector<BSONObj>, bool> autoSplitVector(OperationContext* opCtx,
                                                       const NamespaceString& nss,
                                                       const BSONObj& keyPattern,
