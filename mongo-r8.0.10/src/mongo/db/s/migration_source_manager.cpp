@@ -677,20 +677,95 @@ void MigrationSourceManager::startClone() {
     scopedGuard.dismiss();
 }
 
+/**
+ * MigrationSourceManager::awaitToCatchUp 函数的作用：
+ * 等待接收端克隆过程追赶上源端的数据变更，确保进入关键区域前数据同步差距在可接受范围内。
+ * 
+ * 核心功能：
+ * 1. 克隆完成度检查：等待克隆驱动器确认接收端已经获取了足够的初始数据
+ * 2. 增量同步验证：确保接收端处理的增量变更（xferMods）已经追赶到合适水平
+ * 3. 关键区域准备：为进入迁移的关键区域阶段做准备，此阶段将阻塞写操作
+ * 4. 时间统计更新：记录克隆阶段的耗时并重置计时器为下一阶段准备
+ * 5. 状态转换管理：将迁移状态从 kCloning 转换为 kCloneCaughtUp
+ * 
+ * 等待策略：
+ * - 阻塞等待：调用克隆驱动器的等待方法直到条件满足
+ * - 超时保护：设置最大等待时间（默认6小时）防止无限等待
+ * - 智能判断：克隆驱动器内部评估何时适合进入关键区域
+ * 
+ * 性能考虑：
+ * - 平衡数据完整性和迁移效率：不需要100%同步，只需达到可管理的差距
+ * - 减少关键区域时间：通过预先同步减少后续阻塞写操作的时间
+ * - 网络和I/O优化：在网络条件允许的情况下尽可能多地传输数据
+ * 
+ * 错误处理：
+ * - 超时处理：如果在指定时间内无法达到同步条件则失败
+ * - 网络异常：处理与接收端通信过程中的网络问题
+ * - 状态异常：确保迁移状态的一致性和正确性
+ * 
+ * 该函数是迁移状态机中的关键检查点，确保在进入影响性能的关键区域前数据已基本同步。
+ */
 void MigrationSourceManager::awaitToCatchUp() {
+    // 前置条件检查：确保调用时没有持有任何锁，避免死锁风险
+    // 这是必要的，因为后续可能需要进行网络通信和长时间等待
     invariant(!shard_role_details::getLocker(_opCtx)->isLocked());
+    
+    // 状态验证：确保当前处于克隆阶段，这是进入追赶阶段的前置条件
+    // kCloning 状态表示数据克隆正在进行中，可以开始评估同步进度
     invariant(_state == kCloning);
+    
+    // 错误处理守护：如果函数执行过程中发生异常，自动清理资源
+    // 确保迁移状态的一致性，避免资源泄漏和不一致状态
     ScopeGuard scopedGuard([&] { _cleanupOnError(); });
+    
+    // 克隆阶段时间统计更新：
+    // 功能：记录从克隆开始到当前时刻的总耗时
+    // 用途：性能监控、调优分析、运维观察
+    // 时机：在进入等待阶段前记录，确保统计的准确性
     _stats.totalDonorChunkCloneTimeMillis.addAndFetch(_cloneAndCommitTimer.millis());
+    
+    // 重置克隆和提交计时器：
+    // 目的：为下一个阶段（关键区域）的时间统计做准备
+    // 重要性：分阶段的时间统计有助于识别性能瓶颈
     _cloneAndCommitTimer.reset();
 
     // Block until the cloner deems it appropriate to enter the critical section.
+    // 阻塞等待直到克隆器认为适合进入关键区域：
+    // 
+    // 核心逻辑：调用克隆驱动器的等待方法，让其内部判断同步进度
+    // 参数1：操作上下文，提供中断机制和资源管理
+    // 参数2：最大等待时间（kMaxWaitToEnterCriticalSectionTimeout = 6小时）
+    // 
+    // 内部机制：
+    // - 克隆驱动器会检查接收端的克隆进度
+    // - 评估未传输的增量变更（xferMods）数量
+    // - 考虑网络条件和传输速率
+    // - 确保进入关键区域后能够快速完成剩余同步
+    // 
+    // 等待条件（由克隆驱动器内部决定）：
+    // - 初始数据克隆基本完成
+    // - 增量变更队列长度在可控范围内
+    // - 接收端响应正常，网络状况良好
+    // - 预估关键区域时间在可接受范围内
     uassertStatusOK(_cloneDriver->awaitUntilCriticalSectionIsAppropriate(
         _opCtx, kMaxWaitToEnterCriticalSectionTimeout));
 
+    // 状态转换：从克隆中转换为克隆已追赶
+    // 意义：标记初始数据传输和大部分增量同步已完成
+    // 后续：下一步将进入关键区域，开始阻塞写操作
     _state = kCloneCaughtUp;
+    
+    // 完成第4步时间统计：
+    // 步骤4：awaitToCatchUp 阶段完成
+    // 用途：迁移进度跟踪和性能分析
     _moveTimingHelper.done(4);
+    
+    // 测试断点：允许在步骤4暂停，用于测试和调试
+    // 在生产环境中此断点通常不会激活
     moveChunkHangAtStep4.pauseWhileSet(_opCtx);
+    
+    // 取消错误清理守护：表示函数成功执行完成
+    // 如果执行到这里，说明同步检查通过，可以安全进入下一阶段
     scopedGuard.dismiss();
 }
 

@@ -221,7 +221,7 @@ public:
     bool InitialCloneCommand::run(OperationContext* opCtx,
                                   const DatabaseName&,
                                   const BSONObj& cmdObj,
-                                  BSONObjBuilder& result) override {
+                                  BSONObjBuilder& result) override { // InitialCloneCommand::run
         // 迁移会话ID提取和验证：
         // 功能：从命令对象中提取迁移会话标识符
         // 安全性：确保命令来自合法的迁移会话，防止非法访问
@@ -275,6 +275,7 @@ public:
             // 参数2：集合对象，用于数据读取
             // 参数3：数组构建器指针，用于接收文档数据
             // 重要性：这是实际数据传输的关键调用点
+            // InitialCloneCommand::run调用，获取本次需要迁移的 doc 添加到 arrBuilder 中。
             uassertStatusOK(autoCloner.getCloner()->nextCloneBatch(
                 opCtx, autoCloner.getColl(), arrBuilder.get_ptr()));
         }

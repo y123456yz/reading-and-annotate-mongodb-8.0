@@ -504,18 +504,80 @@ Status MigrationChunkClonerSource::startClone(OperationContext* opCtx,
     return Status::OK();
 }
 
+/**
+ * MigrationChunkClonerSource::awaitUntilCriticalSectionIsAppropriate 函数的作用：
+ * 等待并判断何时适合进入迁移的关键区域（Critical Section），确保在阻塞写操作前数据同步达到最佳状态。
+ * 
+ * 核心功能：
+ * 1. 迁移模式判断：区分手动强制巨型块迁移和常规迁移的处理策略
+ * 2. 关键区域准入控制：调用状态检查机制判断是否可以安全进入关键区域
+ * 3. 巨型块特殊处理：对手动强制的巨型块采用立即进入策略
+ * 4. 状态验证：确保克隆器处于正确的克隆状态
+ * 5. 锁状态检查：验证调用时没有持有任何锁，避免死锁风险
+ * 
+ * 关键区域意义：
+ * - 写操作阻塞：进入关键区域后将阻塞对源分片的写操作
+ * - 最终同步：在阻塞状态下完成剩余数据的最终传输
+ * - 原子切换：确保chunk所有权的原子性转移
+ * - 性能影响：最小化阻塞写操作的时间窗口
+ * 
+ * 决策策略：
+ * - 手动强制巨型块：立即进入关键区域，整个克隆过程在关键区域完成
+ * - 常规迁移：等待接收端克隆进度达到阈值后进入关键区域
+ * - 智能判断：基于数据同步进度、内存使用、会话状态等多维度评估
+ * 
+ * 性能优化：
+ * - 减少阻塞时间：通过预先同步最大化数据传输，最小化关键区域时间
+ * - 平衡策略：在数据完整性和系统可用性之间找到最佳平衡点
+ * - 自适应阈值：基于chunk大小和网络条件动态调整进入时机
+ * 
+ * 错误处理：
+ * - 状态验证：确保迁移状态的一致性和正确性
+ * - 超时保护：防止无限等待导致的资源占用
+ * - 前置条件检查：验证调用环境的正确性
+ * 
+ * 该函数是迁移过程中的关键决策点，直接影响迁移的性能和可用性。
+ */
 Status MigrationChunkClonerSource::awaitUntilCriticalSectionIsAppropriate(
     OperationContext* opCtx, Milliseconds maxTimeToWait) {
+    // 状态前置条件验证：
+    // 条件1：确保当前处于克隆状态，这是进入关键区域的必要前提
+    // 条件2：确保调用时没有持有任何锁，避免在等待过程中出现死锁
+    // 重要性：这些检查确保函数在正确的上下文中被调用
     invariant(_state == kCloning);
     invariant(!shard_role_details::getLocker(opCtx)->isLocked());
+    
     // If this migration is manual migration that specified "force", enter the critical section
     // immediately. This means the entire cloning phase will be done under the critical section.
+    // 手动强制巨型块迁移的特殊处理：
+    // 条件：存在巨型块克隆状态 且 迁移参数指定为手动强制模式
+    // 策略：立即进入关键区域，不等待任何同步条件
+    // 原因：手动强制模式表示管理员明确要求迁移超大块，接受性能影响
+    // 后果：整个克隆阶段将在关键区域（写操作被阻塞）下完成
     if (_jumboChunkCloneState && _args.getForceJumbo() == ForceJumbo::kForceManual) {
-        return Status::OK();
+        return Status::OK();  // 立即返回成功，允许进入关键区域
     }
 
+    // 常规迁移的状态检查策略：
+    // 功能：调用接收端状态检查机制，等待合适的进入时机
+    // 参数1：操作上下文，提供中断机制和资源管理
+    // 参数2：最大等待时间，防止无限等待（通常为6小时）
+    // 
+    // 内部逻辑（由 _checkRecipientCloningStatus 实现）：
+    // - 轮询接收端的克隆状态和进度
+    // - 评估未传输数据量是否在可接受范围内
+    // - 检查会话迁移是否完成或接近完成
+    // - 监控源端内存使用情况
+    // - 基于多维度指标判断最佳进入时机
+    //
+    // 成功条件：
+    // - 接收端状态为 "steady" 或在阈值内的 "catchup"
+    // - 未传输修改操作在可管理范围内
+    // - 会话数据迁移基本完成
+    // - 源端内存使用未超过限制
     return _checkRecipientCloningStatus(opCtx, maxTimeToWait);
 }
+
 
 StatusWith<BSONObj> MigrationChunkClonerSource::commitClone(OperationContext* opCtx) {
     invariant(_state == kCloning);
@@ -809,29 +871,95 @@ void MigrationChunkClonerSource::_nextCloneBatchFromIndexScan(OperationContext* 
     _jumboChunkCloneState->clonerExec->detachFromOperationContext();
 }
 
+/**
+ * MigrationChunkClonerSource::_nextCloneBatchFromCloneRecordIds 函数的作用：
+ * 基于预存储的记录ID获取下一批克隆文档，是常规大小chunk的高效数据传输核心实现。
+ * 
+ * 核心功能：
+ * 1. 基于记录ID的随机访问：使用预先收集的记录ID进行高效的文档访问
+ * 2. 批次大小控制：动态控制单次传输的数据量，避免超出BSON大小限制
+ * 3. 范围边界验证：确保传输的文档仍在目标chunk的分片键范围内
+ * 4. 让步机制管理：定期让步CPU资源，维持系统响应性
+ * 5. 文档溢出处理：支持文档溢出到下次批次，优化传输效率
+ * 
+ * 传输策略：
+ * - 预取优化：基于预扫描的记录ID，避免重复索引扫描
+ * - 随机访问：直接通过记录ID访问文档，效率高于索引扫描
+ * - 批次优化：考虑BSON数组索引开销，精确控制传输大小
+ * - 范围过滤：运行时验证文档是否仍在迁移范围内
+ * 
+ * 性能优化：
+ * - 让步策略：基于时间和迭代次数的双重让步控制
+ * - 内存管理：通过溢出机制避免单次传输过大
+ * - 统计更新：实时更新克隆进度和传输量统计
+ * - 异常记录：跟踪已删除或移出范围的文档数量
+ * 
+ * 数据一致性：
+ * - 时点一致性：基于记录ID确保访问时点的一致性
+ * - 范围检查：验证文档分片键是否仍在目标范围内
+ * - 存在性验证：处理在记录ID收集后被删除的文档
+ * - 变更追踪：通过OpObserver机制追踪并发写操作
+ * 
+ * 错误处理：
+ * - 文档缺失：处理记录ID对应文档已被删除的情况
+ * - 范围变更：处理文档分片键值变更导致的范围移出
+ * - 中断处理：响应操作上下文的中断请求
+ * - 统计维护：准确记录各种异常情况的统计信息
+ * 
+ * 该函数专门用于常规大小的chunk，通过预存储记录ID实现高效的批量数据传输。
+ */
 void MigrationChunkClonerSource::_nextCloneBatchFromCloneRecordIds(OperationContext* opCtx,
                                                                    const CollectionPtr& collection,
                                                                    BSONArrayBuilder* arrBuilder) {
+    // 让步跟踪器初始化：
+    // 功能：创建基于时间和迭代次数的让步控制器
+    // 参数1：快速时钟源，提供高精度时间测量
+    // 参数2：让步迭代间隔，从全局配置参数加载
+    // 参数3：让步时间周期，从全局配置参数加载（毫秒）
+    // 目的：定期让步CPU资源，避免长时间阻塞其他操作
     ElapsedTracker tracker(opCtx->getServiceContext()->getFastClockSource(),
                            internalQueryExecYieldIterations.load(),
                            Milliseconds(internalQueryExecYieldPeriodMS.load()));
 
+    // 主文档获取循环：持续从记录ID列表中获取文档直到满足退出条件
     while (true) {
+        // 不存在记录计数器：跟踪记录ID对应的文档已不存在的数量
+        // 用途：统计在记录ID收集后被删除的文档数量
         int recordsNoLongerExist = 0;
+        
+        // 获取下一个待处理文档：
+        // 功能：从克隆列表中获取下一个记录ID对应的文档
+        // 参数1：操作上下文，提供事务和中断支持
+        // 参数2：集合对象，用于文档访问
+        // 参数3：不存在记录计数器的指针，用于统计已删除文档
+        // 返回：包装的文档对象，可能为空表示没有更多文档
         auto docInFlight = _cloneList.getNextDoc(opCtx, collection, &recordsNoLongerExist);
 
+        // 不存在记录统计更新：
+        // 条件：如果有记录ID对应的文档已不存在
+        // 操作：在互斥锁保护下更新全局统计计数器
+        // 原因：文档可能在记录ID收集后被删除或移动
         if (recordsNoLongerExist) {
             stdx::lock_guard lk(_mutex);
             _numRecordsPassedOver += recordsNoLongerExist;
         }
 
+        // 获取文档内容：从包装对象中提取实际的文档数据
         const auto& doc = docInFlight->getDoc();
         if (!doc) {
+            // 文档为空表示没有更多数据：
+            // 情况：所有记录ID都已处理完毕或没有有效文档
+            // 操作：退出循环，结束当前批次的数据收集
             break;
         }
 
         // We must always make progress in this method by at least one document because empty
         // return indicates there is no more initial clone data.
+        // 让步条件检查：
+        // 前提：必须在此方法中至少处理一个文档，因为空返回表示没有更多初始克隆数据
+        // 条件1：arrBuilder->arrSize() - 数组中已有文档（确保有进展）
+        // 条件2：tracker.intervalHasElapsed() - 让步时间间隔已过
+        // 操作：如果满足条件，将当前文档插入溢出队列并退出循环
         if (arrBuilder->arrSize() && tracker.intervalHasElapsed()) {
             _cloneList.insertOverflowDoc(*doc);
             break;
@@ -842,17 +970,30 @@ void MigrationChunkClonerSource::_nextCloneBatchFromCloneRecordIds(OperationCont
         // index scan during cloning. This is needed because the destination is very
         // conservative in processing xferMod deletes and won't delete docs that are not in
         // the range of the chunk being migrated.
+        // 文档范围验证：
+        // 目的：不发送不再位于正在移动的chunk范围内的文档
+        // 原因：文档的分片键值可能在克隆期间的初始索引扫描之后发生了变化
+        // 必要性：目标分片在处理xferMod删除时非常保守，不会删除不在迁移chunk范围内的文档
+        // 检查：验证文档的分片键值是否仍在指定的最小值和最大值范围内
         if (!isDocInRange(
                 doc->value(), _args.getMin().value(), _args.getMax().value(), _shardKeyPattern)) {
             {
+                // 范围外文档统计更新：
+                // 操作：在互斥锁保护下增加超出范围的文档计数
+                // 原因：文档分片键值变更导致不再属于当前chunk
                 stdx::lock_guard lk(_mutex);
                 _numRecordsPassedOver++;
             }
-            continue;
+            continue;  // 跳过此文档，继续处理下一个
         }
 
         // Use the builder size instead of accumulating the document sizes directly so
         // that we take into consideration the overhead of BSONArray indices.
+        // BSON大小限制检查：
+        // 策略：使用构建器大小而不是直接累积文档大小，以考虑BSONArray索引的开销
+        // 条件1：arrBuilder->arrSize() - 数组中已有文档
+        // 条件2：大小检查 - 当前长度 + 文档大小 + 1024字节缓冲 > BSON最大用户大小
+        // 操作：如果超出大小限制，将文档插入溢出队列并退出循环
         if (arrBuilder->arrSize() &&
             (arrBuilder->len() + doc->value().objsize() + 1024) > BSONObjMaxUserSize) {
             _cloneList.insertOverflowDoc(*doc);
@@ -860,11 +1001,23 @@ void MigrationChunkClonerSource::_nextCloneBatchFromCloneRecordIds(OperationCont
         }
 
         {
+            // 成功克隆统计更新：
+            // 操作：在互斥锁保护下增加成功克隆的记录计数
+            // 时机：文档通过所有验证并准备添加到传输批次时
             stdx::lock_guard lk(_mutex);
             _numRecordsCloned++;
         }
 
+        // 文档添加到传输批次：
+        // 操作：将文档添加到BSON数组构建器中
+        // 结果：文档将包含在返回给接收端的批次中
         arrBuilder->append(doc->value());
+        
+        // 全局统计更新：
+        // 功能：更新分片系统的全局克隆统计信息
+        // 统计1：源端克隆文档计数增加1
+        // 统计2：源端克隆字节数增加文档大小
+        // 用途：监控和性能分析
         ShardingStatistics::get(opCtx).countDocsClonedOnDonor.addAndFetch(1);
         ShardingStatistics::get(opCtx).countBytesClonedOnDonor.addAndFetch(doc->value().objsize());
     }
@@ -879,22 +1032,75 @@ uint64_t MigrationChunkClonerSource::getCloneBatchBufferAllocationSize() {
                     _averageObjectSizeForCloneRecordIds * _cloneList.size());
 }
 
+/**
+ * MigrationChunkClonerSource::nextCloneBatch 函数的作用：
+ * 获取下一批要迁移的文档数据，是 chunk 迁移过程中数据传输的核心函数。
+ * 
+ * 核心功能：
+ * 1. 批量数据获取：从源分片获取一批文档数据用于传输到目标分片
+ * 2. 传输模式选择：根据 chunk 大小选择不同的数据获取策略
+ * 3. 内存优化管理：控制单次传输的数据量，避免内存溢出
+ * 4. 并发安全保证：在共享锁保护下安全地读取集合数据
+ * 5. 统计信息更新：记录克隆进度和传输量统计
+ * 
+ * 传输策略：
+ * - 常规块模式：使用预存储的记录ID进行高效的随机访问
+ * - 巨型块模式：使用直接索引扫描进行流式数据传输
+ * - 自适应选择：根据 _jumboChunkCloneState 和 _forceJumbo 标志自动选择
+ * 
+ * 性能优化：
+ * - 让步机制：定期让步CPU避免长时间阻塞其他操作
+ * - 批次大小控制：动态调整传输批次大小以优化网络效率
+ * - 范围验证：确保只传输在目标chunk范围内的文档
+ * - 溢出文档处理：支持文档溢出到下次批次传输
+ * 
+ * 数据一致性：
+ * - 读取时点一致性：在一致的读取时点获取文档数据
+ * - 范围边界检查：验证文档仍在迁移chunk的范围内
+ * - 记录存在性验证：处理在扫描后被删除的文档
+ * 
+ * 错误处理：
+ * - 异常捕获：捕获并转换数据库异常为状态码
+ * - 集合验证：确保目标集合仍然存在且可访问
+ * - 中断处理：响应操作上下文的中断请求
+ * 
+ * 该函数是 InitialCloneCommand 的核心依赖，负责实际的数据获取和传输准备。
+ * // InitialCloneCommand::run调用，获取本次需要迁移的 doc 添加到 arrBuilder 中。
+ */
+
 Status MigrationChunkClonerSource::nextCloneBatch(OperationContext* opCtx,
                                                   const CollectionPtr& collection,
                                                   BSONArrayBuilder* arrBuilder) {
+    // 集合锁验证：确保调用者持有集合的意向共享锁
+    // 目的：保证在数据读取期间集合不会被删除或重命名
+    // 锁模式：MODE_IS 允许并发读取但阻止结构性变更
     dassert(shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(nss(), MODE_IS));
 
     // If this chunk is too large to store records in _cloneRecordIds and the command args specify
     // to attempt to move it, scan the collection directly.
+    // 巨型块处理分支：
+    // 条件：chunk 过大无法在 _cloneRecordIds 中存储记录且命令参数指定尝试移动
+    // 策略：直接扫描集合而不是使用预存储的记录ID
+    // 优势：避免内存溢出，支持超大chunk的迁移
     if (_jumboChunkCloneState && _forceJumbo) {
         try {
+            // 调用巨型块专用的索引扫描方法：
+            // 功能：使用索引扫描逐步获取chunk范围内的文档
+            // 特点：流式处理，内存使用可控，支持让步机制
+            // 状态管理：维护扫描进度，支持中断和恢复
             _nextCloneBatchFromIndexScan(opCtx, collection, arrBuilder);
             return Status::OK();
         } catch (const DBException& ex) {
+            // 异常处理：捕获数据库异常并转换为状态对象
+            // 常见异常：索引不存在、集合被删除、权限不足等
             return ex.toStatus();
         }
     }
 
+    // 常规块处理分支：
+    // 策略：使用预存储在 _cloneRecordIds 中的记录ID进行随机访问
+    // 优势：访问效率高，批次控制精确，内存使用预期
+    // 适用：中小型chunk，记录ID可以完全加载到内存中
     _nextCloneBatchFromCloneRecordIds(opCtx, collection, arrBuilder);
     return Status::OK();
 }
@@ -1401,7 +1607,7 @@ Status MigrationChunkClonerSource::_checkRecipientCloningStatus(OperationContext
     
     // 主监控循环：持续检查直到满足条件或超时
     while ((Date_t::now() - startTime) < maxTimeToWait) {
-        // 向接收端发送状态查询请求：
+        // 向接收端发送状态查询请求 _recvChunkStatus：
         // 功能：获取接收端当前的克隆状态和进度信息
         // 参数：waitForSteadyOrDone=true 表示等待接收端达到稳定或完成状态
         auto responseStatus = _callRecipient(
