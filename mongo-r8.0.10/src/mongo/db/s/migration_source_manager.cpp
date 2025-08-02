@@ -662,6 +662,7 @@ void MigrationSourceManager::startClone() {
 
     // 启动实际的数据克隆过程
     // 传入迁移ID、会话信息和事务号，确保克隆过程的可追踪性和一致性
+    // MigrationChunkClonerSource::startClone() 方法会处理数据传输、增量同步等逻辑
     uassertStatusOK(_cloneDriver->startClone(_opCtx,
                                              _coordinator->getMigrationId(),   // 迁移唯一标识
                                              _coordinator->getLsid(),          // 逻辑会话ID

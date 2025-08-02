@@ -366,7 +366,7 @@ sequenceDiagram
     participant Mongos as 路由器
     
     Note over Config,Mongos: 阶段1: 迁移启动
-    Config->>Source: moveChunk 命令
+    Config->>Source: _shardsvrMoveRange 命令
     Source->>Source: MigrationSourceManager 构造
     Source->>Source: 元数据验证和冲突检测
     Source->>Source: startClone() - 状态转换 kCreated→kCloning

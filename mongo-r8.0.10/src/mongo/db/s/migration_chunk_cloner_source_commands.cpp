@@ -148,6 +148,74 @@ private:
     std::shared_ptr<MigrationChunkClonerSource> _chunkCloner;
 };
 
+
+/*
+完整的迁移时序图
+sequenceDiagram
+    participant Config as 配置服务器
+    participant Source as 源分片
+    participant Dest as 目标分片
+    participant Mongos as 路由器
+    
+    Note over Config,Mongos: 阶段1: 迁移启动
+    Config->>Source: _shardsvrMoveRange 命令
+    Source->>Source: MigrationSourceManager 构造
+    Source->>Source: 元数据验证和冲突检测
+    Source->>Source: startClone() - 状态转换 kCreated→kCloning
+    
+    Note over Source,Dest: 阶段2: 数据克隆
+    Source->>Dest: _recvChunkStart 命令，Dest RecvChunkStartCommand 接收该命令
+    Dest->>Source: 确认启动成功
+    
+    loop 初始数据克隆循环
+        Dest->>Source: _migrateClone 请求
+        Source->>Source: nextCloneBatch() 获取数据
+        Source->>Dest: 返回文档批次
+        Dest->>Dest: 插入文档到本地
+    end
+    
+    Note over Source,Dest: 阶段3: 写操作追踪（并行进行）
+    Note right of Source: OpObserver 持续捕获写操作
+    Source->>Source: onInsertOp/onUpdateOp/onDeleteOp
+    Source->>Source: 添加ID到内存队列
+    
+    loop 增量同步循环
+        Dest->>Source: _transferMods 请求
+        Source->>Source: nextModsBatch() 获取修改
+        Source->>Dest: 返回增量变更
+        Dest->>Dest: 应用修改操作
+    end
+    
+    Note over Source,Dest: 阶段4: 关键区域准入
+    Source->>Source: awaitToCatchUp()
+    Source->>Source: awaitUntilCriticalSectionIsAppropriate()
+    
+    loop 状态检查循环
+        Source->>Dest: _recvChunkStatus 查询
+        Dest->>Source: 返回状态和进度
+        Source->>Source: 判断未传输数据是否<5%
+    end
+    
+    Note over Source,Dest: 阶段5: 关键区域（写操作阻塞）
+    Source->>Source: enterCriticalSection() - 阻塞写操作
+    Source->>Dest: _recvChunkCommit 命令
+    Dest->>Source: 确认提交成功
+    
+    Note over Source,Config: 阶段6: 元数据提交
+    Source->>Config: CommitChunkMigration 请求
+    Config->>Config: 更新chunk所有权
+    Config->>Source: 提交成功确认
+    
+    Note over Source,Mongos: 阶段7: 清理和通知
+    Source->>Source: forceShardFilteringMetadataRefresh()
+    Source->>Dest: 异步释放关键区域
+    Source->>Source: 退出关键区域，恢复写操作
+    Source->>Config: 记录变更日志
+    
+    Note over Config,Mongos: 路由器自动发现变更并更新路由表
+   */
+
+
 // 接收端接收到发送端发送的 _recvChunkStart 命令后启动克隆流程，接收端通过 RecvChunkStartCommand  MigrationDestinationManager::_migrateDriver 发送 _migrateClone 给发送端，
 // 发送端接收到 _migrateClone 命令后，启动克隆流程，调用nextCloneBatch发送数据给客户端
 class InitialCloneCommand : public BasicCommand {

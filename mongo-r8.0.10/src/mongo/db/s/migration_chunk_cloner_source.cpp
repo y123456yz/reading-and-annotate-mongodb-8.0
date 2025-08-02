@@ -1426,14 +1426,58 @@ MigrationChunkClonerSource::_getIndexScanExecutor(OperationContext* opCtx,
                                               scanOption);
 }
 
+/**
+ * MigrationChunkClonerSource::_storeCurrentRecordId 函数的作用：
+ * 预扫描要迁移的chunk范围并存储文档记录ID，为高效的批量数据传输做准备。
+ * 
+ * 核心功能：
+ * 1. 记录ID预收集：通过索引扫描收集chunk范围内所有文档的物理记录ID
+ * 2. 巨型块检测：检测超过大小限制的chunk并进行相应处理
+ * 3. 性能统计收集：计算平均文档大小、平均对象ID大小等性能参数
+ * 4. 内存管理评估：评估克隆过程中的内存使用情况
+ * 5. 传输策略选择：为后续的数据传输选择最优的访问策略
+ * 
+ * 工作流程：
+ * - 索引扫描：使用分片键索引扫描chunk范围内的所有文档
+ * - 记录ID收集：将每个文档的物理记录ID存储在内存中的集合里
+ * - 大小检测：统计文档数量，检测是否为巨型块
+ * - 统计计算：计算集合和索引的平均大小信息
+ * - 结果存储：将收集的记录ID存储到克隆列表中
+ * 
+ * 巨型块处理：
+ * - 大小阈值：基于平均文档大小和最大chunk大小计算阈值
+ * - 强制模式：如果启用强制迁移，巨型块将使用直接扫描模式
+ * - 错误返回：非强制模式下巨型块会返回ChunkTooBig错误
+ * 
+ * 性能优化：
+ * - 预取策略：预先收集记录ID避免后续重复索引扫描
+ * - 随机访问：基于记录ID的直接文档访问比索引扫描更高效
+ * - 内存评估：提供准确的内存使用预估以优化批次大小
+ * - 统计驱动：基于实际数据特征优化传输参数
+ * 
+ * 错误处理：
+ * - 索引缺失：检查分片键索引和_id索引的存在性
+ * - 中断支持：定期检查操作上下文的中断状态
+ * - 异常捕获：处理执行器扫描过程中的异常
+ * 
+ * 该函数是常规大小chunk高效迁移的基础，通过预收集记录ID实现高性能的批量数据访问。
+ */
 Status MigrationChunkClonerSource::_storeCurrentRecordId(OperationContext* opCtx) {
+    // 获取集合访问权限：以意向共享模式锁定集合
+    // MODE_IS：允许并发读取，但阻止删除或重命名操作
+    // 目的：确保在扫描期间集合结构保持稳定
     AutoGetCollection collection(opCtx, nss(), MODE_IS);
     if (!collection) {
+        // 集合不存在错误：迁移过程中集合被删除
         return {ErrorCodes::NamespaceNotFound,
                 str::stream() << "Collection " << nss().toStringForErrorMsg()
                               << " does not exist."};
     }
 
+    // 获取索引扫描执行器：
+    // 功能：创建基于分片键索引的范围扫描执行器
+    // 参数：操作上下文、集合、默认索引扫描选项
+    // 用途：按照分片键顺序扫描chunk范围内的所有文档
     auto swExec = _getIndexScanExecutor(
         opCtx, collection.getCollection(), InternalPlanner::IndexScanOptions::IXSCAN_DEFAULT);
     if (!swExec.isOK()) {
@@ -1444,48 +1488,71 @@ Status MigrationChunkClonerSource::_storeCurrentRecordId(OperationContext* opCtx
     // Use the average object size to estimate how many objects a full chunk would carry do that
     // while traversing the chunk's range using the sharding index, below there's a fair amount of
     // slack before we determine a chunk is too large because object sizes will vary.
-    unsigned long long maxRecsWhenFull;
-    long long avgRecSize;
+    // 巨型块检测参数计算：
+    // 使用平均对象大小估算一个完整chunk可以容纳多少个对象
+    // 在使用分片索引遍历chunk范围时进行检测
+    // 由于对象大小会变化，在确定chunk过大之前会有相当大的松弛空间
+    unsigned long long maxRecsWhenFull;  // chunk满载时的最大记录数
+    long long avgRecSize;                // 平均记录大小
 
+    // 集合统计信息获取：计算平均文档大小
     const long long totalRecs = collection->numRecords(opCtx);
     if (totalRecs > 0) {
+        // 平均记录大小计算：总数据大小 / 总记录数
         avgRecSize = collection->dataSize(opCtx) / totalRecs;
         // The calls to numRecords() and dataSize() are not atomic so it is possible that the data
         // size becomes smaller than the number of records between the two calls, which would result
         // in average record size of zero
+        // 零值保护：numRecords()和dataSize()调用不是原子的
+        // 可能出现数据大小在两次调用之间变得小于记录数的情况，导致平均记录大小为零
         if (avgRecSize == 0) {
-            avgRecSize = BSONObj::kMinBSONLength;
+            avgRecSize = BSONObj::kMinBSONLength;  // 使用最小BSON长度作为默认值
         }
+        
+        // 最大记录数阈值计算：
+        // 基于最大chunk大小和平均记录大小计算能容纳的最大记录数
+        // 至少为1，避免除零错误
         maxRecsWhenFull = std::max(_args.getMaxChunkSizeBytes() / avgRecSize, 1LL);
-        maxRecsWhenFull = 2 * maxRecsWhenFull;  // pad some slack
+        maxRecsWhenFull = 2 * maxRecsWhenFull;  // pad some slack - 添加2倍松弛空间
     } else {
+        // 空集合处理：设置默认值
         avgRecSize = 0;
-        maxRecsWhenFull = kMaxObjectPerChunk + 1;
+        maxRecsWhenFull = kMaxObjectPerChunk + 1;  // 默认最大对象数 + 1
     }
 
     // Do a full traversal of the chunk and don't stop even if we think it is a large chunk we want
     // the number of records to better report, in that case.
-    bool isLargeChunk = false;
-    unsigned long long recCount = 0;
+    // 完整遍历chunk范围：
+    // 即使认为这是一个大chunk也不要停止，我们希望获得记录数以便更好地报告
+    bool isLargeChunk = false;           // 是否为大chunk标志
+    unsigned long long recCount = 0;     // 实际记录计数
 
     try {
-        BSONObj obj;
-        RecordId recordId;
-        RecordIdSet recordIdSet;
+        BSONObj obj;              // 当前文档对象
+        RecordId recordId;        // 当前记录ID
+        RecordIdSet recordIdSet;  // 记录ID集合，用于存储所有收集的记录ID
 
+        // 主扫描循环：遍历执行器返回的所有文档
         while (PlanExecutor::ADVANCED == exec->getNext(&obj, &recordId)) {
+            // 中断检查：定期检查操作是否被中断
+            // 长时间运行的操作需要支持中断以保持系统响应性
             Status interruptStatus = opCtx->checkForInterruptNoAssert();
             if (!interruptStatus.isOK()) {
                 return interruptStatus;
             }
 
+            // 记录ID收集：如果不是大chunk，将记录ID添加到集合中
+            // 目的：为后续的随机访问做准备
             if (!isLargeChunk) {
                 recordIdSet.insert(recordId);
             }
 
+            // 大chunk检测：当记录数超过阈值时标记为大chunk
             if (++recCount > maxRecsWhenFull) {
                 isLargeChunk = true;
 
+                // 强制迁移处理：如果启用强制迁移，清空记录ID集合并退出
+                // 原因：大chunk将使用直接索引扫描而不是预存储的记录ID
                 if (_forceJumbo) {
                     recordIdSet.clear();
                     break;
@@ -1493,30 +1560,45 @@ Status MigrationChunkClonerSource::_storeCurrentRecordId(OperationContext* opCtx
             }
         }
 
+        // 记录ID列表填充：将收集的记录ID移动到克隆列表中
+        // std::move：避免大量记录ID的拷贝开销
+        // 结果：克隆列表包含按分片键顺序排列的所有记录ID
         _cloneList.populateList(std::move(recordIdSet));
+        
     } catch (DBException& exception) {
+        // 执行器错误处理：为异常添加上下文信息
         exception.addContext("Executor error while scanning for documents belonging to chunk");
         throw;
     }
 
+    // 集合平均对象大小获取：
+    // 功能：获取集合级别的平均对象大小统计
+    // 用途：用于内存使用估算和批次大小优化
     const uint64_t collectionAverageObjectSize = collection->averageObjectSize(opCtx);
 
+    // 平均对象ID大小计算初始化
     uint64_t averageObjectIdSize = 0;
-    const uint64_t defaultObjectIdSize = OID::kOIDSize;
+    const uint64_t defaultObjectIdSize = OID::kOIDSize;  // 默认ObjectId大小
 
     // For clustered collection, an index on '_id' is not required.
+    // 对象ID大小统计：对于聚集集合，'_id'索引不是必需的
     if (totalRecs > 0 && !collection->isClustered()) {
+        // _id索引查找：获取_id索引以计算平均ID大小
         const auto idIdx = collection->getIndexCatalog()->findIdIndex(opCtx);
         if (!idIdx || !idIdx->getEntry()) {
+            // _id索引缺失错误：非聚集集合必须有_id索引
             return {ErrorCodes::IndexNotFound,
                     str::stream() << "can't find index '_id' in storeCurrentRecordId for "
                                   << nss().toStringForErrorMsg()};
         }
 
+        // 平均对象ID大小计算：索引空间使用量 / 总记录数
+        // 目的：准确估算ID字段的存储开销
         averageObjectIdSize =
             idIdx->getEntry()->accessMethod()->getSpaceUsedBytes(opCtx) / totalRecs;
     }
 
+    // 大chunk错误检查：如果是大chunk且未启用强制模式，返回错误
     if (isLargeChunk) {
         return {
             ErrorCodes::ChunkTooBig,
@@ -1528,9 +1610,18 @@ Status MigrationChunkClonerSource::_storeCurrentRecordId(OperationContext* opCtx
                           << getMax()};
     }
 
+    // 统计信息存储：在互斥锁保护下更新成员变量
+    // 目的：为后续的内存使用估算和性能优化提供数据
     stdx::lock_guard<Latch> lk(_mutex);
+    
+    // 克隆记录ID的平均对象大小：集合平均大小 + 默认ObjectId大小
+    // 用途：估算克隆过程中每个记录的内存使用量
     _averageObjectSizeForCloneRecordIds = collectionAverageObjectSize + defaultObjectIdSize;
+    
+    // 平均对象ID大小：使用计算值和默认值中的较大者
+    // 保护：确保至少使用默认ObjectId大小，避免低估
     _averageObjectIdSize = std::max(averageObjectIdSize, defaultObjectIdSize);
+    
     return Status::OK();
 }
 
