@@ -960,6 +960,7 @@ void MigrationChunkClonerSource::_nextCloneBatchFromCloneRecordIds(OperationCont
         // 条件1：arrBuilder->arrSize() - 数组中已有文档（确保有进展）
         // 条件2：tracker.intervalHasElapsed() - 让步时间间隔已过
         // 操作：如果满足条件，将当前文档插入溢出队列并退出循环
+        // 当某个fetcher线程发现当前文档无法放入16MB的响应中时：将文档放回溢出队列，供下次请求使用
         if (arrBuilder->arrSize() && tracker.intervalHasElapsed()) {
             _cloneList.insertOverflowDoc(*doc);
             break;
@@ -1606,7 +1607,8 @@ Status MigrationChunkClonerSource::_checkRecipientCloningStatus(OperationContext
     int iteration = 0;
     
     // 主监控循环：持续检查直到满足条件或超时
-    while ((Date_t::now() - startTime) < maxTimeToWait) {
+    // maxTimeToWait 默认 const Hours kMaxWaitToCommitCloneForJumboChunk(6); 6小时
+    while ((Date_t::now() - startTime) < maxTimeToWait) { 
         // 向接收端发送状态查询请求 _recvChunkStatus：
         // 功能：获取接收端当前的克隆状态和进度信息
         // 参数：waitForSteadyOrDone=true 表示等待接收端达到稳定或完成状态
@@ -1660,6 +1662,7 @@ Status MigrationChunkClonerSource::_checkRecipientCloningStatus(OperationContext
                   "moveChunk data transfer progress",
                   "response"_attr = redact(res),
                   "memoryUsedBytes"_attr = _memoryUsed,
+                  // 预估算一下该 chunk 还有多少文档未迁移 
                   "docsRemainingToClone"_attr =
                       _cloneList.size() - _numRecordsCloned - _numRecordsPassedOver,
                   "untransferredModsSizeBytes"_attr = untransferredModsSizeBytes);
@@ -1916,20 +1919,106 @@ bool MigrationChunkClonerSource::CloneList::hasMore() const {
     return _recordIdsIter != _recordIds.cend() && _inProgressReads > 0;
 }
 
+
+/**
+ * MigrationChunkClonerSource::CloneList::getNextDoc 函数的作用：
+ * 从克隆列表中安全地获取下一个需要迁移的文档，是chunk迁移过程中文档访问的核心函数。
+ * 
+ * 核心功能：
+ * 1. 文档访问协调：在多线程环境下安全地从记录ID集合或溢出队列中获取文档
+ * 2. 溢出文档优先级：优先处理溢出队列中的文档，确保数据传输的连续性
+ * 3. 记录ID迭代：按顺序遍历预扫描的记录ID集合，进行文档的随机访问
+ * 4. 文档存在性验证：处理记录ID对应的文档在扫描后被删除的情况
+ * 5. 并发读取管理：通过读取令牌机制管理正在进行的读取操作数量
+ * 6. 完成状态检测：检测所有文档是否已被处理完毕
+ * 
+ * 工作流程：
+ * - 等待可用文档：使用条件变量等待溢出文档、记录ID或读取完成
+ * - 溢出文档优先：如果存在溢出文档，优先返回溢出队列中的文档
+ * - 记录ID处理：从记录ID迭代器获取下一个记录ID并进行文档查找
+ * - 文档查找：根据记录ID在集合中查找对应的文档数据
+ * - 缺失处理：统计并处理记录ID对应文档已不存在的情况
+ * 
+ * 并发安全机制：
+ * - 互斥锁保护：保护内部数据结构的并发访问
+ * - 读取令牌：通过RAII模式管理正在进行的读取操作计数
+ * - 条件变量：协调多线程之间的等待和通知
+ * - 原子操作：确保状态变更的原子性
+ * 
+ * 性能优化特性：
+ * - 溢出队列：支持文档溢出机制，优化批次传输的大小控制
+ * - 懒加载：按需加载文档，避免不必要的内存占用
+ * - 预取优化：基于预扫描的记录ID，减少重复索引扫描
+ * - 快照隔离：返回快照版本的文档，确保读取一致性
+ * 
+ * 错误处理：
+ * - 文档缺失：处理记录ID对应文档已被删除的情况
+ * - 中断支持：响应操作上下文的中断请求
+ * - 资源清理：通过RAII机制确保资源的正确清理
+ * 
+ * 该函数是_nextCloneBatchFromCloneRecordIds的核心依赖，负责实际的文档访问和并发控制。
+ * 
+ * 多线程执行时序
+时间点T1：三个线程同时调用getNextDoc()
+
+Fetcher线程A：
+lk.lock();                          // 获取锁
+RecordId nextId = *_recordIdsIter;  // nextId = RecordId(1)
+++_recordIdsIter;                   // 迭代器现在指向RecordId(2)
+lk.unlock();                        // 释放锁
+// 去获取RecordId(1)对应的文档
+
+Fetcher线程B（紧接着获取锁）：
+lk.lock();                          // 获取锁  
+RecordId nextId = *_recordIdsIter;  // nextId = RecordId(2)
+++_recordIdsIter;                   // 迭代器现在指向RecordId(3)
+lk.unlock();                        // 释放锁
+// 去获取RecordId(2)对应的文档
+
+
+Fetcher线程C（最后获取锁）：
+lk.lock();                          // 获取锁
+RecordId nextId = *_recordIdsIter;  // nextId = RecordId(3)  
+++_recordIdsIter;                   // 迭代器现在指向RecordId(4)
+lk.unlock();                        // 释放锁
+// 去获取RecordId(3)对应的文档
+
+由于互斥锁的保护，每个线程获取的RecordId都是唯一的，绝对不会重复。
+
+MigrationChunkClonerSource::_nextCloneBatchFromCloneRecordIds 调用
+ */
 std::unique_ptr<MigrationChunkClonerSource::CloneList::DocumentInFlightWhileNotInLock>
 MigrationChunkClonerSource::CloneList::getNextDoc(OperationContext* opCtx,
                                                   const CollectionPtr& collection,
                                                   int* numRecordsNoLongerExist) {
+    // 主文档获取循环：持续尝试获取文档直到成功或无更多文档
     while (true) {
+        // 获取互斥锁：保护对内部数据结构的并发访问
+        // 包括：_recordIdsIter, _overflowDocs, _inProgressReads 等共享状态
         stdx::unique_lock lk(_mutex);
+        
+        // 并发读取计数验证：确保正在进行的读取操作数量非负
+        // _inProgressReads 跟踪当前有多少个线程正在执行文档读取操作
         invariant(_inProgressReads >= 0);
+        
+        // 记录ID变量声明：用于存储从迭代器获取的下一个记录ID
         RecordId nextRecordId;
 
+        // 等待可用文档条件：
+        // 使用条件变量等待以下任一条件满足：
+        // 1. _recordIdsIter != _recordIds.end() - 记录ID迭代器未达到末尾
+        // 2. !_overflowDocs.empty() - 溢出文档队列非空
+        // 3. _inProgressReads == 0 - 没有正在进行的读取操作（表示处理完成）
+        // 支持中断：如果操作上下文被中断，会抛出异常
         opCtx->waitForConditionOrInterrupt(_moreDocsCV, lk, [&]() {
             return _recordIdsIter != _recordIds.end() || !_overflowDocs.empty() ||
                 _inProgressReads == 0;
         });
 
+        // 创建文档飞行对象（带锁版本）：
+        // 功能：创建一个管理正在处理文档的RAII对象
+        // 作用：自动增加_inProgressReads计数，确保并发读取状态的正确跟踪
+        // 设计：使用RAII模式确保即使异常也能正确清理计数
         DocumentInFlightWithLock docInFlight(lk, *this);
 
         // One of the following must now be true (corresponding to the three if conditions):
@@ -1938,33 +2027,86 @@ MigrationChunkClonerSource::CloneList::getNextDoc(OperationContext* opCtx,
         //   3.  The overflow set is empty, the iterator is at the end, and
         //       no threads are holding a document.  This condition indicates
         //       that there are no more docs to return for the cloning phase.
+        
+        // 溢出文档优先处理分支：
+        // 条件：溢出队列中存在文档
+        // 策略：优先处理溢出文档，确保之前因批次大小限制而延迟的文档能被及时处理
+        // 优势：维护文档处理的顺序性，避免数据丢失
         if (!_overflowDocs.empty()) {
+            // 设置溢出文档：从溢出队列头部取出文档并设置到飞行对象中
+            // std::move：转移所有权，避免不必要的拷贝开销
             docInFlight.setDoc(std::move(_overflowDocs.front()));
+            
+            // 移除已处理的溢出文档：从队列头部删除已取出的文档
             _overflowDocs.pop_front();
+            
+            // 释放并返回：将带锁的飞行对象转换为无锁版本并返回
+            // release()：转移所有权，允许在锁外访问文档内容
             return docInFlight.release();
+            
         } else if (_recordIdsIter != _recordIds.end()) {
+            // 记录ID处理分支：
+            // 条件：记录ID迭代器尚未到达末尾
+            // 操作：获取下一个记录ID并推进迭代器
+            
+            // 获取当前记录ID：从迭代器当前位置获取记录ID
             nextRecordId = *_recordIdsIter;
+            
+            // 推进迭代器：移动到下一个记录ID位置
+            // 这确保了每个记录ID只被处理一次
             ++_recordIdsIter;
+            
         } else {
+            // 完成处理分支：
+            // 条件：溢出队列为空 且 记录ID迭代器已到末尾 且 没有正在进行的读取
+            // 含义：所有文档都已处理完毕，克隆阶段结束
+            // 返回：空的飞行对象，表示没有更多文档可处理
             return docInFlight.release();
         }
 
+        // 释放互斥锁：在进行实际的文档读取前释放锁
+        // 目的：避免在IO操作期间持有锁，提高并发性能
+        // 安全性：记录ID已获取，后续操作不需要锁保护
         lk.unlock();
 
+        // 转换飞行对象：将带锁版本转换为无锁版本
+        // 原因：后续的文档查找操作不需要持有克隆列表的锁
+        // 优势：允许其他线程并发访问克隆列表
         auto docInFlightWhileNotLocked = docInFlight.release();
 
+        // 文档查找操作：
+        // 功能：根据记录ID在集合中查找对应的文档
+        // 参数1：操作上下文，提供事务和中断支持
+        // 参数2：记录ID，文档的物理位置标识符
+        // 参数3：文档输出参数，包含快照版本的文档数据
         Snapshotted<BSONObj> doc;
         if (collection->findDoc(opCtx, nextRecordId, &doc)) {
+            // 文档查找成功分支：
+            // 操作：将找到的文档设置到飞行对象中
+            // std::move：转移文档所有权，避免拷贝开销
             docInFlightWhileNotLocked->setDoc(std::move(doc));
+            
+            // 返回包含文档的飞行对象：
+            // 结果：调用方可以访问文档内容进行后续处理
             return docInFlightWhileNotLocked;
         }
 
+        // 文档不存在处理：
+        // 原因：记录ID对应的文档在扫描后被删除或移动
+        // 统计：如果提供了计数器指针，增加不存在记录的计数
+        // 继续：继续循环尝试获取下一个文档
         if (numRecordsNoLongerExist) {
             (*numRecordsNoLongerExist)++;
         }
+        
+        // 继续循环：文档不存在时，继续尝试处理下一个记录ID或溢出文档
+        // 这确保了即使部分文档被删除，迁移过程仍能继续进行
     }
 }
 
+/**
+ * 返回克隆列表中记录ID的数量，也就是一个 chunk 中的文档数量。 配合 MigrationChunkClonerSource::_storeCurrentRecordId 阅读
+ */
 size_t MigrationChunkClonerSource::CloneList::size() const {
     stdx::unique_lock lk(_mutex);
     return _recordIds.size();

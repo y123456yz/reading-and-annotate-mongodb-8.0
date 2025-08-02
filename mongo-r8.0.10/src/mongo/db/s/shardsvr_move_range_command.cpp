@@ -357,7 +357,73 @@ public:
         long long totalCloneTime =
             ShardingStatistics::get(opCtx).totalDonorChunkCloneTimeMillis.load(); // 总克隆时间
         
-        // 阶段1：创建迁移源管理器
+/*
+完整的迁移时序图
+sequenceDiagram
+    participant Config as 配置服务器
+    participant Source as 源分片
+    participant Dest as 目标分片
+    participant Mongos as 路由器
+    
+    Note over Config,Mongos: 阶段1: 迁移启动
+    Config->>Source: moveChunk 命令
+    Source->>Source: MigrationSourceManager 构造
+    Source->>Source: 元数据验证和冲突检测
+    Source->>Source: startClone() - 状态转换 kCreated→kCloning
+    
+    Note over Source,Dest: 阶段2: 数据克隆
+    Source->>Dest: _recvChunkStart 命令，Dest RecvChunkStartCommand 接收该命令
+    Dest->>Source: 确认启动成功
+    
+    loop 初始数据克隆循环
+        Dest->>Source: _migrateClone 请求
+        Source->>Source: nextCloneBatch() 获取数据
+        Source->>Dest: 返回文档批次
+        Dest->>Dest: 插入文档到本地
+    end
+    
+    Note over Source,Dest: 阶段3: 写操作追踪（并行进行）
+    Note right of Source: OpObserver 持续捕获写操作
+    Source->>Source: onInsertOp/onUpdateOp/onDeleteOp
+    Source->>Source: 添加ID到内存队列
+    
+    loop 增量同步循环
+        Dest->>Source: _transferMods 请求
+        Source->>Source: nextModsBatch() 获取修改
+        Source->>Dest: 返回增量变更
+        Dest->>Dest: 应用修改操作
+    end
+    
+    Note over Source,Dest: 阶段4: 关键区域准入
+    Source->>Source: awaitToCatchUp()
+    Source->>Source: awaitUntilCriticalSectionIsAppropriate()
+    
+    loop 状态检查循环
+        Source->>Dest: _recvChunkStatus 查询
+        Dest->>Source: 返回状态和进度
+        Source->>Source: 判断未传输数据是否<5%
+    end
+    
+    Note over Source,Dest: 阶段5: 关键区域（写操作阻塞）
+    Source->>Source: enterCriticalSection() - 阻塞写操作
+    Source->>Dest: _recvChunkCommit 命令
+    Dest->>Source: 确认提交成功
+    
+    Note over Source,Config: 阶段6: 元数据提交
+    Source->>Config: CommitChunkMigration 请求
+    Config->>Config: 更新chunk所有权
+    Config->>Source: 提交成功确认
+    
+    Note over Source,Mongos: 阶段7: 清理和通知
+    Source->>Source: forceShardFilteringMetadataRefresh()
+    Source->>Dest: 异步释放关键区域
+    Source->>Source: 退出关键区域，恢复写操作
+    Source->>Config: 记录变更日志
+    
+    Note over Config,Mongos: 路由器自动发现变更并更新路由表
+   */
+
+        // 阶段1、2：创建迁移源管理器
         // 创建迁移源管理器：负责协调整个迁移过程的状态机
         // 传入迁移请求、写入关注点、源分片连接信息和目标分片主机
         MigrationSourceManager migrationSourceManager(
@@ -365,17 +431,17 @@ public:
     
         // 迁移状态机执行序列：按照严格的顺序执行各个阶段
     
-        // 阶段2：启动克隆阶段
+        // 阶段3：启动克隆阶段
         // 开始将源分片上的 chunk 数据复制到目标分片
         // 这个阶段允许并发读写，不会阻塞业务操作
         migrationSourceManager.startClone();
         
-        // 阶段3：等待追赶完成
+        // 阶段4：等待追赶完成
         // 同步迁移开始后产生的增量变更，确保目标分片数据最新
         // 这个阶段仍然允许并发操作
         migrationSourceManager.awaitToCatchUp();
-        
-        // 阶段4：进入临界区
+
+        // 阶段5：进入临界区
         // 阻塞对该 chunk 范围的所有写操作，确保数据一致性
         // 这是迁移过程中最关键的步骤，会短暂影响写入性能
         migrationSourceManager.enterCriticalSection();

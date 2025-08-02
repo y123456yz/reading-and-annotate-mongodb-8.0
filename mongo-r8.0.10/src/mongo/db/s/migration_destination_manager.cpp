@@ -1332,34 +1332,83 @@ void MigrationDestinationManager::_migrateThread(CancellationToken cancellationT
     _migrateThreadFinishedPromise.reset();
 }
 
+/**
+ * MigrationDestinationManager::_migrateDriver 函数的作用：
+ * 目标分片迁移驱动器的核心执行函数，负责协调整个chunk接收端的迁移流程。
+ * 
+ * 核心职责：
+ * 1. 迁移流程控制：管理从准备阶段到完成的完整迁移生命周期
+ * 2. 数据接收协调：与源分片协调进行初始克隆、增量同步和会话数据迁移
+ * 3. 关键区域管理：控制进入和退出关键区域，确保数据一致性
+ * 4. 状态同步管理：维护迁移状态机，处理状态转换和错误恢复
+ * 5. 写关注处理：确保数据复制满足指定的写关注要求
+ * 6. 索引和集合创建：在目标分片创建必要的集合结构和索引
+ * 7. 范围删除任务：管理重叠范围的清理和新范围的删除任务
+ * 8. 会话迁移：协调事务和可重试写操作的会话数据传输
+ * 
+ * 执行阶段：
+ * - 阶段1：清理重叠的范围删除任务
+ * - 阶段2：创建集合和索引结构
+ * - 阶段3：插入待处理的范围删除任务
+ * - 阶段4：执行初始数据克隆
+ * - 阶段5：执行增量数据同步（catch-up）
+ * - 阶段6：等待提交信号并进入稳定状态
+ * - 阶段7：会话数据迁移完成
+ * - 阶段8：进入关键区域并等待释放信号
+ * 
+ * 参数说明：
+ * @param outerOpCtx 外层操作上下文，持有迁移会话的生命周期
+ * @param skipToCritSecTaken 是否跳过前面阶段直接进入关键区域（用于恢复场景）
+ * 
+ * 错误处理：
+ * - 支持迁移中断后的恢复机制
+ * - 处理网络故障和超时情况
+ * - 维护状态一致性和资源清理
+ * 
+ * 并发安全：
+ * - 使用会话机制防止并发操作冲突
+ * - 通过关键区域确保原子性操作
+ * - 支持主从切换场景下的状态恢复
+ * 
+ * 该函数是MongoDB分片迁移接收端的核心控制器，确保数据迁移的可靠性和一致性。
+ */
 void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx,
                                                  bool skipToCritSecTaken) {
+    // 前置条件检查：确保迁移管理器处于活跃状态
     invariant(isActive());
-    invariant(_sessionId);
-    invariant(_scopedReceiveChunk);
-    invariant(!_min.isEmpty());
-    invariant(!_max.isEmpty());
+    invariant(_sessionId);           // 必须有有效的迁移会话ID
+    invariant(_scopedReceiveChunk);  // 必须持有接收chunk的作用域锁
+    invariant(!_min.isEmpty());     // chunk的最小边界不能为空
+    invariant(!_max.isEmpty());     // chunk的最大边界不能为空
 
-    boost::optional<Timer> timeInCriticalSection;
-    boost::optional<MoveTimingHelper> timing;
+    // 性能监控和时间统计相关变量
+    boost::optional<Timer> timeInCriticalSection;  // 关键区域时间统计
+    boost::optional<MoveTimingHelper> timing;      // 迁移各阶段时间统计
+    
+    // 错误消息设置守护：确保在销毁时将错误信息传递给时间统计助手
     mongo::ScopeGuard timingSetMsgGuard{[this, &timing] {
         // Set the error message to MoveTimingHelper just before it is destroyed. The destructor
         // sends that message (among other things) to the ShardingLogging.
         if (timing) {
             stdx::lock_guard<Latch> sl(_mutex);
-            timing->setCmdErrMsg(_errmsg);
+            timing->setCmdErrMsg(_errmsg);  // 设置错误消息到时间统计中
         }
     }};
 
+    // 判断是否需要执行完整的迁移流程（非恢复模式）
     if (!skipToCritSecTaken) {
         // If this is a configShard, throw if we are draining. This is to avoid creating the
         // db/collections on the local catalog once we have already completed cleanup after drain.
+        // 配置分片draining状态检查：如果是配置分片且有分片正在draining，则抛出异常
+        // 目的：避免在drain清理完成后再次创建数据库/集合
         if (serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer)) {
             checkConfigShardIsNotDraining(outerOpCtx);
         }
 
+        // 初始化时间统计助手：记录迁移的8个主要步骤
         timing.emplace(outerOpCtx, "to", _nss, _min, _max, 8 /* steps */, _toShard, _fromShard);
 
+        // 记录迁移开始日志
         LOGV2(22000,
               "Starting receiving end of chunk migration",
               "chunkMin"_attr = redact(_min),
@@ -1369,48 +1418,87 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx,
               "sessionId"_attr = *_sessionId,
               "migrationId"_attr = _migrationId->toBSON());
 
+        // 中止状态检查：如果迁移已被中止，则提前返回
         const auto initialState = getState();
-
         if (initialState == kAbort) {
             LOGV2_ERROR(22013,
                         "Migration abort requested before the migration started",
                         "migrationId"_attr = _migrationId->toBSON());
             return;
         }
+        invariant(initialState == kReady);  // 确保初始状态为就绪
 
-        invariant(initialState == kReady);
-
+        // 获取源分片的集合选项和索引信息
+        // 用于在目标分片创建相同的集合结构
         auto donorCollectionOptionsAndIndexes = [&]() -> CollectionOptionsAndIndexes {
+            // 获取集合选项和UUID
             auto [collOptions, uuid] =
                 getCollectionOptions(outerOpCtx, _nss, _fromShard, boost::none, boost::none);
+            // 获取索引信息
             auto [indexes, idIndex] =
                 getCollectionIndexes(outerOpCtx, _nss, _fromShard, boost::none, boost::none);
             return {uuid, indexes, idIndex, collOptions};
         }();
 
+        // 存储集合UUID，用于后续的范围删除任务等操作
         _collectionUuid = donorCollectionOptionsAndIndexes.uuid;
 
+        // 获取源分片的连接对象，用于后续的网络通信
         auto fromShard = uassertStatusOK(
             Grid::get(outerOpCtx)->shardRegistry()->getShard(outerOpCtx, _fromShard));
 
+        // 定义迁移的chunk范围
         const ChunkRange range(_min, _max);
 
         // 1. Ensure any data which might have been left orphaned in the range being moved has been
         // deleted.
+        // 阶段1：确保迁移范围内的孤儿数据已被删除
+        // 计算等待范围删除完成的截止时间
+        
+        /* 重叠的范围删除任务处理逻辑举例：
+        // 时间线：T1 - 之前的迁移失败
+        // 源分片：shard1，目标分片：shard2
+        // 迁移范围：{userId: {$gte: 100, $lt: 200}}
+        
+        // T1: 迁移过程中失败，目标分片 shard2 上留下了部分数据和删除任务
+        // config.rangeDeletions 中存在：
+        {
+          _id: ObjectId("..."),
+          nss: "myapp.users", 
+          collectionUuid: UUID("12345678-1234-5678-9abc-123456789abc"),
+          donorShardId: "shard1",
+          range: {
+            min: {userId: 100},
+            max: {userId: 200}
+          },
+          whenToClean: "now",
+          pending: false  // 正在执行删除
+        }
+        
+        // T2: 新的迁移请求到达 shard2
+        // 新迁移范围：{userId: {$gte: 150, $lt: 250}}
+        // 
+        // 重叠检测：
+        // 现有删除范围：[100, 200)
+        // 新迁移范围：  [150, 250)
+        // 重叠区域：    [150, 200)  ← 这就是重叠的范围删除！ */
         const auto rangeDeletionWaitDeadline =
             outerOpCtx->getServiceContext()->getFastClockSource()->now() +
             Milliseconds(drainOverlappingRangeDeletionsOnStartTimeoutMS.load());
 
+        // 循环等待重叠的范围删除任务完成
         while (runWithoutSession(outerOpCtx, [&] {
             return rangedeletionutil::checkForConflictingDeletions(
                 outerOpCtx, range, donorCollectionOptionsAndIndexes.uuid);
         })) {
+            // 检查范围删除器是否被禁用
             uassert(ErrorCodes::ResumableRangeDeleterDisabled,
                     "Failing migration because the disableResumableRangeDeleter server "
                     "parameter is set to true on the recipient shard, which contains range "
                     "deletion tasks overlapping the incoming range.",
                     !disableResumableRangeDeleter.load());
 
+            // 记录等待重叠范围删除完成的日志
             LOGV2(22001,
                   "Migration paused because the requested range overlaps with a range already "
                   "scheduled for deletion",
@@ -1418,6 +1506,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx,
                   "range"_attr = redact(range.toString()),
                   "migrationId"_attr = _migrationId->toBSON());
 
+            // 等待范围清理完成
             auto status =
                 CollectionShardingRuntime::waitForClean(outerOpCtx,
                                                         _nss,
@@ -1425,11 +1514,13 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx,
                                                         range,
                                                         rangeDeletionWaitDeadline);
 
+            // 处理等待结果
             if (!status.isOK() && status != ErrorCodes::ExceededTimeLimit) {
                 _setStateFail(redact(status.toString()));
                 return;
             }
 
+            // 超时检查：确保在截止时间内完成范围清理
             uassert(
                 ErrorCodes::ExceededTimeLimit,
                 "Migration failed because the orphans cleanup routine didn't clear yet a portion "
@@ -1443,14 +1534,17 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx,
             // 'waitForClean' would return immediately even though there really is an ongoing range
             // deletion task. For that case, we loop again until there is no conflicting task in
             // config.rangeDeletions
+            // 防止过滤元数据清理导致的误判：继续循环直到确实没有冲突的删除任务
             outerOpCtx->sleepFor(Milliseconds(1000));
         }
 
+        // 完成第1步时间统计
         timing->done(1);
         migrateThreadHangAtStep1.pauseWhileSet();
 
 
         // 2. Create the parent collection and its indexes, if needed.
+        // 阶段2：创建父集合及其索引（如果需要）
         // The conventional usage of retryable writes is to assign statement id's to all of
         // the writes done as part of the data copying so that _recvChunkStart is
         // conceptually a retryable write batch. However, we are using an alternate approach to do
@@ -1458,12 +1552,14 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx,
         // through to all the places where they are needed would make this code more complex, and 2)
         // some of the operations, like creating the collection or building indexes, are not
         // currently supported in retryable writes.
+        // 设置操作上下文标志：允许在主从切换时中断
         outerOpCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
         {
+            // 创建新的客户端和操作上下文用于集合和索引创建
             auto newClient = outerOpCtx->getServiceContext()
                                  ->getService(ClusterRole::ShardServer)
                                  ->makeClient("MigrationCoordinator");
-            AlternativeClientRegion acr(newClient);
+            AlternativeClientRegion acr(newClient);  // 切换到新的客户端上下文
             auto executor =
                 Grid::get(outerOpCtx->getServiceContext())->getExecutorPool()->getFixedExecutor();
             auto altOpCtx = CancelableOperationContext(
@@ -1471,32 +1567,42 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx,
 
             // Enable write blocking bypass to allow migrations to create the collection and indexes
             // even when user writes are blocked.
+            // 启用写阻塞绕过：允许在用户写操作被阻塞时仍能创建集合和索引
             WriteBlockBypass::get(altOpCtx.get()).set(true);
 
+            // 删除本地不需要的索引（如果存在的话）
             _dropLocalIndexesIfNecessary(altOpCtx.get(), _nss, donorCollectionOptionsAndIndexes);
+            
+            // 克隆集合的索引和选项到目标分片
             cloneCollectionIndexesAndOptions(
                 altOpCtx.get(), _nss, donorCollectionOptionsAndIndexes);
 
             // Get the global indexes and install them.
+            // 获取并安装全局索引（如果功能启用）
             if (feature_flags::gGlobalIndexesShardingCatalog.isEnabled(
                     serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
                 replaceShardingIndexCatalogInShardIfNeeded(
                     altOpCtx.get(), _nss, donorCollectionOptionsAndIndexes.uuid);
             }
 
+            // 完成第2步时间统计
             timing->done(2);
             migrateThreadHangAtStep2.pauseWhileSet();
         }
 
         {
             // 3. Insert a pending range deletion task for the incoming range.
+            // 阶段3：为传入的范围插入待处理的范围删除任务
+            // 创建接收端范围删除任务：标记为待处理状态
             RangeDeletionTask recipientDeletionTask(*_migrationId,
                                                     _nss,
                                                     donorCollectionOptionsAndIndexes.uuid,
                                                     _fromShard,
                                                     range,
                                                     CleanWhenEnum::kNow);
-            recipientDeletionTask.setPending(true);
+            recipientDeletionTask.setPending(true);  // 设置为待处理状态
+            
+            // 设置时间戳和分片键模式
             const auto currentTime = VectorClock::get(outerOpCtx)->getTime();
             recipientDeletionTask.setTimestamp(currentTime.clusterTime().asTimestamp());
             recipientDeletionTask.setKeyPattern(KeyPattern(_shardKeyPattern));
@@ -1504,9 +1610,11 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx,
             // It is illegal to wait for write concern with a session checked out, so persist the
             // range deletion task with an immediately satsifiable write concern and then wait for
             // majority after yielding the session.
+            // 持久化范围删除任务：使用立即满足的写关注，然后在释放会话后等待多数派确认
             rangedeletionutil::persistRangeDeletionTaskLocally(
                 outerOpCtx, recipientDeletionTask, WriteConcernOptions());
 
+            // 在无会话状态下等待多数派写关注
             runWithoutSession(outerOpCtx, [&] {
                 WriteConcernResult ignoreResult;
                 auto latestOpTime =
@@ -1518,10 +1626,12 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx,
                                         &ignoreResult));
             });
 
+            // 完成第3步时间统计
             timing->done(3);
             migrateThreadHangAtStep3.pauseWhileSet();
         }
 
+        // 创建用于数据迁移的新客户端和操作上下文
         auto newClient = outerOpCtx->getServiceContext()
                              ->getService(ClusterRole::ShardServer)
                              ->makeClient("MigrationCoordinator");
@@ -1531,39 +1641,53 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx,
         auto newOpCtxPtr = CancelableOperationContext(
             cc().makeOperationContext(), outerOpCtx->getCancellationToken(), executor);
         auto opCtx = newOpCtxPtr.get();
-        repl::OpTime lastOpApplied;
+        repl::OpTime lastOpApplied;  // 记录最后应用的操作时间
+        
         {
             // 4. Initial bulk clone
-            _setState(kClone);
+            // 阶段4：初始批量克隆
+            _setState(kClone);  // 设置状态为克隆中
 
+            // 启动会话迁移服务
             _sessionMigration->start(opCtx->getServiceContext());
 
             _chunkMarkedPending = true;  // no lock needed, only the migrate thread looks.
+                                         // 标记chunk为待处理状态
 
             {
                 // Destructor of MigrationBatchFetcher is non-trivial. Therefore,
                 // this scope has semantic significance.
+                // MigrationBatchFetcher的析构函数不是简单的，因此这个作用域具有语义意义
+                // 创建迁移批次获取器：负责从源分片获取数据并插入到本地
                 MigrationBatchFetcher<MigrationBatchInserter> fetcher{
-                    outerOpCtx,
-                    opCtx,
-                    _nss,
-                    *_sessionId,
-                    _writeConcern,
-                    _fromShard,
-                    range,
-                    *_migrationId,
-                    *_collectionUuid,
-                    _migrationCloningProgress,
-                    _parallelFetchersSupported,
-                    chunkMigrationFetcherMaxBufferedSizeBytesPerThread.load()};
+                    outerOpCtx,                          // 外层操作上下文
+                    opCtx,                               // 内层操作上下文
+                    _nss,                                // 命名空间
+                    *_sessionId,                         // 会话ID
+                    _writeConcern,                       // 写关注
+                    _fromShard,                          // 源分片
+                    range,                               // 迁移范围
+                    *_migrationId,                       // 迁移ID
+                    *_collectionUuid,                    // 集合UUID
+                    _migrationCloningProgress,           // 克隆进度共享状态
+                    _parallelFetchersSupported,         // 是否支持并行获取器
+                    chunkMigrationFetcherMaxBufferedSizeBytesPerThread.load()  // 最大缓冲区大小
+                };
+                // 执行获取和调度插入操作， 这里会循环发送 _migrateClone 命令给源分片从而获取数据
                 fetcher.fetchAndScheduleInsertion();
             }
+            
+            // 检查操作是否被中断
             opCtx->checkForInterrupt();
+            
+            // 获取克隆过程中的最大操作时间
             lastOpApplied = _migrationCloningProgress->getMaxOptime();
 
+            // 完成第4步时间统计
             timing->done(4);
             migrateThreadHangAtStep4.pauseWhileSet();
 
+            // 故障点检查：模拟接收端迁移失败
             if (MONGO_unlikely(failMigrationOnRecipient.shouldFail())) {
                 _setStateFail(str::stream() << "failing migration after cloning " << _getNumCloned()
                                             << " docs due to failMigrationOnRecipient failpoint");
@@ -1571,13 +1695,17 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx,
             }
         }
 
+        // 创建传输修改请求：用于获取增量数据
         const BSONObj xferModsRequest = createTransferModsRequest(_nss, *_sessionId);
 
         {
             // 5. Do bulk of mods
-            _setState(kCatchup);
+            // 阶段5：执行大量修改操作（增量同步）
+            _setState(kCatchup);  // 设置状态为追赶中
 
+            // 定义批次获取函数：从源分片获取增量修改数据
             auto fetchBatchFn = [&](OperationContext* opCtx, BSONObj* nextBatch) {
+                // 向源分片发送_transferMods命令获取增量数据
                 auto commandResponse = uassertStatusOKWithContext(
                     fromShard->runCommand(opCtx,
                                           ReadPreferenceSetting(ReadPreference::PrimaryOnly),
@@ -1586,33 +1714,43 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx,
                                           Shard::RetryPolicy::kNoRetry),
                     "_transferMods failed: ");
 
+                // 检查命令执行状态
                 uassertStatusOKWithContext(
                     Shard::CommandResponse::getEffectiveStatus(commandResponse),
                     "_transferMods failed: ");
 
                 *nextBatch = commandResponse.response;
+                // 返回true表示这是空批次（没有更多数据）
                 return nextBatch->getField("size").number() == 0;
             };
 
+            // 定义修改应用函数：将增量修改应用到本地集合
             auto applyModsFn = [&](OperationContext* opCtx, BSONObj nextBatch) {
+                // 如果批次大小为0，结束追赶阶段
                 if (nextBatch["size"].number() == 0) {
                     // There are no more pending modifications to be applied. End the catchup phase
                     return false;
                 }
 
+                // 应用迁移操作到本地
                 if (!_applyMigrateOp(opCtx, nextBatch)) {
                     return true;
                 }
+                
+                // 更新追赶阶段的字节统计
                 ShardingStatistics::get(opCtx).countBytesClonedOnCatchUpOnRecipient.addAndFetch(
                     nextBatch["size"].number());
 
+                // 等待复制完成的最大迭代次数
                 const int maxIterations = 3600 * 50;
 
                 int i;
                 for (i = 0; i < maxIterations; i++) {
+                    // 检查操作是否被中断
                     opCtx->checkForInterrupt();
                     outerOpCtx->checkForInterrupt();
 
+                    // 检查迁移是否被中止
                     uassert(
                         ErrorCodes::CommandFailed,
                         str::stream()
@@ -1620,21 +1758,24 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx,
                             << _migrationId->toBSON(),
                         getState() != kAbort);
 
+                    // 检查操作是否已复制到足够多的节点
                     if (runWithoutSession(outerOpCtx, [&] {
                             return opReplicatedEnough(opCtx, lastOpApplied, _writeConcern);
                         })) {
                         return true;
                     }
 
+                    // 记录从节点跟上困难的警告
                     if (i > 100) {
                         LOGV2(22003,
                               "secondaries having hard time keeping up with migrate",
                               "migrationId"_attr = _migrationId->toBSON());
                     }
 
-                    sleepmillis(20);
+                    sleepmillis(20);  // 短暂休眠后重试
                 }
 
+                // 如果达到最大迭代次数仍未复制完成，则失败
                 uassert(ErrorCodes::CommandFailed,
                         "Secondary can't keep up with migrate",
                         i != maxIterations);
@@ -1642,9 +1783,11 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx,
                 return true;
             };
 
+            // 执行获取和应用批次的循环
             auto updatedTime = fetchAndApplyBatch(opCtx, applyModsFn, fetchBatchFn);
             lastOpApplied = (updatedTime == repl::OpTime()) ? lastOpApplied : updatedTime;
 
+            // 完成第5步时间统计
             timing->done(5);
             migrateThreadHangAtStep5.pauseWhileSet();
         }
@@ -1652,6 +1795,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx,
         {
             // Pause to wait for replication. This will prevent us from going into critical section
             // until we're ready.
+            // 暂停等待复制完成：这将防止我们在准备好之前进入关键区域
 
             LOGV2(22004,
                   "Waiting for replication to catch up before entering critical section",
@@ -1662,6 +1806,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx,
                                 "Starting majority commit wait on recipient",
                                 "migrationId"_attr = _migrationId->toBSON());
 
+            // 在无会话状态下等待多数派复制完成
             runWithoutSession(outerOpCtx, [&] {
                 auto awaitReplicationResult =
                     repl::ReplicationCoordinator::get(opCtx)->awaitReplication(
@@ -1682,10 +1827,13 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx,
 
         {
             // 6. Wait for commit
-            _setState(kSteady);
+            // 阶段6：等待提交信号
+            _setState(kSteady);  // 设置状态为稳定
             migrateThreadHangAfterSteadyTransition.pauseWhileSet();
 
-            bool transferAfterCommit = false;
+            bool transferAfterCommit = false;  // 标记是否在提交后进行了传输
+            
+            // 循环处理稳定状态和提交开始状态
             while (getState() == kSteady || getState() == kCommitStart) {
                 opCtx->checkForInterrupt();
                 outerOpCtx->checkForInterrupt();
@@ -1694,10 +1842,13 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx,
                 // aren't sure that at least one transfer happens *after* our state changes to
                 // COMMIT_START, there could be mods still on the FROM shard that got logged
                 // *after* our _transferMods but *before* the critical section.
+                // 确保在收到提交消息后至少进行一次传输
+                // 防止在关键区域之前遗漏源分片上的修改操作
                 if (getState() == kCommitStart) {
                     transferAfterCommit = true;
                 }
 
+                // 继续从源分片获取增量修改
                 auto res = uassertStatusOKWithContext(
                     fromShard->runCommand(opCtx,
                                           ReadPreferenceSetting(ReadPreference::PrimaryOnly),
@@ -1711,12 +1862,14 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx,
 
                 auto mods = res.response;
 
+                // 如果有修改数据，应用它们
                 if (mods["size"].number() > 0) {
                     (void)_applyMigrateOp(opCtx, mods);
                     lastOpApplied = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
                     continue;
                 }
 
+                // 检查是否被中止
                 if (getState() == kAbort) {
                     LOGV2(22006,
                           "Migration aborted while transferring mods",
@@ -1727,44 +1880,58 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx,
                 // We know we're finished when:
                 // 1) The from side has told us that it has locked writes (COMMIT_START)
                 // 2) We've checked at least one more time for un-transmitted mods
+                // 完成条件判断：
+                // 1) 源端已通知写操作被锁定（COMMIT_START状态）
+                // 2) 至少再检查一次未传输的修改
                 if (getState() == kCommitStart && transferAfterCommit == true) {
+                    // 刷新待处理的写操作
                     if (runWithoutSession(outerOpCtx, [&] {
                             return _flushPendingWrites(opCtx, lastOpApplied);
                         })) {
-                        break;
+                        break;  // 刷新成功，退出循环
                     }
                 }
 
                 // Only sleep if we aren't committing
+                // 只有在非提交状态时才休眠
                 if (getState() == kSteady)
                     sleepmillis(10);
             }
 
+            // 检查最终状态是否为失败或中止
             if (getState() == kFail || getState() == kAbort) {
                 _setStateFail("timed out waiting for commit");
                 return;
             }
 
+            // 完成第6步时间统计
             timing->done(6);
             migrateThreadHangAtStep6.pauseWhileSet();
         }
 
+        // 等待会话迁移完成
         runWithoutSession(outerOpCtx, [&] { _sessionMigration->join(); });
+        
+        // 检查会话迁移是否发生错误
         if (_sessionMigration->getState() ==
             SessionCatalogMigrationDestination::State::ErrorOccurred) {
             _setStateFail(redact(_sessionMigration->getErrMsg()));
             return;
         }
 
+        // 完成第7步时间统计
         timing->done(7);
         migrateThreadHangAtStep7.pauseWhileSet();
 
+        // 创建关键区域原因对象
         const auto critSecReason = criticalSectionReason(*_sessionId);
 
+        // 进入关键区域的准备工作
         runWithoutSession(outerOpCtx, [&] {
             // Persist the migration recipient recovery document so that in case of failover, the
             // new primary will resume the MigrationDestinationManager and retake the critical
             // section.
+            // 持久化迁移接收端恢复文档：确保故障转移时新主节点能够恢复迁移状态
             migrationutil::persistMigrationRecipientRecoveryDocument(
                 opCtx, {*_migrationId, _nss, *_sessionId, range, _fromShard, _lsid, _txnNumber});
 
@@ -1776,26 +1943,31 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx,
             // Enter critical section. Ensure it has been majority commited before _recvChunkCommit
             // returns success to the donor, so that if the recipient steps down, the critical
             // section is kept taken while the donor commits the migration.
+            // 进入关键区域：确保在_recvChunkCommit向源端返回成功之前已多数派提交
+            // 这样如果接收端降级，关键区域仍被占用，直到源端提交迁移
             ShardingRecoveryService::get(opCtx)->acquireRecoverableCriticalSectionBlockWrites(
                 opCtx, _nss, critSecReason, ShardingCatalogClient::kMajorityWriteConcern);
 
             LOGV2(5899114, "Entered migration recipient critical section", logAttrs(_nss));
-            timeInCriticalSection.emplace();
+            timeInCriticalSection.emplace();  // 开始计时关键区域时间
         });
 
+        // 检查进入关键区域后的状态
         if (getState() == kFail || getState() == kAbort) {
             _setStateFail("timed out waiting for critical section acquisition");
         }
 
         {
             // Make sure we don't overwrite a FAIL or ABORT state.
+            // 确保不覆盖FAIL或ABORT状态
             stdx::lock_guard<Latch> sl(_mutex);
             if (_state != kFail && _state != kAbort) {
-                _state = kEnteredCritSec;
+                _state = kEnteredCritSec;  // 设置状态为已进入关键区域
                 _stateChangedCV.notify_all();
             }
         }
     } else {
+        // 恢复模式：跳过前面阶段直接处理关键区域
         outerOpCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
         auto newClient = outerOpCtx->getServiceContext()
                              ->getService(ClusterRole::ShardServer)
@@ -1807,6 +1979,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx,
             cc().makeOperationContext(), outerOpCtx->getCancellationToken(), executor);
         auto opCtx = newOpCtxPtr.get();
 
+        // 重新获取可恢复的关键区域
         ShardingRecoveryService::get(opCtx)->acquireRecoverableCriticalSectionBlockWrites(
             opCtx,
             _nss,
@@ -1820,13 +1993,14 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx,
 
         {
             stdx::lock_guard<Latch> sl(_mutex);
-            _state = kEnteredCritSec;
+            _state = kEnteredCritSec;  // 设置状态为已进入关键区域
             _stateChangedCV.notify_all();
         }
 
         LOGV2(6064503, "Recovered migration recipient", "sessionId"_attr = *_sessionId);
     }
 
+    // 最终阶段：等待关键区域释放信号并完成迁移
     outerOpCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
     auto newClient = outerOpCtx->getServiceContext()
                          ->getService(ClusterRole::ShardServer)
@@ -1838,18 +2012,22 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx,
         cc().makeOperationContext(), outerOpCtx->getCancellationToken(), executor);
     auto opCtx = newOpCtxPtr.get();
 
+    // 确保关键区域时间计时器已初始化
     if (skipToCritSecTaken) {
         timeInCriticalSection.emplace();
     }
     invariant(timeInCriticalSection);
 
     // Wait until signaled to exit the critical section and then release it.
+    // 等待退出关键区域的信号，然后释放关键区域
     runWithoutSession(outerOpCtx, [&] {
         awaitCriticalSectionReleaseSignalAndCompleteMigration(opCtx, *timeInCriticalSection);
     });
 
+    // 设置最终状态为完成
     _setState(kDone);
 
+    // 完成第8步时间统计（如果有时间统计助手）
     if (timing) {
         timing->done(8);
     }

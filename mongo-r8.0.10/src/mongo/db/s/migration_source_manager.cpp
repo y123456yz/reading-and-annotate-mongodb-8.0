@@ -769,6 +769,7 @@ void MigrationSourceManager::awaitToCatchUp() {
     scopedGuard.dismiss();
 }
 
+
 void MigrationSourceManager::enterCriticalSection() {
     invariant(!shard_role_details::getLocker(_opCtx)->isLocked());
     invariant(_state == kCloneCaughtUp);
@@ -826,29 +827,111 @@ void MigrationSourceManager::enterCriticalSection() {
     scopedGuard.dismiss();
 }
 
+/**
+ * MigrationSourceManager::commitChunkOnRecipient 函数的作用：
+ * 通知接收端提交 chunk 迁移，完成数据传输的最终确认阶段，确保接收端已准备好接管 chunk 的所有权。
+ * 
+ * 核心功能：
+ * 1. 最终数据传输：通知接收端获取并应用所有剩余的增量变更数据
+ * 2. 提交确认：等待接收端确认所有数据已成功接收并持久化
+ * 3. 统计信息收集：获取接收端的克隆统计信息，用于审计和监控
+ * 4. 状态转换管理：将迁移状态从 kCriticalSection 转换为 kCloneCompleted
+ * 5. 错误处理和恢复：处理提交过程中的异常并启动异步恢复机制
+ * 
+ * 执行条件：
+ * - 必须在关键区域（Critical Section）中执行，此时写操作已被阻塞
+ * - 源端和接收端都已进入迁移的最终阶段
+ * - 所有初始数据和大部分增量数据已传输完成
+ * 
+ * 提交过程：
+ * - 调用克隆驱动器的 commitClone 方法
+ * - 接收端执行最终的数据同步和验证
+ * - 接收端准备接管 chunk 的读写责任
+ * - 返回详细的克隆统计信息
+ * 
+ * 错误处理：
+ * - 支持故障点测试模拟提交失败
+ * - 提交失败时自动启动异步恢复流程
+ * - 确保迁移状态的一致性和可恢复性
+ * 
+ * 时间节点：
+ * - 在进入关键区域后、配置服务器元数据提交前执行
+ * - 是迁移流程中数据传输的最后一步
+ * - 为后续的元数据更新奠定基础
+ * 
+ * 该函数是 chunk 迁移关键路径上的重要环节，确保数据传输的完整性和一致性。
+ */
 void MigrationSourceManager::commitChunkOnRecipient() {
+    // 前置条件检查：确保调用时没有持有任何锁，避免死锁风险
+    // 这是必要的，因为可能需要进行网络通信和等待操作
     invariant(!shard_role_details::getLocker(_opCtx)->isLocked());
+    
+    // 状态验证：确保当前处于关键区域阶段
+    // kCriticalSection 状态表示写操作已被阻塞，可以安全进行最终提交
     invariant(_state == kCriticalSection);
+    
+    // 错误处理和恢复守护：
+    // 功能1：如果提交过程中发生异常，自动清理资源
+    // 功能2：启动异步恢复机制，确保迁移最终能够完成或回滚
     ScopeGuard scopedGuard([&] {
-        _cleanupOnError();
+        _cleanupOnError();  // 清理当前迁移状态
+        // 启动异步恢复流程：在后台持续尝试恢复迁移直到成功或主节点降级
         migrationutil::asyncRecoverMigrationUntilSuccessOrStepDown(_opCtx,
                                                                    _args.getCommandParameter());
     });
 
     // Tell the recipient shard to fetch the latest changes.
+    // 通知接收端分片获取最新的变更：
+    // 
+    // 核心操作：调用克隆驱动器的提交方法
+    // 内部机制：
+    // - 发送 _recvChunkCommit 命令到接收端
+    // - 接收端执行最终的数据同步和验证
+    // - 接收端准备接管 chunk 的所有权
+    // - 返回详细的克隆统计信息
+    // 
+    // 执行内容：
+    // - 传输所有剩余的增量变更（xferMods）
+    // - 传输剩余的会话数据（session data）
+    // - 接收端执行数据完整性验证
+    // - 接收端持久化所有接收的数据
     auto commitCloneStatus = _cloneDriver->commitClone(_opCtx);
 
+    // 故障点测试：模拟提交失败的情况
+    // 功能：允许在测试环境中验证错误处理和恢复机制
+    // 条件：故障点被激活且正常情况下提交会成功
     if (MONGO_unlikely(failMigrationCommit.shouldFail()) && commitCloneStatus.isOK()) {
+        // 人为制造提交失败状态，用于测试异常处理路径
         commitCloneStatus = {ErrorCodes::InternalError,
                              "Failing _recvChunkCommit due to failpoint."};
     }
 
+    // 提交结果验证：确保接收端成功确认了数据提交
+    // 失败处理：如果提交失败，抛出异常并触发错误处理流程
     uassertStatusOKWithContext(commitCloneStatus, "commit clone failed");
+    
+    // 克隆统计信息保存：
+    // 功能：从接收端返回的响应中提取克隆统计信息
+    // 内容：包括克隆的文档数量、字节数、会话数据等详细统计
+    // 用途：用于迁移完成后的日志记录、监控和审计
     _recipientCloneCounts = commitCloneStatus.getValue()["counts"].Obj().getOwned();
 
+    // 状态转换：从关键区域转换为克隆已完成
+    // 意义：标记数据传输阶段完全结束，准备进行元数据更新
+    // 后续：下一步将向配置服务器提交元数据变更
     _state = kCloneCompleted;
+    
+    // 完成第5步时间统计：
+    // 步骤5：commitChunkOnRecipient 阶段完成
+    // 用途：迁移性能分析和进度跟踪
     _moveTimingHelper.done(5);
+    
+    // 测试断点：允许在步骤5暂停，用于测试和调试
+    // 在生产环境中此断点通常不会激活
     moveChunkHangAtStep5.pauseWhileSet();
+    
+    // 取消错误处理守护：表示提交成功完成
+    // 如果执行到这里，说明接收端已成功确认数据接收，可以继续下一阶段
     scopedGuard.dismiss();
 }
 
