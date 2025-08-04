@@ -534,6 +534,51 @@ BSONObj MigrationDestinationManager::getMigrationStatusReport(
     }
 }
 
+/**
+ * MigrationDestinationManager::start 函数的作用：
+ * 在目标分片上启动 chunk 迁移接收过程的入口函数，初始化迁移状态并启动迁移线程。
+ * 
+ * 核心功能：
+ * 1. 迁移状态初始化：设置迁移会话、源/目标分片、chunk范围等核心参数
+ * 2. 线程安全管理：等待前一个迁移线程完成，确保同一时间只有一个迁移在进行
+ * 3. 会话迁移启动：初始化SessionCatalogMigrationDestination处理事务和可重试写操作
+ * 4. 迁移线程创建：启动后台迁移线程执行实际的数据接收和处理工作
+ * 5. 并发控制保护：通过ScopedReceiveChunk确保迁移操作的互斥性和原子性
+ * 6. 写关注配置：设置适当的写关注级别确保数据持久性和一致性
+ * 7. 进度跟踪初始化：设置共享状态用于监控迁移进度和性能统计
+ * 
+ * 启动流程：
+ * - 线程同步：等待之前的会话迁移线程和迁移线程完成
+ * - 状态重置：清理之前的迁移状态，初始化新的迁移参数
+ * - 参数设置：从StartChunkCloneRequest中提取并设置迁移配置
+ * - 会话创建：初始化会话迁移组件处理事务相关数据
+ * - 线程启动：创建并启动后台迁移驱动线程
+ * 
+ * 参数说明：
+ * @param opCtx 操作上下文，提供认证、权限、事务等执行环境
+ * @param nss 目标集合的命名空间（数据库名.集合名）
+ * @param scopedReceiveChunk 接收chunk的作用域锁，确保迁移的唯一性
+ * @param cloneRequest 克隆请求对象，包含源分片、迁移ID、chunk范围等信息
+ * @param writeConcern 写关注选项，控制数据持久性和复制确认级别
+ * 
+ * 线程安全特性：
+ * - 互斥访问：通过ScopedReceiveChunk防止并发迁移操作
+ * - 线程等待：确保前一个迁移完成后才开始新的迁移
+ * - 状态保护：使用互斥锁保护内部状态变量的并发访问
+ * - 取消机制：支持通过CancellationToken中断迁移操作
+ * 
+ * 错误处理：
+ * - 状态验证：确保迁移管理器处于正确的初始状态
+ * - 资源清理：失败时自动清理已分配的资源
+ * - 异常安全：通过RAII模式确保资源的正确管理
+ * 
+ * 性能特性：
+ * - 并行支持：根据源分片能力决定是否启用并行数据获取
+ * - 内存管理：设置克隆进度共享状态用于内存使用监控
+ * - 统计收集：启动性能统计计数器用于监控和调优
+ * 
+ * 该函数是chunk迁移接收端的核心入口，为后续的数据克隆、增量同步、关键区域管理等阶段奠定基础。
+ */
 Status MigrationDestinationManager::start(OperationContext* opCtx,
                                           const NamespaceString& nss,
                                           ScopedReceiveChunk scopedReceiveChunk,
@@ -545,7 +590,13 @@ Status MigrationDestinationManager::start(OperationContext* opCtx,
     // and restoreRecoveredMigrationState() and both of them require a ScopedReceiveChunk which
     // guarantees that there can only be one start() and restoreRecoveredMigrationState() call at
     // any given time.
+    // 等待会话迁移线程和迁移线程完成：
+    // 不在等待期间持有_mutex以避免死锁风险
+    // 由于ScopedReceiveChunk的保护，可以安全地join这些线程而无需持有互斥锁
+    // ScopedReceiveChunk确保同一时间只能有一个start()或restoreRecoveredMigrationState()调用
     if (_sessionMigration && _sessionMigration->joinable()) {
+        // 等待前一个迁移的会话迁移线程完成
+        // 会话迁移负责传输事务和可重试写操作相关的数据
         LOGV2_DEBUG(8991402,
                     2,
                     "Start waiting for the session migration thread for the previous migration to "
@@ -559,6 +610,8 @@ Status MigrationDestinationManager::start(OperationContext* opCtx,
                     "to complete before starting a new migration");
     }
     if (_migrateThreadHandle.joinable()) {
+        // 等待前一个迁移的主迁移线程完成
+        // 主迁移线程负责数据克隆、增量同步、关键区域管理等核心工作
         LOGV2_DEBUG(8991404,
                     2,
                     "Start waiting for the migrate thread for the previous migration to "
@@ -572,56 +625,87 @@ Status MigrationDestinationManager::start(OperationContext* opCtx,
                     "complete before starting a new migration");
     }
 
+    // 获取互斥锁保护内部状态变量的并发访问
+    // 确保迁移状态的一致性和线程安全
     stdx::lock_guard<Latch> lk(_mutex);
-    invariant(!_sessionId);
-    invariant(!_scopedReceiveChunk);
+    
+    // 前置条件验证：确保迁移管理器处于正确的初始状态
+    invariant(!_sessionId);           // 不应该有活跃的会话ID
+    invariant(!_scopedReceiveChunk);  // 不应该有活跃的接收chunk作用域锁
 
-    _state = kReady;
-    _stateChangedCV.notify_all();
-    _errmsg = "";
+    // 初始化迁移状态：重置为就绪状态，准备开始新的迁移
+    _state = kReady;                // 设置状态为就绪
+    _stateChangedCV.notify_all();   // 通知等待状态变化的线程
+    _errmsg = "";                   // 清空错误消息
 
-    _migrationId = cloneRequest.getMigrationId();
-    _lsid = cloneRequest.getLsid();
-    _txnNumber = cloneRequest.getTxnNumber();
+    // 迁移标识符设置：从克隆请求中提取核心标识信息
+    _migrationId = cloneRequest.getMigrationId();  // 迁移的唯一标识符
+    _lsid = cloneRequest.getLsid();                // 逻辑会话ID，用于事务管理
+    _txnNumber = cloneRequest.getTxnNumber();      // 事务号，确保操作的唯一性
 
+    // 并行获取器支持配置：根据源分片的能力决定是否启用并行数据获取
+    // 并行获取可以提高数据传输效率，但需要源分片支持
     _parallelFetchersSupported = cloneRequest.parallelFetchingSupported();
 
-    _nss = nss;
-    _fromShard = cloneRequest.getFromShardId();
+    // 迁移参数配置：设置chunk迁移的核心参数
+    _nss = nss;                                    // 目标集合命名空间
+    _fromShard = cloneRequest.getFromShardId();    // 源分片标识符
+    // 获取源分片连接信息：用于后续的网络通信
     _fromShardConnString =
         uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, _fromShard))
             ->getConnString();
-    _toShard = cloneRequest.getToShardId();
-    _min = cloneRequest.getMinKey();
-    _max = cloneRequest.getMaxKey();
-    _shardKeyPattern = cloneRequest.getShardKeyPattern();
+    _toShard = cloneRequest.getToShardId();        // 目标分片标识符
+    _min = cloneRequest.getMinKey();               // chunk的最小边界键
+    _max = cloneRequest.getMaxKey();               // chunk的最大边界键
+    _shardKeyPattern = cloneRequest.getShardKeyPattern();  // 分片键模式
 
+    // 写关注配置：控制数据持久性和复制确认要求
+    // 写关注确保数据在指定数量的节点上持久化后才认为写操作成功
     _writeConcern = writeConcern;
 
+    // chunk状态初始化：标记chunk尚未被标记为待处理状态
+    // 在迁移过程中，chunk会被标记为待处理以防止并发操作
     _chunkMarkedPending = false;
 
+    // 迁移进度共享状态：创建用于跨线程共享迁移进度信息的对象
+    // 用于监控克隆进度、内存使用情况等性能指标
     _migrationCloningProgress = std::make_shared<MigrationCloningProgressSharedState>();
 
-    _numCatchup = 0;
-    _numSteady = 0;
+    // 统计计数器初始化：重置增量同步和稳定状态的计数器
+    _numCatchup = 0;    // 追赶阶段的操作计数
+    _numSteady = 0;     // 稳定状态的操作计数
 
-    _sessionId = cloneRequest.getSessionId();
-    _scopedReceiveChunk = std::move(scopedReceiveChunk);
+    // 会话和作用域设置：设置迁移会话ID和接收chunk的作用域锁
+    _sessionId = cloneRequest.getSessionId();           // 迁移会话的唯一标识符
+    _scopedReceiveChunk = std::move(scopedReceiveChunk); // 转移接收chunk的所有权
 
+    // Promise对象初始化：用于线程间通信和同步
+    // 这些promise用于协调迁移的不同阶段
     invariant(!_canReleaseCriticalSectionPromise);
+    // 关键区域释放promise：用于通知何时可以释放关键区域
     _canReleaseCriticalSectionPromise = std::make_unique<SharedPromise<void>>();
 
     invariant(!_migrateThreadFinishedPromise);
+    // 迁移线程完成promise：用于通知迁移线程的最终状态
     _migrateThreadFinishedPromise = std::make_unique<SharedPromise<State>>();
 
     // Reset the cancellationSource at the start of every migration to avoid accumulating memory.
+    // 重置取消源：在每次迁移开始时重置以避免内存累积
+    // 取消源用于在需要时中断迁移操作
     auto newCancellationSource = CancellationSource();
     std::swap(_cancellationSource, newCancellationSource);
 
+    // 会话迁移组件初始化：创建负责迁移事务和可重试写操作数据的组件
+    // 会话迁移确保事务状态和可重试写操作在分片间正确传输
     _sessionMigration = std::make_unique<SessionCatalogMigrationDestination>(
         _nss, _fromShard, *_sessionId, _cancellationSource.token());
+    
+    // 性能统计更新：增加接收端迁移开始的计数
+    // 用于监控和分析分片迁移的性能和频率
     ShardingStatistics::get(opCtx).countRecipientMoveChunkStarted.addAndFetch(1);
 
+    // 迁移线程启动：创建并启动后台线程执行实际的迁移工作
+    // 迁移线程将执行数据克隆、增量同步、关键区域管理等核心操作
     _migrateThreadHandle = stdx::thread([this, cancellationToken = _cancellationSource.token()]() {
         _migrateThread(cancellationToken);
     });
@@ -1248,29 +1332,98 @@ void MigrationDestinationManager::cloneCollectionIndexesAndOptions(
     }
 }
 
+/**
+ * MigrationDestinationManager::_migrateThread 函数的作用：
+ * 迁移目标分片的后台线程执行函数，负责在独立线程中运行完整的chunk接收迁移流程。
+ * 
+ * 核心功能：
+ * 1. 线程生命周期管理：初始化迁移专用的客户端和操作上下文
+ * 2. 迁移会话管理：维护与源分片的迁移会话，确保事务一致性
+ * 3. 恢复机制协调：处理迁移过程中的中断和恢复场景
+ * 4. 迁移驱动调度：调用_migrateDriver执行实际的迁移工作
+ * 5. 异常处理和重试：捕获迁移过程中的异常并启动恢复流程
+ * 6. 资源清理管理：确保迁移完成后正确清理会话和资源
+ * 7. 状态通知机制：通过Promise机制通知其他组件迁移结果
+ * 
+ * 线程特性：
+ * - 独立线程：在单独的线程中运行，不阻塞主线程
+ * - 取消支持：响应CancellationToken的取消信号
+ * - 会话隔离：使用专用的会话上下文确保迁移操作的隔离性
+ * - 恢复能力：支持在故障后自动恢复迁移状态
+ * 
+ * 执行模式：
+ * - 正常模式：从头开始执行完整的迁移流程
+ * - 恢复模式：跳过已完成的阶段，从关键区域开始恢复
+ * - 循环重试：在发生错误时自动进入恢复模式重试
+ * 
+ * 参数说明：
+ * @param cancellationToken 取消令牌，用于响应外部的取消请求
+ * @param skipToCritSecTaken 是否跳过前期阶段直接进入关键区域（恢复场景）
+ * 
+ * 会话管理：
+ * - 检出迁移会话：确保在整个迁移期间持有会话
+ * - 事务号验证：防止源分片故障转移后的事务号冲突
+ * - 会话释放：迁移完成后正确释放会话资源
+ * 
+ * 错误处理：
+ * - 异常捕获：捕获迁移过程中的所有异常
+ * - 恢复判断：根据恢复文档存在性决定是否需要恢复
+ * - 状态设置：将错误信息设置到迁移状态中
+ * 
+ * 线程安全：
+ * - 独立客户端：为线程创建独立的客户端上下文
+ * - 状态保护：通过互斥锁保护共享状态的访问
+ * - Promise通知：使用线程安全的Promise机制通信
+ * 
+ * 该函数是迁移接收端的后台工作核心，确保迁移操作不阻塞主服务器线程。
+ */
 void MigrationDestinationManager::_migrateThread(CancellationToken cancellationToken,
                                                  bool skipToCritSecTaken) {
+    // 前置条件验证：确保迁移会话ID已设置
+    // 这是迁移开始的基本要求，标识迁移的唯一性
     invariant(_sessionId);
 
+    // 初始化迁移线程：创建专用的客户端和服务上下文
+    // 线程名："migrateThread" 便于调试和监控
+    // 服务类型：ShardServer 表示这是分片服务器上的操作
     Client::initThread("migrateThread",
                        getGlobalServiceContext()->getService(ClusterRole::ShardServer));
     auto client = Client::getCurrent();
+    
+    // 恢复状态标志：标记当前是否处于恢复模式
+    // 初始为false，在异常处理后会设置为true进行恢复重试
     bool recovering = false;
+    
+    // 主迁移循环：持续执行直到迁移完成或被取消
+    // 支持在发生错误时自动重试和恢复
     while (true) {
+        // 创建可取消的操作上下文：
+        // 目的：为迁移操作提供独立的执行环境和取消机制
+        // 组件：
+        // - executor: 固定执行器，用于异步操作调度
+        // - cancellationToken: 取消令牌，响应外部取消请求
+        // - client: 当前线程的客户端上下文
         const auto executor =
             Grid::get(client->getServiceContext())->getExecutorPool()->getFixedExecutor();
         auto uniqueOpCtx =
             CancelableOperationContext(client->makeOperationContext(), cancellationToken, executor);
         auto opCtx = uniqueOpCtx.get();
 
+        // 权限授予：如果启用了认证，为操作上下文授予内部权限
+        // 目的：确保迁移操作能够访问所需的系统资源和集合
+        // 范围：内部系统级别的操作权限
         if (AuthorizationManager::get(opCtx->getService())->isAuthEnabled()) {
             AuthorizationSession::get(opCtx->getClient())->grantInternalAuthorization(opCtx);
         }
 
         try {
+            // 恢复检查：如果处于恢复模式，检查恢复文档是否存在
             if (recovering) {
+                // 恢复文档存在性检查：确定是否需要执行恢复操作
+                // 如果恢复文档不存在，说明迁移已经完成或被清理，无需恢复
                 if (!migrationRecipientRecoveryDocumentExists(opCtx, *_sessionId)) {
                     // No need to run any recovery.
+                    // 无需运行任何恢复操作，退出循环
                     break;
                 }
             }
@@ -1284,52 +1437,93 @@ void MigrationDestinationManager::_migrateThread(CancellationToken cancellationT
             // yield this session, but will verify the txnNumber has not changed before continuing,
             // preserving the guarantee that orphans cannot be created after the txnNumber is
             // advanced.
+            // 迁移会话管理：
+            // 外层操作上下文用于在接收端迁移期间持有已检出的会话
+            // 这保证了如果源分片发生故障转移，新的源主节点无法在此节点仍在执行接收端操作时
+            // 提升此会话的txnNumber（这很重要，否则在处理范围删除任务后可能创建孤儿数据）
+            // 接收端会定期释放此会话，但在继续之前会验证txnNumber未发生变化，
+            // 保证在txnNumber提升后不会创建孤儿数据
             {
+                // 设置会话上下文：将逻辑会话ID和事务号绑定到操作上下文
+                // 目的：确保迁移操作在正确的会话和事务上下文中执行
                 auto lk = stdx::lock_guard(*opCtx->getClient());
-                opCtx->setLogicalSessionId(_lsid);
-                opCtx->setTxnNumber(_txnNumber);
+                opCtx->setLogicalSessionId(_lsid);      // 设置逻辑会话ID
+                opCtx->setTxnNumber(_txnNumber);        // 设置事务号
             }
 
+            // 检出迁移会话：从会话目录中检出当前迁移的会话
+            // 目的：独占访问会话状态，防止并发修改
+            // 生命周期：在整个迁移过程中保持检出状态
             auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
             auto sessionTxnState = mongoDSessionCatalog->checkOutSession(opCtx);
 
+            // 事务参与者初始化：获取并初始化事务参与者
+            // 功能：管理与此会话关联的事务状态
+            // 模式：继续现有事务或开始新事务（如果需要）
             auto txnParticipant = TransactionParticipant::get(opCtx);
             txnParticipant.beginOrContinue(opCtx,
-                                           {*opCtx->getTxnNumber()},
-                                           boost::none /* autocommit */,
-                                           TransactionParticipant::TransactionActions::kNone);
+                                           {*opCtx->getTxnNumber()},            // 事务号
+                                           boost::none /* autocommit */,       // 不自动提交
+                                           TransactionParticipant::TransactionActions::kNone); // 无特殊操作
+            
+            // 调用迁移驱动器：执行实际的迁移工作
+            // 参数说明：
+            // - opCtx: 操作上下文，包含会话和事务信息
+            // - skipToCritSecTaken || recovering: 是否跳过前期阶段或处于恢复模式
             _migrateDriver(opCtx, skipToCritSecTaken || recovering);
+            
         } catch (...) {
+            // 异常处理：捕获迁移过程中的所有异常
+            // 错误状态设置：将异常信息转换为可读的错误消息并设置迁移状态为失败
             _setStateFail(str::stream() << "migrate failed: " << redact(exceptionToStatus()));
 
+            // 取消检查：如果不是因为取消令牌导致的异常，则进入恢复模式
+            // 目的：区分正常取消和异常失败，对异常失败进行恢复重试
             if (!cancellationToken.isCanceled()) {
                 // Run recovery if needed.
+                // 如果需要，运行恢复逻辑
                 recovering = true;
-                continue;
+                continue;  // 继续循环，进入恢复模式
             }
         }
 
+        // 正常完成：如果没有异常且不需要恢复，退出主循环
         break;
     }
 
+    // 迁移线程清理阶段：清理会话状态和通知其他组件
+    // 
+    // 获取互斥锁：保护共享状态的并发访问
     stdx::lock_guard<Latch> lk(_mutex);
-    _sessionId.reset();
-    _scopedReceiveChunk.reset();
+    
+    // 会话状态重置：清理迁移会话相关的状态
+    _sessionId.reset();           // 重置会话ID，表示迁移不再活跃
+    _scopedReceiveChunk.reset();  // 重置接收chunk的作用域锁，释放独占访问
+    
+    // 通知等待线程：唤醒所有等待迁移状态变化的线程
+    // 用于同步那些等待迁移完成的操作
     _isActiveCV.notify_all();
 
     // If we reached this point without having set _canReleaseCriticalSectionPromise we must be on
     // an error path. Just set the promise with error because it is illegal to leave it unset on
     // destruction.
+    // 关键区域释放Promise处理：
+    // 如果到达此处而未设置_canReleaseCriticalSectionPromise，说明处于错误路径
+    // 必须设置Promise为错误状态，因为在析构时保持未设置状态是非法的
     invariant(_canReleaseCriticalSectionPromise);
     if (!_canReleaseCriticalSectionPromise->getFuture().isReady()) {
+        // 设置Promise为取消错误，明确表示关键区域释放被中断
         _canReleaseCriticalSectionPromise->setError(
             {ErrorCodes::CallbackCanceled, "explicitly breaking release critical section promise"});
     }
-    _canReleaseCriticalSectionPromise.reset();
+    _canReleaseCriticalSectionPromise.reset();  // 重置Promise指针
 
+    // 迁移线程完成Promise处理：
+    // 通知等待迁移线程完成的组件，并传递最终的迁移状态
+    // 这是线程间同步的重要机制
     invariant(_migrateThreadFinishedPromise);
-    _migrateThreadFinishedPromise->emplaceValue(_state);
-    _migrateThreadFinishedPromise.reset();
+    _migrateThreadFinishedPromise->emplaceValue(_state);  // 设置最终状态值
+    _migrateThreadFinishedPromise.reset();                // 重置Promise指针
 }
 
 /**
