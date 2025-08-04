@@ -60,24 +60,93 @@
 
 namespace mongo {
 
+/**
+ * MigrationBatchFetcher<Inserter>::BufferSizeTracker::waitUntilSpaceAvailableAndAdd 函数的作用：
+ * 在chunk迁移过程中实现内存流控机制，确保缓冲区有足够空间容纳新的数据批次。
+ * 
+ * 核心功能：
+ * 1. 内存流控管理：控制同时在内存中等待处理的数据批次总大小
+ * 2. 阻塞等待机制：当缓冲区空间不足时阻塞调用线程直到有足够空间
+ * 3. 批次大小验证：确保单个批次大小不超过配置的最大缓冲区限制
+ * 4. 空间预留操作：成功等待后立即预留所需的缓冲区空间
+ * 5. 中断响应支持：在等待过程中能够响应操作上下文的中断信号
+ * 6. 线程安全保护：使用互斥锁确保多线程环境下的并发安全
+ * 
+ * 流控策略：
+ * - 当前缓冲区使用量 + 新批次大小 <= 最大缓冲区限制时才允许继续
+ * - 超出限制时线程阻塞，直到其他线程释放足够空间
+ * - 支持无限制模式（kUnlimited），跳过所有流控检查
+ * 
+ * 内存管理：
+ * - 防止过多数据批次同时加载到内存导致内存溢出
+ * - 通过限制缓冲区大小平衡内存使用和迁移性能
+ * - 与remove()函数配合实现生产者-消费者模式的内存管理
+ * 
+ * 参数说明：
+ * @param opCtx 操作上下文，提供中断检查和等待条件支持
+ * @param sizeBytes 请求预留的字节数（通常是数据批次的大小）
+ * 
+ * 异常处理：
+ * - uassert: 当批次大小超过最大限制时抛出异常
+ * - 中断异常: 当操作上下文被中断时抛出中断异常
+ * 
+ * 性能考虑：
+ * - 避免频繁的内存分配和释放
+ * - 通过条件变量减少忙等待的CPU开销
+ * - 平衡内存使用和迁移吞吐量
+ * 
+ * 该函数是MongoDB chunk迁移内存管理的核心组件，确保迁移过程的内存安全性。
+ */
 template <typename Inserter>
 void MigrationBatchFetcher<Inserter>::BufferSizeTracker::waitUntilSpaceAvailableAndAdd(
     OperationContext* opCtx, int sizeBytes) {
+    
+    // 无限制模式检查：如果设置为无限制，直接返回不执行任何流控
+    // kUnlimited 表示不对缓冲区大小进行限制，通常用于测试或特殊场景
     if (_maxSizeBytes == MigrationBatchFetcher<Inserter>::BufferSizeTracker::kUnlimited) {
         return;
     }
 
+    // 批次大小验证：确保单个批次不超过最大缓冲区限制
+    // 这是一个前置条件检查，防止配置错误导致永远无法满足的等待
+    // 错误场景：单个批次就超过了整个缓冲区的最大容量
     uassert(8120100,
             str::stream() << "chunkMigrationFetcherMaxBufferedSizeBytesPerThread setting of "
                           << _maxSizeBytes << " is too small for received batch size of "
                           << sizeBytes,
             sizeBytes <= _maxSizeBytes);
 
+    // 获取互斥锁：保护共享状态变量的并发访问
+    // unique_lock 支持条件变量的等待操作，提供RAII锁管理
     stdx::unique_lock lk(_mutex);
+    
+    // 条件等待：等待缓冲区有足够空间容纳当前批次
+    // 核心流控逻辑：当前使用量 + 新批次大小 <= 最大限制
+    // 
+    // waitForConditionOrInterrupt 的工作机制：
+    // 1. 检查lambda条件，如果满足则立即返回
+    // 2. 如果不满足，释放互斥锁并在条件变量上等待
+    // 3. 被唤醒时重新获取锁并再次检查条件
+    // 4. 重复直到条件满足或操作被中断
+    // 
+    // 中断支持：
+    // - opCtx->waitForConditionOrInterrupt 会检查操作上下文的中断状态
+    // - 如果操作被中断（如用户取消、超时等），会抛出中断异常
+    // - 确保迁移操作能够及时响应外部的取消请求
     opCtx->waitForConditionOrInterrupt(_hasAvailableSpace, lk, [this, sizeBytes] {
         return (_currentSize + sizeBytes) <= _maxSizeBytes;
     });
+    
+    // 空间预留：条件满足后立即增加当前使用量
+    // 这个操作必须在锁保护下执行，确保原子性
+    // 防止其他线程在条件检查和空间分配之间修改_currentSize
     _currentSize += sizeBytes;
+    
+    // 函数返回时：
+    // 1. 缓冲区已预留了请求的空间
+    // 2. 调用者可以安全地使用这些空间存储数据批次
+    // 3. 锁自动释放（RAII机制）
+    // 4. 调用者有责任在使用完毕后调用remove()释放空间
 }
 
 template <typename Inserter>

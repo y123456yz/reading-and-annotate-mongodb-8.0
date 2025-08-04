@@ -1772,6 +1772,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx,
                 altOpCtx.get(), _nss, donorCollectionOptionsAndIndexes);
 
             // Get the global indexes and install them.
+            // yang add todo xxxxxx  8.0全局索引分享
             // 获取并安装全局索引（如果功能启用）
             if (feature_flags::gGlobalIndexesShardingCatalog.isEnabled(
                     serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
