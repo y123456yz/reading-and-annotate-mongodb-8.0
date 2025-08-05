@@ -720,32 +720,73 @@ CollectionType ShardingCatalogClientImpl::getCollection(OperationContext* opCtx,
 
     return CollectionType(collDoc[0]);
 }
+
+/**
+ * 获取指定数据库中所有分片集合的元数据信息
+ * 
+ * 功能说明：
+ * 1. 从config.collections中查询指定数据库的所有分片集合
+ * 2. 通过unsplittable字段过滤，排除未分片的集合(unsplittable=true)
+ * 3. 支持按指定排序条件返回结果
+ * 4. 使用指定的读一致性级别确保数据一致性
+ * 
+ * 应用场景：
+ * - 管理员查看数据库中的分片集合列表
+ * - Balancer获取需要均衡的集合信息
+ * - 分片状态监控和统计
+ * - 集合元数据缓存刷新
+ * 
+ * @param opCtx 操作上下文，提供事务和权限控制
+ * @param dbName 目标数据库名，如果为空则查询所有数据库
+ * @param readConcernLevel 读一致性级别，确保读取数据的一致性
+ * @param sort 排序条件，控制返回结果的顺序
+ * @return 分片集合元数据的向量，每个元素包含完整的集合配置信息
+ * db.collections.find({"unsplittable": { $ne: true }})
+ */
 std::vector<CollectionType> ShardingCatalogClientImpl::getShardedCollections(
     OperationContext* opCtx,
     const DatabaseName& dbName,
     repl::ReadConcernLevel readConcernLevel,
     const BSONObj& sort) {
+    
+    // 构建查询条件：匹配指定数据库且排除未分片集合
     BSONObjBuilder b;
     if (!dbName.isEmpty()) {
+        // 将数据库名序列化为查询格式
         const auto db =
             DatabaseNameUtil::serialize(dbName, SerializationContext::stateCommandRequest());
+        
+        // 构建正则表达式：^dbName\\..*  匹配以"数据库名."开头的集合名
+        // pcre_util::quoteMeta确保数据库名中的特殊字符被正确转义
         b.appendRegex(CollectionType::kNssFieldName, "^{}\\."_format(pcre_util::quoteMeta(db)));
     }
 
+    // 关键过滤条件：排除unsplittable=true的集合
+    // unsplittable 字段标识集合是否可分片：
+    // - true: 未分片集合(如小集合、系统集合)
+    // - false或不存在: 分片集合
+    // $ne操作符确保只返回真正的分片集合
     b.append(CollectionType::kUnsplittableFieldName, BSON("$ne" << true));
 
+    // 执行config.collections的exhaustive查询
+    // 使用_exhaustiveFindOnConfig确保获取所有匹配的文档，避免分页导致的数据丢失
     auto collDocs = uassertStatusOK(_exhaustiveFindOnConfig(opCtx,
-                                                            getConfigReadPreference(opCtx),
-                                                            readConcernLevel,
-                                                            CollectionType::ConfigNS,
-                                                            b.obj(),
-                                                            sort,
-                                                            boost::none))
+                                                            getConfigReadPreference(opCtx), // 根据集群配置选择读偏好
+                                                            readConcernLevel,                // 应用指定的读一致性级别
+                                                            CollectionType::ConfigNS,       // config.collections命名空间
+                                                            b.obj(),                        // 查询条件
+                                                            sort,                           // 排序条件
+                                                            boost::none))                   // 无限制返回条数
                         .value;
+    
+    // 预分配向量容量，避免动态扩容的性能开销
     std::vector<CollectionType> collections;
     collections.reserve(collDocs.size());
+    
+    // 将BSON文档转换为CollectionType对象
+    // CollectionType包含集合的完整元数据：分片键、chunk分布、zone配置等
     for (const BSONObj& obj : collDocs)
-        collections.emplace_back(obj);
+        collections.emplace_back(obj);  // 直接在向量中构造CollectionType对象
 
     return collections;
 }

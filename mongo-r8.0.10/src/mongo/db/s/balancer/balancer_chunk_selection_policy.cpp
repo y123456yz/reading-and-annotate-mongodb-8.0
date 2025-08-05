@@ -525,8 +525,10 @@ StatusWith<MigrateInfoVector> BalancerChunkSelectionPolicy::selectChunksToMove(
             // 若无迁移候选，则移除缓存；否则缓存集合名
             // 把需要balance的表名加入缓存
             if (migrateCandidates.empty()) {
+                // 说明该表没有不均衡的chunk了，可以从缓存中移除，避免下次继续处理该表
                 imbalancedCollectionsCachePtr->erase(nss);
             } else if (imbalancedCollectionsCachePtr->size() < kMaxCachedCollectionsSize) {
+                // 把该表缓存起来，下一次优先处理
                 imbalancedCollectionsCachePtr->insert(nss);
             }
         }
@@ -547,7 +549,8 @@ StatusWith<MigrateInfoVector> BalancerChunkSelectionPolicy::selectChunksToMove(
             imbalancedCollectionsCachePtr->erase(imbalancedNssIt++);
             continue;
         }
-
+        
+        // 之前做过balance的表可以优先加入本次的处理批次
         collBatch.push_back(imbalancedColl.value());
         ++imbalancedNssIt;
 
@@ -557,16 +560,18 @@ StatusWith<MigrateInfoVector> BalancerChunkSelectionPolicy::selectChunksToMove(
 
     // 随机遍历剩余集合，批量收集迁移候选 chunk
     // 选出100个可 balance 的集合，这100个集合执行 processBatch 选出候选chunk, 每一批集合中挑选候选 chunk 的时间不超过 balancerChunksSelectionTimeoutMs 毫秒，避免挑选chunk耗时太长
+    // 每一轮选100个表的候选chunk， 直到遍历完所有的表获取到所有的候选chunk
     auto client = opCtx->getClient();
     std::shuffle(collections.begin(), collections.end(), client->getPrng().urbg());
     for (const auto& coll : collections) {
-
+        // 选出可 balance 的集合存入 collBatch 这个vector
         if (balancer_policy_utils::canBalanceCollection(coll)) {
             collBatch.push_back(coll);
         }
 
-        // 达到批次大小则处理
+        // 达到批次大小则处理，默认 100 个表
         if (collBatch.size() == kStatsForBalancingBatchSize) {
+            // 调用 Lambda 处理这批可balance的表
             processBatch(collBatch);
             if (availableShards->size() < 2) {
                 return candidateChunks;

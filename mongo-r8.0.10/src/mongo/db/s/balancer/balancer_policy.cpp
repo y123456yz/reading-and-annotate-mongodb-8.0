@@ -834,6 +834,7 @@ bool BalancerPolicy::_singleZoneBalanceBasedOnDataSize(
         return false;
     }
 
+    //{"t":{"$date":"2025-07-29T19:42:13.844+08:00"},"s":"D1", "c":"SHARDING", "id":7548100, "svc":"S", "ctx":"Balancer","msg":"Balancing single zone","attr":{"namespace":"config.system.sessions","zone":"","idealDataSizePerShardForZone":330,"fromShardId":"shard1ReplSet","fromShardDataSize":990,"toShardId":"shard2ReplSet","toShardDataSize":0,"maxChunkSizeBytes":200000}}
     LOGV2_DEBUG(7548100,
                 1,
                 "Balancing single zone",
@@ -1139,7 +1140,7 @@ NamespaceStringToShardDataSizeMap getStatsForBalancing(
     const std::vector<ShardId>& shardIds,
     const std::vector<NamespaceWithOptionalUUID>& namespacesWithUUIDsForStatsRequest) {
 
-    // 构建统计请求命令：创建ShardsvrGetStatsForBalancing请求对象
+    // 构建统计请求命令：创建 _shardsvrGetStatsForBalancing 请求对象
     // 该请求包含所有需要统计的集合命名空间和UUID信息
     ShardsvrGetStatsForBalancing req{namespacesWithUUIDsForStatsRequest};
     req.setScaleFactor(1);  // 设置比例因子为1，获取实际数据大小

@@ -359,6 +359,22 @@ typedef std::variant<Status, StatusWith<DataSizeResponse>, StatusWith<NumMergedC
 typedef std::vector<ClusterStatistics::ShardStatistics> ShardStatisticsVector;
 typedef StringMap<StringMap<ShardZoneInfo>> ShardZoneInfoMap;
 
+/*
+// 完整的数据结构表示：
+NamespaceStringToShardDataSizeMap = {
+    集合命名空间1 => {
+        分片ID1 => 数据大小（字节）,
+        分片ID2 => 数据大小（字节）,
+        ...
+    },
+    集合命名空间2 => {
+        分片ID1 => 数据大小（字节）,
+        分片ID2 => 数据大小（字节）,
+        ...
+    },
+    ...
+}
+*/
 using ShardDataSizeMap = std::map<ShardId, int64_t>;
 using NamespaceStringToShardDataSizeMap = stdx::unordered_map<NamespaceString, ShardDataSizeMap>;
 /*

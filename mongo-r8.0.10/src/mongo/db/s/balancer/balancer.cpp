@@ -739,6 +739,7 @@ void Balancer::onBecomeArbiter() {
     MONGO_UNREACHABLE;
 }
 
+//Balancer::onStepUpComplete
 void Balancer::initiate(OperationContext* opCtx) {
     stdx::lock_guard<Latch> scopedLock(_mutex);
     _imbalancedCollectionsCache.clear();
@@ -1234,16 +1235,22 @@ void Balancer::_mainThread() {
                                   : kBalanceRoundDefaultInterval);
                 } else {
                     // 按迁移节流策略 sleep，防止迁移过于频繁
+                    // 也就是上一轮balance迁移完成后到这一轮balance开始前的间隔时间
                     const auto throttleTimeMillis = [&] {
-                        const auto& minRoundinterval =
-                            Milliseconds(balancerMigrationsThrottlingMs.load());
+                        // 获取配置的最小轮次间隔（默认1000ms = 1秒）
+                        const auto& minRoundinterval = Milliseconds(balancerMigrationsThrottlingMs.load());
 
+                        // 计算距离上次迁移的时间间隔
                         const auto timeSinceLastMigration = Date_t::now() - lastMigrationTime;
+                        
+                        // 如果距离上次迁移的时间还不够，计算需要补充的等待时间
                         if (timeSinceLastMigration < minRoundinterval) {
                             return minRoundinterval - timeSinceLastMigration;
                         }
+                        // 如果已经超过最小间隔，无需等待
                         return Milliseconds::zero();
                     }();
+                    // 保证每一轮balance之间有一个最小的时间间隔，防止过于频繁的迁移操作
                     _sleepFor(opCtx.get(), throttleTimeMillis);
 
                     // 执行 chunk 迁移（包括未分片集合、碎片整理、普通均衡三类任务）
