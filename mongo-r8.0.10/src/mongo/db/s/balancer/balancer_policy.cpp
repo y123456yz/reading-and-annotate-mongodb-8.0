@@ -510,7 +510,17 @@ MigrateInfosWithReason BalancerPolicy::balance(
             // Now we know we need to move chunks off this shard, but only if permitted by the
             // tags policy
             unsigned numJumboChunks = 0;
-
+            
+            /*
+            例如没有启用addShardTag和addTagRange,对应shardId zoneinfo如下:
+            "shard0001" => {
+                "" => ShardZoneInfo{
+                    numChunks: 5,           // 该分片上的chunk数量
+                    firstNormalizedZoneIdx: 0,  // 指向_normalizedZones[0],说明没有指定shardtag tagRange
+                    firstChunkMinKey: {userId: MinKey}  // 第一个chunk的最小键
+                }
+            },
+            */
             const auto& shardZones = distribution.getZoneInfoForShard(stat.shardId);
             for (const auto& shardZone : shardZones) {
                 const auto& zoneName = shardZone.first;
@@ -523,7 +533,7 @@ MigrateInfosWithReason BalancerPolicy::balance(
                             return true;  // continue
                         }
 
-                        // 选择负载最轻的目标分片
+                        // 选择负载最轻的目标分片，也就是数据最少的分片
                         const auto [to, _] = _getLeastLoadedReceiverShard(
                             shardStats, collDataSizeInfo, zoneName, *availableShards);
                         if (!to.isValid()) {
@@ -1052,49 +1062,165 @@ DataSizeInfo::DataSizeInfo(const ShardId& shardId,
       estimatedValue(estimatedValue),
       maxSize(maxSize) {}
 
+
+/*
+// 完整的调用链：
+BalancerChunkSelectionPolicy::selectChunksToMove()
+    ↓
+getDataSizeInfoForCollections()  // 批量获取多个集合的统计信息
+    ↓
+getStatsForBalancing()  // ← 当前函数，从分片收集统计数据
+    ↓
+sharding_util::sendCommandToShards()  // 并发网络通信
+
+// 函数返回的嵌套映射结构示例：
+NamespaceStringToShardDataSizeMap result = {
+    "myapp.users" => {
+        "shard0001" => 1073741824,  // 1GB
+        "shard0002" => 536870912,   // 512MB  
+        "shard0003" => 2147483648   // 2GB
+    },
+    "myapp.orders" => {
+        "shard0001" => 268435456,   // 256MB
+        "shard0002" => 805306368,   // 768MB
+        "shard0003" => 134217728    // 128MB
+    },
+    "myapp.products" => {
+        "shard0001" => 134217728,   // 128MB
+        "shard0002" => 402653184,   // 384MB
+        "shard0003" => 67108864     // 64MB
+    }
+};
+*/
+
+/**
+ * getStatsForBalancing 函数的作用：
+ * 从分片集群中的所有指定分片收集多个集合的数据大小统计信息，用于负载均衡决策。
+ * 
+ * 核心功能：
+ * 1. 批量统计收集：通过单次网络请求从每个分片获取多个集合的数据统计信息
+ * 2. 并行网络通信：同时向所有目标分片发送统计请求，提高收集效率
+ * 3. 数据结构构建：将收集到的统计信息组织成嵌套映射结构便于查询
+ * 4. 异常处理机制：处理分片不可用、网络错误等异常情况
+ * 5. 负载均衡支持：为BalancerPolicy提供准确的数据分布信息
+ * 
+ * 处理流程：
+ * - 构建ShardsvrGetStatsForBalancing请求，包含所有目标集合的命名空间和UUID
+ * - 并行向所有指定分片发送统计请求
+ * - 收集和解析各分片的响应数据
+ * - 构建集合命名空间到分片数据大小的完整映射
+ * - 处理分片移除等异常情况，确保系统稳定性
+ * 
+ * 性能优化：
+ * - 批量请求：避免为每个集合单独发送网络请求
+ * - 并行通信：同时从多个分片收集统计信息
+ * - 结构化存储：提供高效的嵌套映射查询接口
+ * 
+ * 容错机制：
+ * - 跳过已移除的分片，支持动态分片管理
+ * - 处理网络超时和连接错误
+ * - 验证响应数据的完整性和一致性
+ * 
+ * 参数说明：
+ * @param opCtx 操作上下文，提供事务和中断支持
+ * @param shardIds 目标分片ID列表，指定从哪些分片收集统计信息
+ * @param namespacesWithUUIDsForStatsRequest 待统计的集合列表，包含命名空间和UUID
+ * 
+ * 返回值：
+ * @return NamespaceStringToShardDataSizeMap 嵌套映射结构
+ *         外层Key: NamespaceString（集合命名空间）
+ *         内层Key: ShardId（分片标识）
+ *         Value: int64_t（该分片上该集合的数据大小，单位字节）
+ * 
+ * 该函数是MongoDB负载均衡器数据收集的核心组件，为chunk迁移决策提供数据基础。
+ */
 NamespaceStringToShardDataSizeMap getStatsForBalancing(
     OperationContext* opCtx,
     const std::vector<ShardId>& shardIds,
     const std::vector<NamespaceWithOptionalUUID>& namespacesWithUUIDsForStatsRequest) {
 
+    // 构建统计请求命令：创建ShardsvrGetStatsForBalancing请求对象
+    // 该请求包含所有需要统计的集合命名空间和UUID信息
     ShardsvrGetStatsForBalancing req{namespacesWithUUIDsForStatsRequest};
-    req.setScaleFactor(1);
-    const auto reqObj = req.toBSON({});
+    req.setScaleFactor(1);  // 设置比例因子为1，获取实际数据大小
+    const auto reqObj = req.toBSON({});  // 序列化为BSON格式用于网络传输
 
+    // 获取执行器：用于并行网络通信的线程池执行器
+    // FixedExecutor提供固定大小的线程池，适合并发网络操作
     const auto executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
+    
+    // 并行发送统计请求：同时向所有指定分片发送统计命令
+    // 关键性能优化：避免串行请求导致的延迟累积
+    // throwOnError = false：不在网络错误时立即抛异常，而是在响应中标记错误状态
     auto responsesFromShards = sharding_util::sendCommandToShards(
         opCtx, DatabaseName::kAdmin, reqObj, shardIds, executor, false /* throwOnError */);
 
+    // 使用fmt库的字面量语法，支持Python风格的字符串格式化
     using namespace fmt::literals;
+    
+    // 初始化返回映射：嵌套映射结构用于存储最终的统计结果
+    // 外层Key: NamespaceString, 内层Key: ShardId, Value: 数据大小(字节)
     NamespaceStringToShardDataSizeMap namespaceToShardDataSize;
+    
+    // 处理分片响应：遍历所有分片的响应，解析统计数据
     for (auto&& response : responsesFromShards) {
         try {
             const auto& shardId = response.shardId;
+            
+            // 构建错误上下文信息：用于异常处理时的错误描述
             auto errorContext =
                 "Failed to get stats for balancing from shard '{}'"_format(shardId.toString());
+                
+            // 验证响应状态：检查网络请求是否成功
+            // 如果请求失败，uassertStatusOKWithContext会抛出包含上下文的异常
             const auto responseValue =
                 uassertStatusOKWithContext(std::move(response.swResponse), errorContext);
 
+            // 解析响应数据：将BSON响应反序列化为结构化对象
+            // IDLParserContext提供解析上下文，用于错误定位和调试
             const ShardsvrGetStatsForBalancingReply reply =
                 ShardsvrGetStatsForBalancingReply::parse(
                     IDLParserContext("ShardsvrGetStatsForBalancingReply"), responseValue.data);
+                    
+            // 提取集合统计信息：从响应中获取该分片上所有集合的统计数据
             const auto collStatsFromShard = reply.getStats();
 
+            // 数据完整性验证：确保响应中的集合数量与请求数量一致
+            // 这是一个重要的安全检查，防止数据不一致导致的逻辑错误
             tassert(8245200,
                     "Collection count mismatch",
                     collStatsFromShard.size() == namespacesWithUUIDsForStatsRequest.size());
 
+            // 填充统计映射：将该分片的统计数据添加到全局映射中
             for (const auto& stats : collStatsFromShard) {
+                // 构建嵌套映射：namespace -> shardId -> collectionSize
+                // stats.getNs(): 集合命名空间
+                // shardId: 当前分片ID  
+                // stats.getCollSize(): 该集合在当前分片的数据大小（字节）
                 namespaceToShardDataSize[stats.getNs()][shardId] = stats.getCollSize();
             }
         } catch (const ExceptionFor<ErrorCodes::ShardNotFound>& ex) {
             // Handle `removeShard`: skip shards removed during a balancing round
+            // 处理分片移除场景：跳过在均衡轮次中被移除的分片
+            // 
+            // 这种情况在以下场景中会发生：
+            // 1. 管理员执行removeShard命令移除分片
+            // 2. 分片因网络问题暂时不可达
+            // 3. 分片正在进行维护或重启
+            // 
+            // 跳过这些分片是安全的，因为：
+            // - 被移除的分片上的chunk会被迁移到其他分片
+            // - 暂时不可用的分片在下一轮均衡中会重新包含
+            // - 不影响整体的负载均衡决策
             LOGV2_DEBUG(6581603,
                         1,
                         "Skipping shard for the current balancing round",
                         "error"_attr = redact(ex));
         }
     }
+    
+    // 返回完整的统计映射：包含所有可用分片上所有集合的数据大小信息
+    // 调用者可以通过namespaceToShardDataSize[nss][shardId]快速查询特定集合在特定分片的数据大小
     return namespaceToShardDataSize;
 }
 

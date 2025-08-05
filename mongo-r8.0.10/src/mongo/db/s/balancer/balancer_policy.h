@@ -628,6 +628,36 @@ private:
 
     // Map that tracks how many chunks every shard is owning in each zone
     // shardId -> zoneName -> shardZoneInfo
+    /*
+        假设有一个分片集群：
+
+        分片：shard0001, shard0002, shard0003
+        集合：myapp.users，分片键：{userId: 1}
+        没有设置任何zone配置，那么_shardZoneInfoMap的内容将是：
+        _shardZoneInfoMap = {
+            "shard0001" => {
+                "" => ShardZoneInfo{
+                    numChunks: 5,           // 该分片上的chunk数量
+                    firstNormalizedZoneIdx: 0,  // 指向_normalizedZones[0]
+                    firstChunkMinKey: {userId: MinKey}  // 第一个chunk的最小键
+                }
+            },
+            "shard0002" => {
+                "" => ShardZoneInfo{
+                    numChunks: 3,
+                    firstNormalizedZoneIdx: 0,
+                    firstChunkMinKey: {userId: 100}
+                }
+            },
+            "shard0003" => {
+                "" => ShardZoneInfo{
+                    numChunks: 4,
+                    firstNormalizedZoneIdx: 0,
+                    firstChunkMinKey: {userId: 500}
+                }
+            }
+        }
+    */
     ShardZoneInfoMap _shardZoneInfoMap;
 
     // Info for zones.
@@ -644,6 +674,13 @@ private:
     //  partially a chunk, boundaries of that zone will be shrunk so that the normalized zone won't
     //  overlap with that chunk. Boundaries of a normalized zone will never fall in the middle of a
     //  chunk.
+    /*
+    // 如果是没有任何zone配置
+    // _normalizedZones内容：
+    _normalizedZones = [
+        ZoneRange{min: {userId: MinKey}, max: {userId: MaxKey}, zone: ""}
+    ]
+    */
     std::vector<ZoneRange> _normalizedZones;
 
     ChunkManager _chunkMngr;

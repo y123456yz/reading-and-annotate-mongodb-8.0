@@ -125,39 +125,102 @@ StatusWith<DistributionStatus> createCollectionDistributionStatus(
     return {DistributionStatus{nss, std::move(swZoneInfo.getValue()), chunkMgr}};
 }
 
+/**
+ * getDataSizeInfoForCollections 函数的作用：
+ * 批量获取多个分片集合的数据大小统计信息，用于负载均衡决策。
+ * 
+ * 核心功能：
+ * 1. 数据大小收集：从所有分片收集指定集合的数据大小统计信息
+ * 2. 批量处理优化：通过单次网络请求获取多个集合的统计信息，提高效率
+ * 3. 配置参数处理：为每个集合确定最大chunk大小限制
+ * 4. 统计信息映射：构建集合命名空间到分片数据大小映射的完整结构
+ * 5. 负载均衡支持：为均衡器策略提供基础数据支撑
+ * 
+ * 处理流程：
+ * - 获取均衡器配置，确定全局和集合级别的chunk大小限制
+ * - 构建批量统计请求，包含所有目标集合的命名空间和UUID
+ * - 向所有分片发送统计请求，收集每个分片上各集合的数据大小
+ * - 整合统计结果，构建完整的数据大小映射结构
+ * 
+ * 性能优化：
+ * - 批量网络请求：避免为每个集合单独发送请求
+ * - 并行收集：同时从多个分片收集统计信息
+ * - 结构化缓存：提供易于查询的数据结构给上层调用者
+ * 
+ * 参数说明：
+ * @param opCtx 操作上下文，提供事务和中断支持
+ * @param collections 待统计的集合元数据列表
+ * 
+ * 返回值：
+ * @return 集合命名空间到CollectionDataSizeInfoForBalancing的映射
+ *         包含每个集合在各分片的数据大小和最大chunk大小配置
+ * 
+ * 该函数是负载均衡数据收集的核心组件，为后续的chunk迁移决策提供准确的数据基础。
+ */
 stdx::unordered_map<NamespaceString, CollectionDataSizeInfoForBalancing>
 getDataSizeInfoForCollections(OperationContext* opCtx,
                               const std::vector<CollectionType>& collections) {
+    // 获取负载均衡器配置：用于确定全局chunk大小限制和其他均衡参数
+    // 这个配置包含了集群级别的均衡策略设置
     const auto balancerConfig = Grid::get(opCtx)->getBalancerConfiguration();
     uassertStatusOK(balancerConfig->refreshAndCheck(opCtx));
 
+    // 获取分片注册表：用于获取集群中所有活跃分片的ID列表
+    // 统计请求需要发送到所有分片以获得完整的数据大小信息
     const auto shardRegistry = Grid::get(opCtx)->shardRegistry();
     const auto shardIds = shardRegistry->getAllShardIds(opCtx);
 
     // Map to be returned, incrementally populated with the collected statistics
+    // 初始化返回映射：逐步填充收集到的统计信息
+    // Key: NamespaceString（集合命名空间）
+    // Value: CollectionDataSizeInfoForBalancing（包含分片数据大小和chunk配置）
     stdx::unordered_map<NamespaceString, CollectionDataSizeInfoForBalancing> dataSizeInfoMap;
 
+    // 构建统计请求的命名空间列表：为批量统计请求准备数据
+    // 包含每个集合的命名空间和UUID，确保请求的准确性
     std::vector<NamespaceWithOptionalUUID> namespacesWithUUIDsForStatsRequest;
     for (const auto& coll : collections) {
         const auto& nss = coll.getNss();
+        
+        // 确定集合的最大chunk大小：优先使用集合级配置，否则使用全局默认值
+        // 这个大小限制会影响chunk拆分和迁移的决策
         const auto maxChunkSizeBytes =
             coll.getMaxChunkSizeBytes().value_or(balancerConfig->getMaxChunkSizeBytes());
 
+        // 初始化集合的数据大小信息结构：
+        // - 空的分片到数据大小映射（后续填充）
+        // - 确定的最大chunk大小限制
         dataSizeInfoMap.emplace(
             nss,
             CollectionDataSizeInfoForBalancing(std::map<ShardId, int64_t>(), maxChunkSizeBytes));
 
+        // 构建带UUID的命名空间：确保统计请求的唯一性和准确性
+        // UUID避免了因集合删除重建导致的统计数据混淆
         NamespaceWithOptionalUUID nssWithUUID(nss);
         nssWithUUID.setUUID(coll.getUuid());
         namespacesWithUUIDsForStatsRequest.push_back(nssWithUUID);
     }
 
+    // 批量获取统计信息：向所有分片发送统计请求，收集各集合的数据大小
+    // 这是一个网络密集型操作，通过批量请求优化性能
+    // 返回结果格式：NamespaceString -> (ShardId -> 数据大小)
     auto namespaceToShardDataSize =
         getStatsForBalancing(opCtx, shardIds, namespacesWithUUIDsForStatsRequest);
+    
+    // 整合统计结果：将收集到的分片数据大小填充到返回映射中
     for (auto& [ns, shardDataSizeMap] : namespaceToShardDataSize) {
+        // 验证集合存在性：确保统计结果对应的集合在我们的处理列表中
+        // 这是一个安全性检查，防止意外的数据不一致
         tassert(8245201, "Namespace not found", dataSizeInfoMap.contains(ns));
+        
+        // 填充分片数据大小映射：将从各分片收集到的数据大小信息
+        // 移动到最终的返回结构中，避免不必要的数据复制
         dataSizeInfoMap.at(ns).shardToDataSizeMap = std::move(shardDataSizeMap);
     }
+    
+    // 返回完整的集合数据大小信息映射：
+    // 包含每个集合在各分片的数据大小统计和chunk大小配置
+    // 供负载均衡器用于制定迁移决策
     return dataSizeInfoMap;
 }
 
