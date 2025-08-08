@@ -132,7 +132,7 @@ BalancerCommandsSchedulerImpl::~BalancerCommandsSchedulerImpl() {
 }
 
 //Balancer::_mainThread()
-//启动后台线程 _workerThread，该线程负责异步处理和下发所有均衡相关命令（如 chunk 迁移、合并等）。
+//启动后台线程 _workerThread ，该线程负责异步处理和下发所有均衡相关命令（如 chunk 迁移、合并等）。
 void BalancerCommandsSchedulerImpl::start(OperationContext* opCtx) {
     LOGV2(5847200, "Balancer command scheduler start requested");
     stdx::lock_guard<Latch> lg(_mutex);
@@ -225,7 +225,7 @@ SemiFuture<void> BalancerCommandsSchedulerImpl::requestMoveRange(
         std::move(externalClientInfo) // 外部客户端信息（可选）
     );
 
-    // 构建并入队新的命令请求到内部工作线程
+    // 构建并入队新的命令请求到内部工作线程， 最终任务交由 BalancerCommandsScheduler 线程执行
     // _buildAndEnqueueNewRequest 将请求加入队列，由 _workerThread 异步处理
     return _buildAndEnqueueNewRequest(opCtx, std::move(commandInfo))
         .then([](const executor::RemoteCommandResponse& remoteResponse) {
@@ -345,6 +345,25 @@ Future<executor::RemoteCommandResponse> BalancerCommandsSchedulerImpl::_buildAnd
     // 为每个新请求生成唯一标识符，用于请求跟踪、日志记录和结果关联
     const auto newRequestId = UUID::gen();
     
+    /*
+    {
+    "t": {"$date": "2025-01-15T14:30:25.123+08:00"},
+    "s": "D2",
+    "c": "SHARDING", 
+    "id": 5847202,
+    "svc": "S",
+    "ctx": "Balancer",
+    "msg": "Enqueuing new Balancer command request",
+    "attr": {
+        "reqId": {
+        "uuid": {"$uuid": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"}
+        },
+        "command": "{ _shardsvrMoveRange: \"ecommerce.orders\", toShard: \"shard0002\", min: { customer_id: 100000 }, max: { customer_id: 200000 }, waitForDelete: false, epoch: ObjectId('65a1b2c3d4e5f67890abcdef'), collectionTimestamp: Timestamp(1705123825, 15), fromShard: \"shard0001\", maxChunkSizeBytes: 67108864, forceJumbo: false, secondaryThrottle: true, writeConcern: { w: \"majority\", wtimeout: 30000 } }",
+        "recoveryDocRequired": false
+    }
+    }
+    */
+    //{"t":{"$date":"2025-07-29T19:47:59.205+08:00"},"s":"D2", "c":"SHARDING", "id":5847202, "svc":"S", "ctx":"Balancer","msg":"Enqueuing new Balancer command request","attr":{"reqId":{"uuid":{"$uuid":"3cc580e0-5cff-4fc3-b333-8397a5ae996f"}},"command":"{ _shardsvrMoveRange: \"benchmark.yyztest\", toShard: \"shard1ReplSet\", min: { _id: 122475263 }, waitForDelete: false, epoch: ObjectId('6888b23d9b404274eb601360'), collectionTimestamp: Timestamp(1753788989, 10), fromShard: \"shard3ReplSet\", maxChunkSizeBytes: 10485760, forceJumbo: 0, secondaryThrottle: false, writeConcern: { w: 1, wtimeout: 0 } }","recoveryDocRequired":false}}
     // 记录请求入队的详细信息，包括命令内容和是否需要恢复支持
     LOGV2_DEBUG(5847202,
                 2,
@@ -431,38 +450,103 @@ void BalancerCommandsSchedulerImpl::_enqueueRequest(WithLock, RequestData&& requ
     }
 }
 
+/**
+ * BalancerCommandsSchedulerImpl::_submit 的作用：
+ * 将均衡器命令请求提交到目标分片进行异步执行，是调度器与远程分片通信的核心接口。
+ * 
+ * 核心功能：
+ * 1. 分片路由和发现：通过分片注册表获取目标分片信息和主机地址
+ * 2. 远程命令构建：将抽象的命令信息序列化为具体的远程命令请求
+ * 3. 异步执行调度：通过TaskExecutor将命令提交到目标分片的主节点
+ * 4. 回调机制设置：注册命令完成后的回调处理函数
+ * 5. 错误处理和状态管理：处理分片不可用、网络异常等各种失败情况
+ * 
+ * 执行流程：
+ * 1. 分片解析：从分片注册表中查找目标分片
+ * 2. 主机定位：获取分片主节点的网络地址
+ * 3. 命令序列化：将命令对象转换为BSON格式
+ * 4. 异步提交：通过TaskExecutor调度远程命令执行
+ * 5. 结果处理：设置异步回调处理命令执行结果
+ * 
+ * 参数说明：
+ * @param opCtx 操作上下文，包含认证、会话和超时信息
+ * @param params 命令提交参数，包含请求ID和完整的命令信息
+ * 
+ * @return CommandSubmissionResult 提交结果，包含请求ID和提交状态
+ * 
+ * 该函数是调度器架构中连接逻辑命令和物理执行的桥梁，实现了：
+ * 命令抽象 → 分片路由 → 远程调度 → 异步执行
+ */
 CommandSubmissionResult BalancerCommandsSchedulerImpl::_submit(
     OperationContext* opCtx, const CommandSubmissionParameters& params) {
+    
+    // 记录命令提交开始的调试信息，包含请求ID用于跟踪
     LOGV2_DEBUG(
         5847203, 2, "Balancer command request submitted for execution", "reqId"_attr = params.id);
+    
     try {
+        // ========== 第一步：分片发现和验证 ==========
+        // 通过分片注册表获取目标分片对象
+        // Grid::get(opCtx)->shardRegistry() 提供集群分片信息的统一访问接口
         const auto shardWithStatus =
             Grid::get(opCtx)->shardRegistry()->getShard(opCtx, params.commandInfo->getTarget());
+        
+        // 检查分片获取是否成功：分片可能不存在、已下线或配置错误
         if (!shardWithStatus.isOK()) {
+            // 分片获取失败：返回包含错误状态的提交结果
+            // 这种情况通常发生在分片配置变更、网络分区或分片下线时
             return CommandSubmissionResult(params.id, shardWithStatus.getStatus());
         }
 
+        // ========== 第二步：目标主机定位 ==========
+        // 获取分片主节点的网络地址，均衡器命令必须在主节点执行
+        // ReadPreference::PrimaryOnly 确保命令发送到分片的主节点
         const auto shardHostWithStatus = shardWithStatus.getValue()->getTargeter()->findHost(
             opCtx, ReadPreferenceSetting{ReadPreference::PrimaryOnly});
+        
+        // 检查主机地址获取是否成功：主节点可能不可用或正在选举中
         if (!shardHostWithStatus.isOK()) {
+            // 主机地址获取失败：返回包含错误状态的提交结果
+            // 这种情况通常发生在复制集选举、主节点故障或网络问题时
             return CommandSubmissionResult(params.id, shardHostWithStatus.getStatus());
         }
 
+        // ========== 第三步：远程命令构建 ==========
+        // 构建TaskExecutor所需的远程命令请求对象
+        // 包含：目标主机地址、数据库名称、序列化命令、操作上下文
         const executor::RemoteCommandRequest remoteCommand =
-            executor::RemoteCommandRequest(shardHostWithStatus.getValue(),
-                                           params.commandInfo->getTargetDb(),
-                                           params.commandInfo->serialise(),
-                                           opCtx);
+            executor::RemoteCommandRequest(shardHostWithStatus.getValue(),  // 目标分片主机地址
+                                           params.commandInfo->getTargetDb(), // 目标数据库名
+                                           params.commandInfo->serialise(),   // 序列化的BSON命令
+                                           opCtx);                           // 操作上下文
+
+        // ========== 第四步：异步回调设置 ==========
+        // 定义命令执行完成后的回调函数
+        // 使用lambda捕获请求ID，确保回调能正确关联到原始请求
         auto onRemoteResponseReceived =
-            [this,
-             requestId = params.id](const executor::TaskExecutor::RemoteCommandCallbackArgs& args) {
+            [this,                          // 捕获当前调度器实例
+             requestId = params.id]         // 捕获请求ID用于结果关联
+            (const executor::TaskExecutor::RemoteCommandCallbackArgs& args) {
+                // 当远程命令执行完成（成功或失败）时调用此回调
+                // _applyCommandResponse 将处理响应并更新请求状态
                 _applyCommandResponse(requestId, args.response);
             };
 
+        // ========== 第五步：异步命令调度 ==========
+        // 通过TaskExecutor将命令提交到线程池进行异步执行
+        // scheduleRemoteCommand 立即返回，不等待命令执行完成
         auto swRemoteCommandHandle =
             (*_executor)->scheduleRemoteCommand(remoteCommand, onRemoteResponseReceived);
+        
+        // 返回提交结果：包含请求ID和调度状态
+        // 注意：这里返回的是提交状态，不是命令执行结果
+        // 实际执行结果将通过上面设置的回调函数异步处理
         return CommandSubmissionResult(params.id, swRemoteCommandHandle.getStatus());
+        
     } catch (const DBException& e) {
+        // ========== 异常处理 ==========
+        // 捕获所有数据库相关异常（网络错误、认证失败、超时等）
+        // 将异常转换为状态码，确保调用方能正确处理错误情况
         return CommandSubmissionResult(params.id, e.toStatus());
     }
 }
