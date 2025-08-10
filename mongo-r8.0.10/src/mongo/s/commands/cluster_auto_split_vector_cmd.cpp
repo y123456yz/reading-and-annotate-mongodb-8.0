@@ -46,6 +46,20 @@
 namespace mongo {
 
 namespace {
+/*
+// 客户端向mongos发送的请求，ClusterAutoSplitVectorCommand 处理， 注意和 AutoSplitVectorCommand 的区别
+db.runCommand({
+    "autoSplitVector": "ecommerce.orders",
+    "keyPattern": {"order_date": 1},
+    "min": {"order_date": ISODate("2025-01-01")},
+    "max": {"order_date": ISODate("2025-02-01")},
+    "maxChunkSizeBytes": 67108864  // 64MB
+})
+
+AutoSplitVectorCommand
+ config server的“Balancer”线程发现zone违规，则会通过 Balancer::_splitChunksIfNeeded 函数处理最终走到这里
+
+*/
 
 class ClusterAutoSplitVectorCommand final : public TypedCommand<ClusterAutoSplitVectorCommand> {
 public:

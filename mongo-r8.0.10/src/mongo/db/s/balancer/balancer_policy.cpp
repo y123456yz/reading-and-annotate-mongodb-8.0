@@ -559,6 +559,8 @@ MigrateInfosWithReason BalancerPolicy::balance(
                             distribution.nss(),
                             distribution.getChunkManager().getUUID(),
                             chunk.getMin(),
+                            // 注意这里max填充为空，所以这里也是源分片收到_shardsvrMoveRange命令后会进入split拆分逻辑的原因
+                            // 配合 MigrationSourceManager::MigrationSourceManager 阅读
                             boost::none /* max */,
                             chunk.getLastmod(),
                             // Always force jumbo chunks to be migrated off draining shards

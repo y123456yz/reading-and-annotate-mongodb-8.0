@@ -74,6 +74,14 @@ namespace {
  * Given that the `vector<BSONObj>` returned by `autoSplitVector` can't be greater than 16MB when
  * serialized, pessimistically assume that each key occupies the highest possible number of bytes.
  */
+/**
+ * BSON数组序列化规则：
+ * BSON数组在序列化时会转换为BSON对象，数组索引作为字符串键
+ * 例如：["a","b","c"] → {"0":"a","1":"b","2":"c"}
+ * 
+ * estimatedAdditionalBytesPerItemInBSONArray的作用：
+ * 预估每个数组元素在序列化时额外需要的字节数（主要是索引键的开销）
+ */
 const int estimatedAdditionalBytesPerItemInBSONArray{
     (int)std::to_string(BSONObjMaxUserSize / BSONObj::kMinBSONLength).length()};
 
@@ -148,6 +156,7 @@ auto orderShardKeyFields(const BSONObj& keyPattern, const BSONObj& key) {
  * 
  * 该函数是分片集群自动平衡和 chunk 分裂的核心算法，确保数据在分片间的均匀分布。
  */
+// AutoSplitVectorCommand::typedRun
 // MigrationSourceManager::MigrationSourceManager->computeOtherBound 调用
 std::pair<std::vector<BSONObj>, bool> autoSplitVector(OperationContext* opCtx,
                                                       const NamespaceString& nss,

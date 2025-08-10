@@ -324,6 +324,7 @@ MigrationSourceManager::MigrationSourceManager(OperationContext* opCtx,
 
             // 获取 chunk 管理器和包含最小值的 chunk
             const auto cm = metadata.getChunkManager();
+            // 从路由表中获取min对应的chunk， 这样就可以获取该chunk的max
             const auto owningChunk = cm->findIntersectingChunkWithSimpleCollation(min);
             
             // 计算最优的最大边界：
@@ -332,6 +333,7 @@ MigrationSourceManager::MigrationSourceManager(OperationContext* opCtx,
             const auto max = computeOtherBound(_opCtx,
                                                nss(),
                                                min,
+                                               //源分片处理的时候才通过路由表重新填充
                                                owningChunk.getMax(),
                                                cm->getShardKeyPattern(),
                                                _args.getMaxChunkSizeBytes(),

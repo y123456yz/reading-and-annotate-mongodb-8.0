@@ -405,6 +405,7 @@ void enqueueCollectionMigrations(OperationContext* opCtx,
  * @param migrationsAndResponses 迁移任务和响应的配对列表，函数会填充响应部分
  * 
  * 该函数是 chunk 迁移执行的关键入口，将迁移决策转换为实际的异步迁移操作。
+ * Balancer::_doMigrations->enqueueChunkMigrations() 调用此函数来批量提交迁移请求。
  */
 void enqueueChunkMigrations(OperationContext* opCtx,
                             BalancerCommandsScheduler& scheduler,
@@ -1461,50 +1462,107 @@ bool Balancer::_checkOIDs(OperationContext* opCtx) {
 }
 
 /**
+ * Balancer::_splitChunksIfNeeded 的作用：
  * 检查并强制分片集合的 chunk 边界与 zone（分区）边界对齐，必要时对 chunk 进行拆分。
- *
- * 主要流程：
- * 1. 调用 _chunkSelectionPolicy->selectChunksToSplit，选出需要拆分的 chunk（如 zone 边界不对齐）。
- * 2. 对每个待拆分 chunk，获取最新的路由信息（RoutingInformationCache），确保操作的元数据是最新的。
- * 3. 调用 shardutil::splitChunkAtMultiplePoints，按指定 splitKeys 在目标 shard 上拆分 chunk。
- * 4. 拆分失败时记录警告日志，不影响后续 chunk 的拆分。
- * 5. 全部分拆完成后返回 OK，若有元数据/路由信息错误则提前返回错误。
- *
- * 该函数主要用于在每轮均衡前，确保所有 chunk 的分布满足 zone 约束，避免 zone 违规。
+ * 这是 Balancer 主循环中的关键步骤，确保 chunk 分布满足 zone 约束，避免违反分区规则。
+ * 
+ * 核心功能：
+ * 1. 边界对齐检查：识别与 zone 边界不对齐的 chunk，确保数据分布符合分区策略
+ * 2. 自动拆分执行：对检测到的违规 chunk 进行自动拆分，使其边界与 zone 边界对齐
+ * 3. 元数据同步：在拆分前获取最新的路由信息，确保操作基于准确的集合元数据
+ * 4. 错误隔离处理：单个 chunk 拆分失败不影响其他 chunk 的拆分操作
+ * 5. Zone 合规保障：通过预先拆分确保后续的 chunk 迁移不违反 zone 约束
+ * 
+ * 执行时机：
+ * - 在每轮 balancing round 的 chunk 迁移之前执行
+ * - 作为数据均衡的前置步骤，确保所有操作都在合规的 chunk 边界内进行
+ * 
+ * 应用场景：
+ * - Zone sharding: 确保 chunk 边界与地理分区或硬件分区对齐
+ * - Tag-aware sharding: 保证带标签的 chunk 分布符合标签约束
+ * - 数据本地化: 确保特定数据范围位于指定的分片或分片组中
+ * 
+ * @param opCtx 操作上下文，用于访问 MongoDB 资源和处理中断
+ * @return Status 拆分操作的整体状态，成功时返回 OK，失败时返回具体错误信息
+ * 
+ * 该函数是 MongoDB 分片集群维护 zone 合规性的核心机制，确保数据分布策略得到严格执行。
+ * Balancer::_mainThread()
+ * 
+ * 该函数实际上只对zone违规的表进行chunk拆分，普通不均衡的表不会满足zone违规，因此不会进入for循环，因此对普通不均衡表来说该函数会直接返回，不会做split拆分
  */
 Status Balancer::_splitChunksIfNeeded(OperationContext* opCtx) {
+
+    // ========== 第一阶段：选择需要拆分的 chunk ==========
+    // 调用分片选择策略，识别所有需要拆分的 chunk
+    // 主要检测：zone 边界不对齐的 chunk、violates tag 约束的 chunk 等
     auto chunksToSplitStatus = _chunkSelectionPolicy->selectChunksToSplit(opCtx);
     if (!chunksToSplitStatus.isOK()) {
+        // 如果选择策略本身失败（如无法访问配置服务器），直接返回错误
+        // 这确保了只有在能够正确识别待拆分 chunk 时才进行后续操作
         return chunksToSplitStatus.getStatus();
     }
 
+    //如果是普通不均衡的表，不会满足chunk zone违规，因此chunksToSplitStatus返回为空，不会进入下面的for循环
+
+    // ========== 第二阶段：逐个处理待拆分的 chunk ==========
+    // 遍历所有需要拆分的 chunk，为每个 chunk 执行拆分操作
+    // 采用单个处理模式，确保每个 chunk 的拆分都基于最新的元数据信息
     for (const auto& splitInfo : chunksToSplitStatus.getValue()) {
+        
+        // ========== 子步骤 2.1：获取最新的路由信息 ==========
+        // 在拆分前刷新集合的路由信息，确保操作基于最新的 chunk 分布
+        // 这避免了因元数据过期导致的拆分失败或不一致问题
         auto routingInfoStatus =
             RoutingInformationCache::get(opCtx)
                 ->getShardedCollectionRoutingInfoWithPlacementRefresh(opCtx, splitInfo.nss);
         if (!routingInfoStatus.isOK()) {
+            // 如果无法获取路由信息（如集合被删除、网络问题等），终止整个拆分流程
+            // 因为没有准确的路由信息，继续操作可能导致数据不一致
             return routingInfoStatus.getStatus();
         }
 
+        // 提取 ChunkManager，包含该集合的完整分片信息
         const auto& [cm, _] = routingInfoStatus.getValue();
 
+        // ========== 子步骤 2.2：执行 chunk 拆分操作 ==========
+        // 调用分片工具函数，在指定的分片上按 splitKeys 拆分 chunk
+        // 参数详解：
+        // - splitInfo.shardId: 拥有该 chunk 的目标分片
+        // - splitInfo.nss: 集合命名空间
+        // - cm.getShardKeyPattern(): 分片键模式，用于验证拆分点的合法性
+        // - splitInfo.collectionPlacementVersion: 集合版本信息，确保操作时效性
+        // - ChunkRange: chunk 的当前边界范围
+        // - splitInfo.splitKeys: 计算出的拆分点数组
         auto splitStatus = shardutil::splitChunkAtMultiplePoints(
             opCtx,
-            splitInfo.shardId,
-            splitInfo.nss,
-            cm.getShardKeyPattern(),
-            splitInfo.collectionPlacementVersion.epoch(),
-            splitInfo.collectionPlacementVersion.getTimestamp(),
-            ChunkRange(splitInfo.minKey, splitInfo.maxKey),
-            splitInfo.splitKeys);
+            splitInfo.shardId,              // 目标分片：拥有该 chunk 的分片
+            splitInfo.nss,                  // 命名空间：要拆分的集合
+            cm.getShardKeyPattern(),        // 分片键模式：验证拆分点合法性
+            splitInfo.collectionPlacementVersion.epoch(),      // 集合 epoch：版本控制
+            splitInfo.collectionPlacementVersion.getTimestamp(), // 集合时间戳：版本控制
+            ChunkRange(splitInfo.minKey, splitInfo.maxKey),    // chunk 范围：当前 chunk 边界
+            splitInfo.splitKeys);           // 拆分点：按这些点将 chunk 分割成多个小 chunk
+
+        // ========== 子步骤 2.3：处理拆分结果 ==========
         if (!splitStatus.isOK()) {
+            // 单个 chunk 拆分失败时记录警告日志，但不终止整个流程
+            // 这种设计允许部分拆分成功，最大化操作的有效性
+            // 失败原因可能包括：chunk 已被其他操作修改、分片不可达、分割点无效等
             LOGV2_WARNING(21879,
                           "Failed to split chunk",
-                          "splitInfo"_attr = redact(splitInfo.toString()),
-                          "error"_attr = redact(splitStatus));
+                          "splitInfo"_attr = redact(splitInfo.toString()),  // 拆分信息详情
+                          "error"_attr = redact(splitStatus));              // 具体错误信息
         }
+        // 注意：这里没有 return，继续处理下一个 chunk
+        // 这确保了一个 chunk 的拆分失败不会影响其他 chunk 的拆分
     }
 
+    // ========== 第三阶段：返回整体成功状态 ==========
+    // 如果执行到这里，说明：
+    // 1. 成功获取了所有待拆分的 chunk 列表
+    // 2. 成功获取了所有需要的路由信息
+    // 3. 完成了所有 chunk 的拆分尝试（部分可能失败，但已记录日志）
+    // 返回 OK 表示整个拆分流程正常完成，即使个别 chunk 拆分可能失败
     return Status::OK();
 }
 

@@ -205,6 +205,9 @@ void BalancerCommandsSchedulerImpl::disableBalancerForCollection(OperationContex
  * 该函数是 chunk 迁移命令的统一入口，负责将同步的迁移请求转换为异步执行模式。
  * 请求提交 → 工作线程队列 → 异步执行 → 回调处理
  * _buildAndEnqueueNewRequest() → _workerThread() → _submit() → _applyCommandResponse()
+ * 
+ * 
+ * Balancer::_doMigrations->enqueueChunkMigrations() ->BalancerCommandsSchedulerImpl::requestMoveRange
  */
 SemiFuture<void> BalancerCommandsSchedulerImpl::requestMoveRange(
     OperationContext* opCtx,
@@ -338,6 +341,10 @@ SemiFuture<void> BalancerCommandsSchedulerImpl::requestMoveCollection(
  * 
  * 该函数实现了从同步接口到异步执行的转换，是调度器架构的关键枢纽：
  * 同步调用 → 请求入队 → 异步执行 → 结果回调
+ * 
+ *  Balancer::_doMigrations->enqueueChunkMigrations() 
+ *      ->BalancerCommandsSchedulerImpl::requestMoveRange
+ *         ->BalancerCommandsSchedulerImpl::_buildAndEnqueueNewRequest
  */
 Future<executor::RemoteCommandResponse> BalancerCommandsSchedulerImpl::_buildAndEnqueueNewRequest(
     OperationContext* opCtx, std::shared_ptr<CommandInfo>&& commandInfo) {
@@ -345,24 +352,22 @@ Future<executor::RemoteCommandResponse> BalancerCommandsSchedulerImpl::_buildAnd
     // 为每个新请求生成唯一标识符，用于请求跟踪、日志记录和结果关联
     const auto newRequestId = UUID::gen();
     
-    /*
-    {
-    "t": {"$date": "2025-01-15T14:30:25.123+08:00"},
-    "s": "D2",
-    "c": "SHARDING", 
-    "id": 5847202,
-    "svc": "S",
-    "ctx": "Balancer",
-    "msg": "Enqueuing new Balancer command request",
-    "attr": {
-        "reqId": {
-        "uuid": {"$uuid": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"}
-        },
-        "command": "{ _shardsvrMoveRange: \"ecommerce.orders\", toShard: \"shard0002\", min: { customer_id: 100000 }, max: { customer_id: 200000 }, waitForDelete: false, epoch: ObjectId('65a1b2c3d4e5f67890abcdef'), collectionTimestamp: Timestamp(1705123825, 15), fromShard: \"shard0001\", maxChunkSizeBytes: 67108864, forceJumbo: false, secondaryThrottle: true, writeConcern: { w: \"majority\", wtimeout: 30000 } }",
-        "recoveryDocRequired": false
-    }
-    }
-    */
+/*
+{
+  "t": {"$date": "2025-07-29T19:47:59.205+08:00"},
+  "s": "D2",
+  "c": "SHARDING",
+  "id": 5847202,
+  "svc": "S",
+  "ctx": "Balancer",
+  "msg": "Enqueuing new Balancer command request",
+  "attr": {
+    "reqId": {"uuid": {"$uuid": "3cc580e0-5cff-4fc3-b333-8397a5ae996f"}},
+    "command": "{ _shardsvrMoveRange: \"benchmark.yyztest\", toShard: \"shard1ReplSet\", min: { _id: 122475263 }, waitForDelete: false, epoch: ObjectId('6888b23d9b404274eb601360'), collectionTimestamp: Timestamp(1753788989, 10), fromShard: \"shard3ReplSet\", maxChunkSizeBytes: 10485760, forceJumbo: 0, secondaryThrottle: false, writeConcern: { w: 1, wtimeout: 0 } }",
+    "recoveryDocRequired": false
+  }
+}
+*/
     //{"t":{"$date":"2025-07-29T19:47:59.205+08:00"},"s":"D2", "c":"SHARDING", "id":5847202, "svc":"S", "ctx":"Balancer","msg":"Enqueuing new Balancer command request","attr":{"reqId":{"uuid":{"$uuid":"3cc580e0-5cff-4fc3-b333-8397a5ae996f"}},"command":"{ _shardsvrMoveRange: \"benchmark.yyztest\", toShard: \"shard1ReplSet\", min: { _id: 122475263 }, waitForDelete: false, epoch: ObjectId('6888b23d9b404274eb601360'), collectionTimestamp: Timestamp(1753788989, 10), fromShard: \"shard3ReplSet\", maxChunkSizeBytes: 10485760, forceJumbo: 0, secondaryThrottle: false, writeConcern: { w: 1, wtimeout: 0 } }","recoveryDocRequired":false}}
     // 记录请求入队的详细信息，包括命令内容和是否需要恢复支持
     LOGV2_DEBUG(5847202,
@@ -569,27 +574,97 @@ void BalancerCommandsSchedulerImpl::_applySubmissionResult(
     }
 }
 
+// 收到config server的应答，例如chunk迁移完成
+/**
+ * BalancerCommandsSchedulerImpl::_applyCommandResponse 的作用：
+ * 处理来自远程分片（源分片或目标分片）的命令执行响应，更新请求状态并触发后续处理流程。
+ * 这是TaskExecutor异步回调机制的核心处理函数，连接远程命令执行与本地状态管理。
+ * 
+ * 核心功能：
+ * 1. 响应结果关联：将远程命令的执行结果与对应的本地请求进行关联
+ * 2. 状态更新管理：更新请求的最终状态（成功/失败）和详细结果信息
+ * 3. 完成队列维护：将已完成的请求加入清理队列，供工作线程清理资源
+ * 4. 恢复流程控制：在恢复模式下跟踪剩余请求数量，控制状态转换
+ * 5. 线程同步通知：唤醒等待的工作线程处理完成的请求
+ * 
+ * 执行时机：
+ * - 远程分片完成ShardsvrMoveRange命令执行后
+ * - 远程分片完成MergeChunks命令执行后  
+ * - 远程分片完成DataSize查询命令后
+ * - 网络错误或命令执行失败时
+ * 
+ * 参数说明：
+ * @param requestId 请求的唯一标识符，用于在内部映射表中定位对应请求
+ * @param response 远程命令的执行响应，包含成功结果或错误信息
+ * 
+ * 该函数是异步命令执行流程的关键节点：
+ * 远程执行完成 → 回调触发 → 状态更新 → 资源清理 → 结果通知
+ */
+// 收到config server的应答
 void BalancerCommandsSchedulerImpl::_applyCommandResponse(
     UUID requestId, const executor::RemoteCommandResponse& response) {
     {
+        // ========== 第一阶段：线程安全的状态更新 ==========
+        // 获取互斥锁，确保对调度器状态和请求映射表的原子性操作
         stdx::lock_guard<Latch> lg(_mutex);
+        
+        // 验证调度器状态：确保在有效状态下处理响应
+        // 如果调度器已停止，说明系统状态异常，应该终止处理
         tassert(8245207, "Scheduler is stopped", _state != SchedulerState::Stopped);
+        
+        // ========== 第二阶段：请求定位和验证 ==========
+        // 在活跃请求映射表中查找对应的请求对象
+        // _requests 维护所有正在处理的请求信息
         auto requestIt = _requests.find(requestId);
+        
+        // 验证请求存在性：确保回调对应的请求仍在处理中
+        // 如果请求不存在，说明可能出现了重复回调或内部状态错误
         tassert(8245208, "Request ID is already in use", requestIt != _requests.end());
+        
+        // 获取请求对象的引用，准备更新其状态
         auto& request = requestIt->second;
+        
+        // ========== 第三阶段：设置请求执行结果 ==========
+        // 将远程命令的执行响应设置为请求的最终结果
+        // response 包含：执行状态、返回数据、错误信息等
+        // setOutcome() 会：
+        // 1. 解析响应状态（成功/失败）
+        // 2. 提取返回的数据内容
+        // 3. 设置Future对象的值，通知等待的调用方
         request.setOutcome(response);
+        
+        // ========== 第四阶段：完成队列管理 ==========
+        // 将已完成的请求ID加入清理队列
+        // _recentlyCompletedRequestIds 记录需要被工作线程清理的请求
+        // 工作线程会在下次循环中清理这些请求的资源
         _recentlyCompletedRequestIds.emplace_back(request.getId());
+        
+        // ========== 第五阶段：恢复模式状态控制 ==========
+        // 如果调度器处于恢复状态，需要跟踪恢复进度
         if (_state == SchedulerState::Recovering && --_numRequestsToRecover == 0) {
+            // 所有恢复请求都已完成，切换到正常运行状态
+            // 这标志着调度器从故障恢复状态转换为正常工作状态
             LOGV2(5847207, "Balancer scheduler recovery complete. Switching to regular execution");
             _state = SchedulerState::Running;
         }
+        
+        // ========== 第六阶段：线程间通信 ==========
+        // 通知等待在条件变量上的工作线程
+        // 工作线程可能在等待：
+        // 1. 新的请求处理完成
+        // 2. 调度器状态变更
+        // 3. 资源清理时机
         _stateUpdatedCV.notify_all();
     }
+    
+    // ========== 第七阶段：详细日志记录 ==========
+    // 记录请求执行完成的详细信息，用于调试和监控
+    // 包含：请求ID（用于追踪）、完整的响应内容（包括结果数据）
     LOGV2_DEBUG(5847204,
-                2,
+                2,  // 调试级别2，需要设置相应的日志级别才能看到
                 "Execution of balancer command request completed",
-                "reqId"_attr = requestId,
-                "response"_attr = response);
+                "reqId"_attr = requestId,      // 请求唯一标识
+                "response"_attr = response);   // 完整的远程命令响应
 }
 
 /**

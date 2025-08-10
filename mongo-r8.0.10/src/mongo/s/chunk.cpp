@@ -133,6 +133,7 @@ BSONObj ChunkInfo::toBSON() const {
     return bob.obj();
 }
 
+// ShardingCatalogManager::splitOrMarkJumbo 如果chunk无法分割会调用它，标记为jumbo
 void ChunkInfo::markAsJumbo() {
     _jumbo.store(true);
 }

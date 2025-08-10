@@ -355,49 +355,141 @@ bool balancer_policy_utils::canBalanceCollection(const CollectionType& coll) {
 BalancerChunkSelectionPolicy::BalancerChunkSelectionPolicy(ClusterStatistics* clusterStats)
     : _clusterStats(clusterStats) {}
 
+/**
+ * BalancerChunkSelectionPolicy::selectChunksToSplit 的作用：
+ * 扫描集群中所有分片集合，识别并选择需要拆分的 chunk，主要解决 zone（分区）边界违规问题。
+ * 这是 Balancer 数据均衡前的关键预处理步骤，确保所有 chunk 边界与 zone 配置严格对齐。
+ * 
+ * 核心功能：
+ * 1. 全集合扫描：遍历集群中所有分片集合，进行全面的 zone 合规性检查
+ * 2. Zone 边界检测：识别 chunk 边界与 zone 边界不对齐的违规情况
+ * 3. 拆分点计算：为违规 chunk 计算精确的拆分点，确保拆分后符合 zone 约束
+ * 4. 错误隔离处理：单个集合处理失败不影响其他集合的拆分候选选择
+ * 5. 随机化处理：随机遍历集合顺序，避免总是优先处理相同集合
+ * 6. 批量优化：将同一 chunk 的多个拆分点合并，减少元数据刷新开销
+ * 
+ * 应用场景：
+ * - Zone sharding：确保数据严格按地理区域或硬件分区分布
+ * - Tag-aware balancing：保证带标签的 chunk 分布符合标签约束规则
+ * - 动态 zone 调整：当管理员修改 zone 配置后，自动调整 chunk 边界
+ * - 合规性维护：持续监控并修复因各种操作导致的 zone 边界违规
+ * 
+ * 执行时机：
+ * - 在每轮 balancing round 开始前执行，作为数据迁移的前置条件
+ * - 当检测到 zone 配置变更时触发，确保新配置得到执行
+ * - 管理员手动触发集群重平衡时的第一步操作
+ * 
+ * @param opCtx 操作上下文，提供事务控制、中断处理和资源访问
+ * @return StatusWith<SplitInfoVector> 拆分候选信息向量，包含所有需要拆分的 chunk 及其拆分点
+ * 
+ * 该函数是 MongoDB 分片集群维护 zone 合规性的核心入口，为后续的 chunk 均衡迁移提供合规的基础。
+ * 
+* // 对于普通数据不均衡表，candidatesStatus.getValue() 通常为空向量， 
+  // 因此对于普通不均衡表，splitCandidates返回空
+ */
 StatusWith<SplitInfoVector> BalancerChunkSelectionPolicy::selectChunksToSplit(
     OperationContext* opCtx) {
+    
+    // ========== 第一阶段：获取集群统计信息 ==========
+    // 获取集群中所有分片的统计信息，包括分片状态、可用性等基础数据
+    // 这些信息用于后续的 chunk 分布分析和拆分决策
     auto shardStatsStatus = _clusterStats->getStats(opCtx);
     if (!shardStatsStatus.isOK()) {
+        // 如果无法获取分片统计信息（如网络问题、分片不可达等），直接返回错误
+        // 因为没有准确的集群状态信息，无法进行可靠的拆分决策
         return shardStatsStatus.getStatus();
     }
 
+    // 提取分片统计信息，供后续处理使用
     const auto& shardStats = shardStatsStatus.getValue();
 
+    // ========== 第二阶段：获取所有分片集合元数据 ==========
+    // 获取 ShardingCatalogManager 的本地目录客户端，用于访问配置数据库
     const auto catalogClient = ShardingCatalogManager::get(opCtx)->localCatalogClient();
 
+    // 从 config.collections 获取所有分片集合的元数据信息
+    // 参数说明：
+    // - DatabaseName::kEmpty: 获取所有数据库的集合
+    // - kMajorityReadConcern: 使用多数读关注，确保读取到已提交的数据
+    // - {}: 空的查询过滤器，获取所有分片集合
     auto collections = catalogClient->getShardedCollections(
         opCtx, DatabaseName::kEmpty, repl::ReadConcernLevel::kMajorityReadConcern, {});
     if (collections.empty()) {
+        // 如果集群中没有分片集合，则不需要进行任何拆分操作
+        // 返回空的拆分候选向量
         return SplitInfoVector{};
     }
 
+    // ========== 第三阶段：初始化拆分候选收集器 ==========
+    // 初始化拆分候选信息向量，用于收集所有需要拆分的 chunk 信息
     SplitInfoVector splitCandidates;
 
+    // ========== 第四阶段：随机化集合处理顺序 ==========
+    // 获取当前操作的客户端对象，用于访问伪随机数生成器
     auto client = opCtx->getClient();
+    // 随机打乱集合处理顺序，避免总是优先处理字典序靠前的集合
+    // 这种随机化有助于：
+    // 1. 均匀分布处理负载，避免某些集合总是优先处理
+    // 2. 减少因处理顺序固定导致的性能热点
+    // 3. 提高系统的整体公平性和均衡性
     std::shuffle(collections.begin(), collections.end(), client->getPrng().urbg());
 
+    // ========== 第五阶段：逐个处理分片集合 ==========
+    // 遍历所有分片集合，为每个集合检查并生成拆分候选
     for (const auto& coll : collections) {
+        // 提取集合的命名空间（数据库名.集合名）
         const NamespaceString& nss(coll.getNss());
 
+        // ========== 子步骤 5.1：获取集合的拆分候选 ==========
+        // 调用内部函数，分析单个集合的 zone 合规性并生成拆分候选
+        // 该函数会：
+        // 1. 获取集合的最新路由信息和 zone 配置
+        // 2. 检查 chunk 边界与 zone 边界的对齐情况
+        // 3. 计算违规 chunk 的拆分点
+        // 4. 返回该集合的所有拆分候选信息
         auto candidatesStatus = _getSplitCandidatesForCollection(opCtx, nss, shardStats);
+        
+        // ========== 子步骤 5.2：处理集合不存在的情况 ==========
         if (candidatesStatus == ErrorCodes::NamespaceNotFound) {
-            // Namespace got dropped before we managed to get to it, so just skip it
+            // 集合在处理过程中被删除（并发删除操作）
+            // 这是正常情况，直接跳过该集合继续处理下一个
+            // 不需要记录错误日志，因为集合删除是合法的管理操作
             continue;
         } else if (!candidatesStatus.isOK()) {
+            // ========== 子步骤 5.3：处理其他错误情况 ==========
+            // 处理集合时发生其他错误（如网络问题、权限问题、数据损坏等）
+            // 记录警告日志，但不终止整个拆分候选选择流程
+            // 这种错误隔离策略确保部分集合的问题不会影响其他集合的处理
             LOGV2_WARNING(21852,
                           "Unable to enforce zone range policy for collection",
-                          logAttrs(nss),
-                          "error"_attr = candidatesStatus.getStatus());
+                          logAttrs(nss),                           // 集合命名空间信息
+                          "error"_attr = candidatesStatus.getStatus());  // 具体错误详情
 
+            // 继续处理下一个集合，不因单个集合失败而终止
             continue;
         }
 
+        // 对于普通数据不均衡表，candidatesStatus.getValue() 通常为空向量， 
+        // 因此对于普通不均衡表，splitCandidates返回空
+
+        // ========== 子步骤 5.4：收集成功的拆分候选 ==========
+        // 将当前集合的拆分候选信息追加到总的拆分候选向量中
+        // 使用 move iterator 优化性能，避免不必要的数据复制
+        // insert + make_move_iterator 的组合实现了高效的批量移动插入
         splitCandidates.insert(splitCandidates.end(),
                                std::make_move_iterator(candidatesStatus.getValue().begin()),
                                std::make_move_iterator(candidatesStatus.getValue().end()));
     }
 
+    // ========== 第六阶段：返回所有拆分候选 ==========
+    // 返回收集到的所有拆分候选信息
+    // 每个 SplitInfo 包含：
+    // - 目标分片 ID
+    // - 集合命名空间
+    // - 集合版本信息
+    // - chunk 的当前边界（min, max）
+    // - 计算出的拆分点数组
+    // 调用方（通常是 Balancer::_splitChunksIfNeeded）将使用这些信息执行实际的 chunk 拆分操作
     return splitCandidates;
 }
 
@@ -658,6 +750,9 @@ StatusWith<MigrateInfosWithReason> BalancerChunkSelectionPolicy::selectChunksToM
  * 管理员将 zoneB 的起始范围从 M 改为 L，即 zoneB: [L, Z)。
  *   sh.updateZoneKeyRange("test.coll", { shardKey: "L" }, { shardKey: "Z" }, "zoneB")
  * 此时 chunk [L, N) 跨越了 zoneA 和 zoneB 的边界，属于 zone违规。
+ * 
+ * 
+ * // 普通的数据不均衡表，不会触发zone违规，最终会返回空的拆分候选
  */
 StatusWith<SplitInfoVector> BalancerChunkSelectionPolicy::_getSplitCandidatesForCollection(
     OperationContext* opCtx, const NamespaceString& nss, const ShardStatisticsVector& shardStats) {
@@ -682,6 +777,7 @@ StatusWith<SplitInfoVector> BalancerChunkSelectionPolicy::_getSplitCandidatesFor
     SplitCandidatesBuffer splitCandidates(nss, cm.getVersion());
 
     if (nss == NamespaceString::kLogicalSessionsNamespace && !zoneInfo.allZones().empty()) {
+        // 普通的数据不均衡表，不会触发zone违规，因此走这里，最终会返回空的拆分候选
         LOGV2_WARNING(4562401,
                       "Ignoring zones for the internal sessions collection.",
                       "nss"_attr = NamespaceString::kLogicalSessionsNamespace,

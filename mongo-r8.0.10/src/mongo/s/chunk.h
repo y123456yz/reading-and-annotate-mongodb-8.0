@@ -200,6 +200,7 @@ public:
 
     /**
      * Marks this chunk as jumbo. Only moves from false to true once and is used by the balancer.
+     * ShardingCatalogManager::splitOrMarkJumbo 如果chunk无法分割会调用它，标记为jumbo
      */
     void markAsJumbo() {
         _chunkInfo.markAsJumbo();
