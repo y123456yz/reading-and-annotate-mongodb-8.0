@@ -325,62 +325,202 @@ namespace {
 // generated at the time of commit.
 //
 // The "begin" and "end" iterators must remain valid until the active WriteUnitOfWork resolves.
+/**
+ * Oplog时间戳槽位预分配函数 - Doc-Locking存储引擎的时序一致性保障机制
+ * 
+ * 核心功能：
+ * 1. 为批量插入操作预先分配oplog时间戳槽位，确保时序正确性
+ * 2. 支持doc-locking存储引擎的乱序oplog写入能力，优化并发性能
+ * 3. 通知存储引擎每个新时间戳，维护时间戳的全局一致性
+ * 4. 提供异常回滚机制，确保预分配槽位在失败时能正确清理
+ * 5. 协调WriteUnitOfWork与oplog时间戳的生命周期管理
+ * 
+ * 设计原理：
+ * - 时序分离：将时间戳分配与实际oplog写入分离，提升并发度
+ * - 存储引擎适配：专门为doc-locking引擎设计，允许乱序物理写入
+ * - 异常安全：通过回滚机制确保失败时不会泄露时间戳槽位
+ * - 批量优化：一次性分配多个槽位，减少分配开销
+ * 
+ * 适用场景：
+ * - Doc-locking存储引擎的批量插入操作
+ * - 需要保证oplog时序一致性的写入场景
+ * - 高并发环境下的性能优化需求
+ * - 非事务环境的普通写入操作
+ * 
+ * 重要约束：
+ * - 仅适用于非多文档事务环境（事务有自己的时间戳管理）
+ * - 要求oplog未被禁用（本地数据库等场景不适用）
+ * - 迭代器必须在WriteUnitOfWork解析前保持有效
+ * - 存储引擎必须支持乱序时间戳写入
+ * 
+ * @param opCtx 操作上下文，包含事务状态、存储引擎信息等
+ * @param collection 目标集合获取句柄，提供集合元数据和命名空间信息
+ * @param begin 插入语句迭代器开始位置，指向第一个待插入文档
+ * @param end 插入语句迭代器结束位置，标记批次边界
+ */
+// Acquire optimes and fill them in for each item in the batch.  This must only be done for
+// doc-locking storage engines, which are allowed to insert oplog documents
+// out-of-timestamp-order.  For other storage engines, the oplog entries must be physically
+// written in timestamp order, so we defer optime assignment until the oplog is about to be
+// written. Multidocument transactions should not generate opTimes because they are
+// generated at the time of commit.
+//
+// The "begin" and "end" iterators must remain valid until the active WriteUnitOfWork resolves.
 void acquireOplogSlotsForInserts(OperationContext* opCtx,
                                  const CollectionAcquisition& collection,
+                                 // 给begin->end的迭代器范围内的每个InsertStatement分配oplog槽位    
                                  std::vector<InsertStatement>::iterator begin,
                                  std::vector<InsertStatement>::iterator end) {
+    // 事务状态断言：确保当前不在多文档事务中
+    // 多文档事务有自己的opTime生成机制，在事务提交时统一生成
+    // 避免与事务的时间戳管理机制产生冲突
     dassert(!opCtx->inMultiDocumentTransaction());
+    
+    // Oplog状态断言：确保当前集合的oplog记录未被禁用
+    // 某些特殊场景下oplog可能被禁用：
+    // 1. 本地数据库操作（local数据库不参与复制）
+    // 2. 初始化同步期间的特殊操作
+    // 3. 维护模式下的内部操作
     dassert(!repl::ReplicationCoordinator::get(opCtx)->isOplogDisabledFor(opCtx, collection.nss()));
 
     // Populate 'slots' with new optimes for each insert.
     // This also notifies the storage engine of each new timestamp.
+    // 计算批次大小：确定需要分配的oplog槽位数量
+    // 这个数量对应于批次中实际的文档数量
     auto batchSize = std::distance(begin, end);
+    
+    // 核心功能：批量获取oplog时间戳槽位
+    // getNextOpTimes执行以下关键操作：
+    // 1. 从oplog时间戳生成器获取连续的时间戳
+    // 2. 确保时间戳的全局唯一性和单调递增性
+    // 3. 通知存储引擎预留这些时间戳（对于doc-locking引擎）
+    // 4. 更新复制协调器的时间戳状态
     auto oplogSlots = repl::getNextOpTimes(opCtx, batchSize);
+    
+    // 时间戳分配：将获取的oplog槽位分配给各个插入语句
+    // 建立插入文档与其对应oplog时间戳之间的映射关系
     auto slot = oplogSlots.begin();
     for (auto it = begin; it != end; it++) {
+        // 为每个InsertStatement设置其对应的oplog槽位
+        // 这个槽位将在后续的oplog写入中使用
         it->oplogSlot = *slot++;
     }
 
     // If we abort this WriteUnitOfWork, we must make sure we never attempt to use these reserved
     // oplog slots again.
+    // 异常安全机制：注册WriteUnitOfWork回滚处理器
+    // 关键作用：
+    // 1. 当WriteUnitOfWork因异常而回滚时自动执行清理
+    // 2. 防止已分配但未使用的oplog槽位被意外重用
+    // 3. 维护oplog时间戳的一致性和完整性
+    // 4. 避免时间戳泄露导致的复制状态混乱
     shard_role_details::getRecoveryUnit(opCtx)->onRollback([begin, end](OperationContext* opCtx) {
+        // 回滚处理：清除所有已分配的oplog槽位
+        // 将每个InsertStatement的oplogSlot重置为空槽位
+        // 确保这些槽位不会在后续操作中被误用
         for (auto it = begin; it != end; it++) {
-            it->oplogSlot = OplogSlot();
+            it->oplogSlot = OplogSlot();  // 重置为默认的空槽位
         }
     });
+    
+    // 故障点支持：用于测试oplog槽位分配后的异常处理
+    // 这个故障点允许测试以下场景：
+    // 1. 在槽位分配完成后但实际插入前触发异常
+    // 2. 验证回滚机制是否正确清理预分配的槽位
+    // 3. 测试异常情况下的oplog一致性保证
     hangAndFailAfterDocumentInsertsReserveOpTimes.executeIf(
         [&](const BSONObj& data) {
+            // 暂停执行：等待故障点被禁用
             hangAndFailAfterDocumentInsertsReserveOpTimes.pauseWhileSet(opCtx);
+            
+            // 可选的异常触发：根据故障点配置决定是否抛出异常
             const auto skipFail = data["skipFail"];
             if (!skipFail || !skipFail.boolean()) {
+                // 抛出预定义的错误，用于测试异常处理路径
                 uasserted(51269,
                           "hangAndFailAfterDocumentInsertsReserveOpTimes fail point enabled");
             }
         },
         [&](const BSONObj& data) {
             // Check if the failpoint specifies no collection or matches the existing one.
+            // 故障点条件检查：确定是否应该触发故障点
+            // 支持针对特定集合的故障点配置，提供更精确的测试控制
             const auto fpNss = NamespaceStringUtil::parseFailPointData(data, "collectionNS");
             return fpNss.isEmpty() || collection.nss() == fpNss;
         });
 }
 }  // namespace
 
+/**
+ * 原子性文档插入执行函数 - MongoDB插入操作的底层原子实现
+ * 
+ * 核心功能：
+ * 1. 在单个WriteUnitOfWork中原子性地插入一批文档，确保全部成功或全部失败
+ * 2. 管理oplog时间戳分配策略，支持doc-locking和其他存储引擎的不同需求
+ * 3. 处理上限集合的特殊插入要求，避免多时间戳约束违反
+ * 4. 支持向量化插入的事务性复制，优化批量插入的oplog记录
+ * 5. 协调存储引擎写入和oplog记录的时序一致性
+ * 
+ * 设计原理：
+ * - 原子性保证：使用WriteUnitOfWork确保插入操作的原子性
+ * - 时间戳管理：根据存储引擎类型选择预分配或延迟分配oplog时间戳
+ * - 性能优化：支持向量化插入减少oplog条目数量
+ * - 一致性维护：确保oplog记录与实际数据写入的时序一致性
+ * 
+ * 适用场景：
+ * - 批量插入操作的底层实现
+ * - 需要原子性保证的多文档插入
+ * - 时序集合的专门插入处理
+ * - 副本集同步和迁移数据插入
+ * 
+ * 重要约束：
+ * - 调用者负责写入冲突重试，此函数不处理WriteConflictException
+ * - 上限集合需要预留时间戳以避免多时间戳约束违反
+ * - 事务环境和非事务环境有不同的oplog处理策略
+ * 
+ * @param opCtx 操作上下文，包含事务状态、复制设置等
+ * @param collection 目标集合的获取句柄，包含集合指针和锁信息
+ * @param begin 插入语句迭代器的开始位置
+ * @param end 插入语句迭代器的结束位置
+ * @param fromMigrate 是否来自迁移操作，影响oplog记录方式
+ */
 void insertDocumentsAtomically(OperationContext* opCtx,
                                const CollectionAcquisition& collection,
                                std::vector<InsertStatement>::iterator begin,
                                std::vector<InsertStatement>::iterator end,
                                bool fromMigrate) {
+    // 计算当前批次的文档数量，用于后续的优化决策和资源分配
     auto batchSize = std::distance(begin, end);
+    
+    // 获取复制协调器，用于检查oplog配置和复制状态
     auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    
+    // 事务状态检查：确定当前是否在多文档事务中
     const bool inTransaction = opCtx->inMultiDocumentTransaction();
+    
+    // Oplog状态检查：确定是否需要记录oplog条目
+    // oplog可能因为以下原因被禁用：
+    // 1. 本地数据库操作（不参与复制）
+    // 2. 初始化期间的特殊操作
+    // 3. 维护模式下的操作
     const bool oplogDisabled = replCoord->isOplogDisabledFor(opCtx, collection.nss());
+    
+    // Oplog分组策略初始化：控制oplog条目的聚合方式
     WriteUnitOfWork::OplogEntryGroupType oplogEntryGroupType = WriteUnitOfWork::kDontGroup;
 
+    // 功能兼容性版本检查：确定是否启用向量化插入的事务性复制
     const auto fcvSnapshot = serverGlobalParams.featureCompatibility.acquireFCVSnapshot();
     const bool replicateVectoredInsertsTransactionally = fcvSnapshot.isVersionInitialized() &&
         repl::feature_flags::gReplicateVectoredInsertsTransactionally.isEnabled(fcvSnapshot);
+        
     // For multiple inserts not part of a multi-document transaction, the inserts will be
     // batched into a single applyOps oplog entry.
+    // 向量化插入优化：将多个插入操作合并为单个applyOps oplog条目
+    // 条件：
+    // 1. 启用了向量化插入事务性复制功能
+    // 2. 不在多文档事务中（事务有自己的oplog管理）
+    // 3. 批次大小大于1（单个插入无需优化）
+    // 4. oplog未被禁用
     if (replicateVectoredInsertsTransactionally && !inTransaction && batchSize > 1 &&
         !oplogDisabled) {
         oplogEntryGroupType = WriteUnitOfWork::kGroupForPossiblyRetryableOperations;
@@ -388,24 +528,58 @@ void insertDocumentsAtomically(OperationContext* opCtx,
 
     // Intentionally not using writeConflictRetry. That is handled by the caller so it can react to
     // oversized batches.
+    // 写入单元初始化：创建原子性写入单元，支持oplog分组
+    // 注意：故意不使用writeConflictRetry，写入冲突由调用者处理
+    // 这样调用者可以对超大批次做出适当的反应（如分批处理）
     WriteUnitOfWork wuow(opCtx, oplogEntryGroupType);
 
     // Capped collections may implicitly generate a delete in the same unit of work as an
     // insert. In order to avoid that delete generating a second timestamp in a WUOW which
     // has un-timestamped writes (which is a violation of multi-timestamp constraints),
     // we must reserve the timestamp for the insert in advance.
+    // 上限集合的时间戳预留机制：
+    // 核心问题：上限集合插入可能触发隐式删除（删除最老的文档）
+    // 约束：一个WriteUnitOfWork中不能有多个时间戳（多时间戳约束）
+    // 解决方案：预先为插入操作分配oplog时间戳
+    // 适用条件：
+    // 1. 不使用向量化插入分组（向量化插入有自己的时间戳管理）
+    // 2. 不在事务中（事务有统一的时间戳管理）
+    // 3. oplog未被禁用
+    // 4. 满足以下任一条件：
+    //    - 未启用向量化插入功能
+    //    - 是上限集合（需要特殊处理）
     if (oplogEntryGroupType != WriteUnitOfWork::kGroupForPossiblyRetryableOperations &&
         !inTransaction && !oplogDisabled &&
         (!replicateVectoredInsertsTransactionally || collection.getCollectionPtr()->isCapped())) {
+        // 为插入操作预分配oplog时间戳槽位
+        // 这确保了doc-locking存储引擎可以按正确的时间戳顺序写入oplog
         acquireOplogSlotsForInserts(opCtx, collection, begin, end);
     }
 
+    // 执行底层文档插入操作
+    // 核心功能：
+    // 1. 将文档写入存储引擎
+    // 2. 更新索引
+    // 3. 触发OpObserver事件（生成oplog等）
+    // 4. 处理上限集合的容量限制
+    // 参数说明：
+    // - opCtx: 操作上下文
+    // - collection.getCollectionPtr(): 集合指针
+    // - begin, end: 文档迭代器范围
+    // - &CurOp::get(opCtx)->debug(): 调试信息收集器
+    // - fromMigrate: 是否来自迁移（影响oplog记录）
     uassertStatusOK(collection_internal::insertDocuments(opCtx,
                                                          collection.getCollectionPtr(),
                                                          begin,
                                                          end,
                                                          &CurOp::get(opCtx)->debug(),
                                                          fromMigrate));
+    
+    // 提交写入单元：
+    // 1. 将所有更改持久化到存储引擎
+    // 2. 如果使用了oplog分组，将生成合并的applyOps条目
+    // 3. 更新复制状态和最后操作时间戳
+    // 4. 释放预分配的oplog时间戳（如果有）
     wuow.commit();
 }
 

@@ -62,6 +62,7 @@ ReplicationCoordinator* ReplicationCoordinator::get(ServiceContext& service) {
     return getReplicationCoordinator(service).get();
 }
 
+//// 获取复制协调器，用于检查oplog配置和复制状态
 ReplicationCoordinator* ReplicationCoordinator::get(OperationContext* ctx) {
     return get(ctx->getClient()->getServiceContext());
 }
