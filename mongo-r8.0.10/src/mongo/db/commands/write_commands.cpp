@@ -287,49 +287,89 @@ public:
             return request().getNamespace();
         }
 
+        /**
+         * insert命令的核心执行函数 - 处理所有insert操作的入口点
+         * 
+         * 核心功能：
+         * 1. 执行insert命令的完整生命周期管理和验证处理
+         * 2. 支持多种特殊场景：FLE加密、时序集合、普通集合的插入操作
+         * 3. 处理事务验证和写入权限检查，确保数据安全性
+         * 4. 管理执行优先级和故障点调试支持
+         * 5. 统一的错误处理和异常传播机制
+         * 
+         * 执行流程：
+         * - 预处理：大小验证、事务检查、加密处理
+         * - 路由分发：根据集合类型选择不同的执行路径
+         * - 核心执行：调用write_ops_exec::performInserts完成实际写入
+         * - 后处理：构建响应、错误处理、状态跟踪
+         * 
+         * 特殊处理：
+         * - FLE(Field Level Encryption)：支持字段级加密的文档插入
+         * - 时序集合：针对时间序列数据的优化插入处理
+         * - 故障点：支持测试和调试的挂起点机制
+         * - 优先级：为特定系统集合设置低优先级处理
+         * 
+         * @param opCtx 操作上下文，包含会话、事务、权限等信息
+         * @return InsertCommandReply 插入操作的完整响应结果
+         * @throws DBException 各种数据库异常，包括权限、验证、执行失败等
+         */
         write_ops::InsertCommandReply typedRun(OperationContext* opCtx) final try {
             // On debug builds, verify that the estimated size of the insert command is at least as
             // large as the size of the actual, serialized insert command. This ensures that the
             // logic which estimates the size of insert commands is correct.
+            // 调试构建中验证insert命令估算大小的正确性
             dassert(write_ops::verifySizeEstimate(request(), &unparsedRequest()));
 
+            // 执行事务相关验证：检查事务状态、多文档事务约束等
             doTransactionValidationForWrites(opCtx, ns());
+            
+            // FLE(Field Level Encryption)加密字段处理分支
             if (request().getEncryptionInformation().has_value()) {
                 {
                     // Flag set here and in fle_crud.cpp since this only executes on a mongod.
+                    // 设置诊断信息省略标志，保护加密相关的敏感信息不被记录
                     stdx::lock_guard<Client> lk(*opCtx->getClient());
                     CurOp::get(opCtx)->setShouldOmitDiagnosticInformation_inlock(lk, true);
                 }
 
+                // 检查FLE处理状态，如果尚未处理则进行FLE预处理
                 if (!request().getEncryptionInformation()->getCrudProcessed().value_or(false)) {
                     write_ops::InsertCommandReply insertReply;
+                    // 执行FLE特定的插入处理，可能涉及密钥获取、字段加密等
                     auto batch = processFLEInsert(opCtx, request(), &insertReply);
                     if (batch == FLEBatchResult::kProcessed) {
+                        // FLE处理完成，直接返回结果，跳过后续普通插入流程
                         return insertReply;
                     }
                 }
             }
 
+            // 时序集合(Time-series)特殊处理分支
             if (auto [isTimeseriesViewRequest, _] =
                     timeseries::isTimeseriesViewRequest(opCtx, request());
                 isTimeseriesViewRequest) {
                 // Re-throw parsing exceptions to be consistent with CmdInsert::Invocation's
                 // constructor.
                 try {
+                    // 执行时序集合专用的写入逻辑，包括bucket管理、时间索引优化等
                     return write_ops_exec::performTimeseriesWrites(opCtx, request());
                 } catch (DBException& ex) {
+                    // 为时序集合异常添加上下文信息，便于错误诊断
                     ex.addContext(str::stream()
-                                  << "time-series insert failed: " << ns().toStringForErrorMsg());
+                                << "time-series insert failed: " << ns().toStringForErrorMsg());
                     throw;
                 }
             }
 
+            // 执行优先级管理：为特定系统集合设置低优先级
             boost::optional<ScopedAdmissionPriority<ExecutionAdmissionContext>> priority;
             if (request().getNamespace() == NamespaceString::kConfigSampledQueriesNamespace ||
                 request().getNamespace() == NamespaceString::kConfigSampledQueriesDiffNamespace) {
+                // 查询采样相关的系统集合使用低优先级，避免影响正常业务
                 priority.emplace(opCtx, AdmissionContext::Priority::kLow);
             }
 
+            // 故障点调试支持：允许在写入前暂停，用于测试和调试
             if (hangInsertBeforeWrite.shouldFail([&](const BSONObj& data) {
                     const auto fpNss = NamespaceStringUtil::parseFailPointData(data, "ns"_sd);
                     return fpNss == request().getNamespace();
@@ -337,17 +377,20 @@ public:
                 hangInsertBeforeWrite.pauseWhileSet();
             }
 
+            // 核心执行：调用实际的插入执行引擎
             auto reply = write_ops_exec::performInserts(opCtx, request());
 
+            // 构建标准化的命令响应
             write_ops::InsertCommandReply insertReply;
             populateReply(opCtx,
-                          !request().getWriteCommandRequestBase().getOrdered(),
-                          request().getDocuments().size(),
-                          std::move(reply),
-                          &insertReply);
+                        !request().getWriteCommandRequestBase().getOrdered(),  // 是否无序执行
+                        request().getDocuments().size(),                       // 文档数量
+                        std::move(reply),                                       // 执行结果
+                        &insertReply);                                          // 输出响应
 
             return insertReply;
         } catch (const DBException& ex) {
+            // 统一异常处理：记录非主节点错误，用于复制集故障转移逻辑
             NotPrimaryErrorTracker::get(opCtx->getClient()).recordError(ex.code());
             throw;
         }

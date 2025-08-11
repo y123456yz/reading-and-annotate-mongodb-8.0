@@ -1143,6 +1143,33 @@ void logOperationAndProfileIfNeeded(OperationContext* opCtx, CurOp* curOp) {
     }
 }
 
+/**
+ * insert操作的核心执行函数 - MongoDB插入操作的完整实现
+ * 
+ * 核心功能：
+ * 1. 处理批量insert操作的完整生命周期管理和错误处理
+ * 2. 支持多种操作源：普通插入、时序集合插入、迁移数据插入
+ * 3. 实现批量处理策略：自动分批、大小控制、重试机制
+ * 4. 管理事务状态：可重试写入检测、语句ID处理、事务参与者协调
+ * 5. 提供完整的监控和统计：性能指标、错误追踪、操作计数
+ * 
+ * 执行策略：
+ * - 批量优化：根据文档大小和数量自动分批，提升写入性能
+ * - 错误处理：分类处理各种异常情况，支持有序/无序执行模式
+ * - 重试支持：检测并处理可重试写入，避免重复执行
+ * - 文档修正：处理时间戳、字段验证、加密等特殊需求
+ * 
+ * 特殊处理：
+ * - 可重试写入：通过stmtId检测重复执行并返回缓存结果
+ * - 时序集合：针对时间序列数据的特殊插入路径
+ * - 文档验证：支持模式验证和安全内容验证的可选禁用
+ * - 批量分组：智能控制批次大小以优化性能和内存使用
+ * 
+ * @param opCtx 操作上下文，包含会话、事务、权限等运行时信息
+ * @param wholeOp 完整的insert命令请求，包含所有待插入文档
+ * @param source 操作源类型，标识数据来源（普通/时序/迁移等）
+ * @return WriteResult 插入操作的完整结果，包含成功数量、错误信息等
+ */
 WriteResult performInserts(OperationContext* opCtx,
                            const write_ops::InsertCommandRequest& wholeOp,
                            OperationSource source) {
@@ -1152,6 +1179,7 @@ WriteResult performInserts(OperationContext* opCtx,
     invariant(!shard_role_details::getLocker(opCtx)->inAWriteUnitOfWork() ||
               (txnParticipant && opCtx->inMultiDocumentTransaction()));
 
+    // 获取当前操作的CurOp实例，用于性能监控和统计
     auto& curOp = *CurOp::get(opCtx);
     ON_BLOCK_EXIT([&] {
         // Timeseries inserts already did as part of performTimeseriesWrites.
@@ -1172,6 +1200,7 @@ WriteResult performInserts(OperationContext* opCtx,
 
     // Timeseries inserts already did as part of performTimeseriesWrites.
     if (source != OperationSource::kTimeseriesInsert) {
+        // 为非时序插入设置操作上下文和监控信息
         stdx::lock_guard<Client> lk(*opCtx->getClient());
         curOp.setNS_inlock(wholeOp.getNamespace());
         curOp.setLogicalOp_inlock(LogicalOp::opInsert);
@@ -1182,26 +1211,34 @@ WriteResult performInserts(OperationContext* opCtx,
     // If we are performing inserts from tenant migrations, skip checking if the user is allowed to
     // write to the namespace.
     if (!repl::tenantMigrationInfo(opCtx)) {
+        // 权限检查：验证用户是否有权限写入目标命名空间
         uassertStatusOK(userAllowedWriteNS(opCtx, wholeOp.getNamespace()));
     }
 
+    // 获取文档验证配置：确定是否禁用模式验证和安全内容验证
     const auto [disableDocumentValidation, fleCrudProcessed] = getDocumentValidationFlags(
         opCtx, wholeOp.getWriteCommandRequestBase(), wholeOp.getDbName().tenantId());
 
+    // 根据配置禁用文档模式验证
     DisableDocumentSchemaValidationIfTrue docSchemaValidationDisabler(opCtx,
                                                                       disableDocumentValidation);
 
+    // 根据配置禁用安全内容验证（FLE加密相关）
     DisableSafeContentValidationIfTrue safeContentValidationDisabler(
         opCtx, disableDocumentValidation, fleCrudProcessed);
 
+    // 初始化最后操作修正器，用于维护副本集一致性
     LastOpFixer lastOpFixer(opCtx);
 
+    // 初始化写入结果容器
     WriteResult out;
     out.results.reserve(wholeOp.getDocuments().size());
 
+    // 可重试写入统计跟踪
     bool containsRetry = false;
     ON_BLOCK_EXIT([&] { updateRetryStats(opCtx, containsRetry); });
 
+    // 批量处理相关变量初始化
     size_t nextOpIndex = 0;
     size_t bytesInBatch = 0;
     std::vector<InsertStatement> batch;
@@ -1214,15 +1251,19 @@ WriteResult performInserts(OperationContext* opCtx,
     const bool bypassEmptyTsReplacement = (source == OperationSource::kFromMigrate) ||
         static_cast<bool>(wholeOp.getBypassEmptyTsReplacement());
 
+    // 主循环：遍历所有待插入的文档
     for (auto&& doc : wholeOp.getDocuments()) {
         const auto currentOpIndex = nextOpIndex++;
         const bool isLastDoc = (&doc == &wholeOp.getDocuments().back());
         bool containsDotsAndDollarsField = false;
 
+        // 文档修正：处理_id字段、时间戳、特殊字符等
         auto fixedDoc = fixDocumentForInsert(
             opCtx, doc, bypassEmptyTsReplacement, &containsDotsAndDollarsField);
 
+        // 获取当前操作的语句ID，用于可重试写入
         const StmtId stmtId = getStmtIdForWriteOp(opCtx, wholeOp, currentOpIndex);
+        // 检查是否为已执行的可重试写入
         const bool wasAlreadyExecuted = opCtx->isRetryableWrite() &&
             txnParticipant.checkStatementExecutedNoOplogEntryFetch(opCtx, stmtId);
 
@@ -1234,8 +1275,10 @@ WriteResult performInserts(OperationContext* opCtx,
             // Similarly, if the insert was already executed as part of a retryable write, flush the
             // current batch to preserve the error results order.
         } else {
+            // 正常处理路径：准备文档插入
             BSONObj toInsert = fixedDoc.getValue().isEmpty() ? doc : std::move(fixedDoc.getValue());
 
+            // 统计包含特殊字符的字段
             if (containsDotsAndDollarsField)
                 dotsAndDollarsFieldsCounters.inserts.increment();
 
@@ -1246,12 +1289,15 @@ WriteResult performInserts(OperationContext* opCtx,
                                    : std::vector<StmtId>{stmtId},
                                toInsert);
 
+            // 累计当前批次的字节数
             bytesInBatch += batch.back().doc.objsize();
 
+            // 批次大小控制：如果未达到限制且不是最后一个文档，继续累积
             if (!isLastDoc && batch.size() < maxBatchSize && bytesInBatch < maxBatchBytes)
                 continue;  // Add more to batch before inserting.
         }
 
+        // 执行批量插入并处理错误
         out.canContinue = insertBatchAndHandleErrors(opCtx,
                                                      wholeOp.getNamespace(),
                                                      wholeOp.getCollectionUUID(),
@@ -1272,6 +1318,7 @@ WriteResult performInserts(OperationContext* opCtx,
         // Revisit any conditions that may have caused the batch to be flushed. In those cases,
         // append the appropriate result to the output.
         if (!fixedDoc.isOK()) {
+            // 处理文档修正失败的情况
             globalOpCounters.gotInsert();
             ServerWriteConcernMetrics::get(opCtx)->recordWriteConcernForInsert(
                 opCtx->getWriteConcern());
@@ -1279,6 +1326,7 @@ WriteResult performInserts(OperationContext* opCtx,
                 uassertStatusOK(fixedDoc.getStatus());
                 MONGO_UNREACHABLE;
             } catch (const DBException& ex) {
+                // 生成错误并判断是否可以继续
                 out.canContinue = handleError(opCtx,
                                               ex,
                                               wholeOp.getNamespace(),
@@ -1292,12 +1340,14 @@ WriteResult performInserts(OperationContext* opCtx,
                 break;
             }
         } else if (wasAlreadyExecuted) {
+            // 处理可重试写入的重复执行情况
             containsRetry = true;
             RetryableWritesStats::get(opCtx)->incrementRetriedStatementsCount();
             out.retriedStmtIds.push_back(stmtId);
             out.results.emplace_back(makeWriteResultForInsertOrDeleteRetry());
         }
     }
+    // 确保所有批次都已处理完毕
     invariant(batch.empty());
 
     return out;

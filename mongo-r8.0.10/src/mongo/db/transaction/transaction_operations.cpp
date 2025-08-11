@@ -101,6 +101,29 @@ std::vector<BSONObj> packOperationsIntoApplyOps(
 
 MONGO_FAIL_POINT_DEFINE(hangAfterLoggingApplyOpsForTransaction);
 
+/**
+ * 事务语句打包为applyOps格式的核心函数
+ * 
+ * 核心功能：
+ * 1. 将一组事务操作语句序列化为BSON格式并打包到applyOps数组中
+ * 2. 收集所有语句的stmtId，用于可重试写入和去重处理
+ * 3. 提取findAndModify操作的pre/post图像，准备写入config.image_collection
+ * 4. 验证操作数量与语句数量的一致性，确保数据完整性
+ * 5. 处理BSON大小限制，防止超过16MB限制导致的异常
+ * 
+ * 设计要点：
+ * - 数据一致性：确保每个语句都有对应的操作，防止数据丢失
+ * - 内存管理：高效处理大量操作的序列化和打包
+ * - 异常处理：将BSONObjectTooLarge转换为TransactionTooLarge异常
+ * - 图像提取：支持事务中findAndModify操作的变更前后图像记录
+ * 
+ * @param stmtBegin 事务语句迭代器开始位置
+ * @param stmtEnd 事务语句迭代器结束位置
+ * @param operations 预先序列化的操作BSON对象向量
+ * @param applyOpsBuilder 用于构建applyOps命令的BSON构建器
+ * @param stmtIdsWritten 输出参数，收集所有写入语句的stmtId
+ * @param imageToWrite 输出参数，提取的pre/post图像数据
+ */
 // static
 void TransactionOperations::packTransactionStatementsForApplyOps(
     std::vector<TransactionOperation>::const_iterator stmtBegin,
@@ -109,25 +132,44 @@ void TransactionOperations::packTransactionStatementsForApplyOps(
     BSONObjBuilder* applyOpsBuilder,
     std::vector<StmtId>* stmtIdsWritten,
     boost::optional<repl::ReplOperation::ImageBundle>* imageToWrite) {
+    
+    // 数据一致性验证：确保操作数量与语句数量严格匹配
     tassert(6278508,
             "Number of operations does not match the number of transaction statements",
             operations.size() == static_cast<size_t>(stmtEnd - stmtBegin));
 
+    // 初始化操作迭代器，用于并行遍历操作和语句
     auto operationsIter = operations.begin();
+    
+    // 构建applyOps数组：创建BSON数组构建器，所有操作将被打包到"applyOps"字段中
     BSONArrayBuilder opsArray(applyOpsBuilder->subarrayStart("applyOps"_sd));
+    
+    // 主处理循环：同步遍历事务语句和对应的操作
     for (auto stmtIter = stmtBegin; stmtIter != stmtEnd; stmtIter++) {
         const auto& stmt = *stmtIter;
+        
+        // 添加序列化操作：将预先序列化的BSON操作对象添加到applyOps数组
         opsArray.append(*operationsIter++);
+        
+        // 收集语句ID：获取当前语句的所有stmtId并添加到输出向量中
+        // 这些ID用于可重试写入的去重和幂等性保证
         const auto stmtIds = stmt.getStatementIds();
         stmtIdsWritten->insert(stmtIdsWritten->end(), stmtIds.begin(), stmtIds.end());
+        
+        // 提取pre/post图像：如果当前语句是findAndModify操作，提取变更前后的文档图像
+        // 这些图像将被存储到config.image_collection中，用于变更流和审计功能
         stmt.extractPrePostImageForTransaction(imageToWrite);
     }
+    
+    // 完成BSON数组构建并处理大小限制异常
     try {
         // BSONArrayBuilder will throw a BSONObjectTooLarge exception if we exceeded the max BSON
         // size.
         opsArray.done();
     } catch (const AssertionException& e) {
         // Change the error code to TransactionTooLarge if it is BSONObjectTooLarge.
+        // 异常转换：将BSON大小超限异常转换为更具语义的事务过大异常
+        // 这样客户端可以更好地理解和处理错误情况
         uassert(ErrorCodes::TransactionTooLarge,
                 e.reason(),
                 e.code() != ErrorCodes::BSONObjectTooLarge);

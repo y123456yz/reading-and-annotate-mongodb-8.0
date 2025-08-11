@@ -721,6 +721,38 @@ bool _skipOplogOps(const bool isOplogDisabled,
 
 }  // namespace
 
+/**
+ * 插入操作的观察者函数 - MongoDB oplog记录的核心入口
+ * 
+ * 核心功能：
+ * 1. 处理单个或批量文档插入操作的oplog记录
+ * 2. 支持三种不同的写入模式：普通写入、批量写入、多文档事务
+ * 3. 处理分片环境下的resharding目标分片路由
+ * 4. 管理可重试写入的语句ID和会话状态更新
+ * 5. 处理租户迁移场景下的元数据记录
+ * 
+ * 写入模式处理：
+ * - 普通写入：直接记录到oplog，支持链式oplog条目
+ * - 批量写入：累积操作到BatchedWriteContext，延迟批量提交
+ * - 多文档事务：添加到TransactionParticipant，事务提交时统一处理
+ * 
+ * 分片支持：
+ * - 通过ShardingWriteRouter计算resharding目标分片
+ * - 处理chunk迁移过程中的文档路由
+ * 
+ * 可重试写入：
+ * - 记录stmtId用于去重和幂等性保证
+ * - 更新config.transactions表维护会话状态
+ * 
+ * @param opCtx 操作上下文，包含会话、事务、锁等信息
+ * @param coll 目标集合的指针，包含命名空间和UUID信息
+ * @param first 插入语句迭代器的开始位置
+ * @param last 插入语句迭代器的结束位置
+ * @param recordIds 可选的记录ID列表，用于存储引擎层面的记录标识
+ * @param fromMigrate 标识每个插入是否来自chunk迁移的布尔值列表
+ * @param defaultFromMigrate 默认的迁移标志，当fromMigrate为空时使用
+ * @param opAccumulator 可选的操作状态累积器，收集opTime等执行结果
+ */
 void OpObserverImpl::onInserts(OperationContext* opCtx,
                                const CollectionPtr& coll,
                                std::vector<InsertStatement>::const_iterator first,
@@ -729,48 +761,63 @@ void OpObserverImpl::onInserts(OperationContext* opCtx,
                                std::vector<bool> fromMigrate,
                                bool defaultFromMigrate,
                                OpStateAccumulator* opAccumulator) {
+    // 获取集合命名空间和基础环境信息
     const auto& nss = coll->ns();
     auto replCoord = repl::ReplicationCoordinator::get(opCtx);
     const bool isOplogDisabled = replCoord->isOplogDisabledFor(opCtx, nss);
+    
+    // 检查当前操作的事务和批量写入状态
     auto txnParticipant = TransactionParticipant::get(opCtx);
     const bool inMultiDocumentTransaction =
         txnParticipant && !isOplogDisabled && txnParticipant.transactionIsOpen();
     auto& batchedWriteContext = BatchedWriteContext::get(opCtx);
     const bool inBatchedWrite = batchedWriteContext.writesAreBatched();
 
+    // 早期退出检查：如果不需要记录oplog，直接返回
     if (_skipOplogOps(
             isOplogDisabled, inBatchedWrite, inMultiDocumentTransaction, nss, first->stmtIds)) {
         return;
     }
 
+    // 获取集合UUID，用于oplog条目的标识
     const auto& uuid = coll->uuid();
 
+    // 初始化oplog时间记录和分片路由
     std::vector<repl::OpTime> opTimeList;
     repl::OpTime lastOpTime;
-
     auto shardingWriteRouter = std::make_unique<ShardingWriteRouter>(opCtx, nss);
 
     if (inBatchedWrite) {
+        // 批量写入模式：将操作累积到BatchedWriteContext中
         dassert(!defaultFromMigrate ||
                 std::all_of(
                     fromMigrate.begin(), fromMigrate.end(), [](bool migrate) { return migrate; }));
+        // 设置批量操作的默认迁移标志
         batchedWriteContext.setDefaultFromMigrate(defaultFromMigrate);
 
+        // 遍历每个插入语句，构建批量操作
         size_t i = 0;
         for (auto iter = first; iter != last; iter++) {
+            // 提取文档的分片键和ID，用于oplog记录
             const auto docKey = getDocumentKey(coll, iter->doc).getShardKeyAndId();
+            // 创建插入操作的oplog条目
             auto operation = MutableOplogEntry::makeInsertOperation(nss, uuid, iter->doc, docKey);
+            // 设置resharding目标分片（如果适用）
             operation.setDestinedRecipient(
                 shardingWriteRouter->getReshardingDestinedRecipient(iter->doc));
 
+            // 设置迁移标志和记录ID
             operation.setFromMigrateIfTrue(fromMigrate[std::distance(first, iter)]);
             if (!recordIds.empty()) {
                 operation.setRecordId(recordIds[i++]);
             }
+            // 设置可重试写入的语句ID
             operation.setInitializedStatementIds(iter->stmtIds);
+            // 将操作添加到批量上下文中
             batchedWriteContext.addBatchedOperation(opCtx, operation);
         }
     } else if (inMultiDocumentTransaction) {
+        // 多文档事务模式：将操作添加到事务参与者中
         invariant(!defaultFromMigrate);
 
         // Do not add writes to the profile collection to the list of transaction operations, since
@@ -781,27 +828,33 @@ void OpObserverImpl::onInserts(OperationContext* opCtx,
             return;
         }
 
+        // 检查是否为可重试内部事务
         const bool inRetryableInternalTransaction =
             isInternalSessionForRetryableWrite(*opCtx->getLogicalSessionId());
 
+        // 遍历每个插入语句，构建事务操作
         size_t i = 0;
         for (auto iter = first; iter != last; iter++) {
+            // 提取文档键和创建操作条目
             const auto docKey = getDocumentKey(coll, iter->doc).getShardKeyAndId();
             auto operation = MutableOplogEntry::makeInsertOperation(nss, uuid, iter->doc, docKey);
             if (!recordIds.empty()) {
                 operation.setRecordId(recordIds[i++]);
             }
+            // 为可重试内部事务设置语句ID
             if (inRetryableInternalTransaction) {
                 operation.setInitializedStatementIds(iter->stmtIds);
             }
+            // 设置分片路由信息
             operation.setDestinedRecipient(
                 shardingWriteRouter->getReshardingDestinedRecipient(iter->doc));
 
+            // 设置迁移标志并添加到事务操作中
             operation.setFromMigrateIfTrue(fromMigrate[std::distance(first, iter)]);
-
             txnParticipant.addTransactionOperation(opCtx, operation);
         }
     } else {
+        // 普通写入模式：直接记录到oplog
         // Ensure well-formed embedded ReplOperation for logging.
         // This means setting optype, nss, and object at the minimum.
         MutableOplogEntry oplogEntryTemplate;
@@ -811,9 +864,11 @@ void OpObserverImpl::onInserts(OperationContext* opCtx,
         oplogEntryTemplate.setUuid(uuid);
         oplogEntryTemplate.setObject({});
         oplogEntryTemplate.setFromMigrateIfTrue(defaultFromMigrate);
+        // 设置墙上时钟时间
         Date_t lastWriteDate = getWallClockTimeForOpLog(opCtx);
         oplogEntryTemplate.setWallClockTime(lastWriteDate);
 
+        // 调用内部函数记录插入操作到oplog
         opTimeList = _logInsertOps(opCtx,
                                    &oplogEntryTemplate,
                                    first,
@@ -826,24 +881,29 @@ void OpObserverImpl::onInserts(OperationContext* opCtx,
         if (!opTimeList.empty())
             lastOpTime = opTimeList.back();
 
+        // 将oplog时间添加到操作上下文的保留时间列表中
         auto& times = OpObserver::Times::get(opCtx).reservedOpTimes;
         using std::begin;
         using std::end;
         times.insert(end(times), begin(opTimeList), end(opTimeList));
 
+        // 收集所有写入语句的ID，用于会话状态更新
         std::vector<StmtId> stmtIdsWritten;
         std::for_each(first, last, [&](const InsertStatement& stmt) {
             stmtIdsWritten.insert(stmtIdsWritten.end(), stmt.stmtIds.begin(), stmt.stmtIds.end());
         });
 
+        // 更新会话事务记录，用于可重试写入和会话管理
         SessionTxnRecord sessionTxnRecord;
         sessionTxnRecord.setLastWriteOpTime(lastOpTime);
         sessionTxnRecord.setLastWriteDate(lastWriteDate);
         onWriteOpCompleted(opCtx, stmtIdsWritten, sessionTxnRecord, nss);
     }
 
+    // 如果提供了操作累积器，设置执行结果
     if (opAccumulator) {
         opAccumulator->insertOpTimes = std::move(opTimeList);
+        // 将分片写入路由器存储到累积器装饰器中，供后续处理使用
         shardingWriteRouterOpStateAccumulatorDecoration(opAccumulator) =
             std::move(shardingWriteRouter);
     }
