@@ -581,8 +581,40 @@ bool getFleCrudProcessed(OperationContext* opCtx,
     return false;
 }
 
-/**
+/** performInserts 调用
  * Returns true if caller should try to insert more documents. Does nothing else if batch is empty.
+ */
+/**
+ * 批量插入操作的核心执行和错误处理函数 - MongoDB插入操作的底层实现
+ * 
+ * 核心功能：
+ * 1. 执行单个批次的文档插入操作，支持原子性和非原子性两种模式
+ * 2. 处理集合的自动创建和获取，确保目标集合存在
+ * 3. 实现完整的错误处理机制，包括事务回滚和错误恢复
+ * 4. 支持多种操作源：普通插入、时序集合插入、迁移数据插入
+ * 5. 管理写入单元的生命周期和oplog记录的一致性
+ * 
+ * 执行策略：
+ * - 原子性优先：对于非上限集合和非事务场景，优先尝试批量原子插入
+ * - 降级处理：原子插入失败时自动降级为逐个插入处理
+ * - 集合管理：自动处理集合不存在的情况，按需创建集合
+ * - 锁管理：合理控制锁的持有和释放，避免长时间锁定
+ * 
+ * 特殊处理：
+ * - 上限集合：必须逐个插入以保证插入顺序的强制性
+ * - 事务环境：在事务中的插入操作需要特殊的错误处理
+ * - 时序集合：针对时间序列数据的特殊验证和处理
+ * - 迁移数据：来自迁移的数据禁止隐式集合创建
+ * 
+ * @param opCtx 操作上下文，包含会话、事务、权限等运行时信息
+ * @param nss 目标命名空间，指定要插入的集合
+ * @param collectionUUID 可选的集合UUID，用于验证集合一致性
+ * @param ordered 是否为有序插入，影响错误处理和继续策略
+ * @param batch 待插入的文档批次，包含语句ID和文档内容
+ * @param source 操作源类型，标识数据来源（普通/时序/迁移等）
+ * @param lastOpFixer 最后操作修正器，用于维护副本集一致性
+ * @param out 输出结果容器，收集插入结果和错误信息
+ * @return bool 是否可以继续处理后续操作（用于批量处理的流程控制）
  */
 bool insertBatchAndHandleErrors(OperationContext* opCtx,
                                 const NamespaceString& nss,
@@ -592,11 +624,14 @@ bool insertBatchAndHandleErrors(OperationContext* opCtx,
                                 OperationSource source,
                                 LastOpFixer* lastOpFixer,
                                 WriteResult* out) {
+    // 早期退出检查：如果批次为空，直接返回可以继续
     if (batch.empty())
         return true;
 
+    // 获取当前操作上下文，用于故障点调试和性能监控
     auto& curOp = *CurOp::get(opCtx);
 
+    // 故障点支持：允许在批量插入期间暂停，用于测试和调试
     CurOpFailpointHelpers::waitWhileFailPointEnabled(
         &hangDuringBatchInsert,
         opCtx,
@@ -609,51 +644,64 @@ bool insertBatchAndHandleErrors(OperationContext* opCtx,
         },
         nss);
 
+    // 故障点测试：强制所有插入操作失败，用于异常情况测试
     if (MONGO_unlikely(failAllInserts.shouldFail())) {
         uasserted(ErrorCodes::InternalError, "failAllInserts failpoint active!");
     }
 
+    // 集合获取和管理逻辑
     boost::optional<CollectionAcquisition> collection;
     auto acquireCollection = [&] {
         while (true) {
+            // 尝试获取集合，使用写入模式和适当的锁级别
             collection.emplace(mongo::acquireCollection(
                 opCtx,
                 CollectionAcquisitionRequest::fromOpCtx(
                     opCtx, nss, AcquisitionPrerequisites::kWrite, collectionUUID),
                 fixLockModeForSystemDotViewsChanges(nss, MODE_IX)));
             if (collection->exists()) {
+                // 集合存在，跳出循环
                 break;
             }
 
+            // 时序集合特殊处理：时序插入时集合必须已存在
             if (source == OperationSource::kTimeseriesInsert) {
                 assertTimeseriesBucketsCollectionNotFound(nss);
             }
 
+            // 迁移数据限制：禁止因迁移数据而隐式创建集合
             if (source == OperationSource::kFromMigrate) {
                 uasserted(
                     ErrorCodes::CannotCreateCollection,
                     "The implicit creation of a collection due to a migration is not allowed.");
             }
 
+            // 释放锁并创建集合
             collection.reset();  // unlock.
             makeCollection(opCtx, nss);
         }
 
+        // 设置数据库性能分析级别
         curOp.raiseDbProfileLevel(
             CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(nss.dbName()));
+        // 验证写入权限
         assertCanWrite_inlock(opCtx, nss);
 
+        // 故障点支持：在持有锁期间暂停，用于测试锁相关的并发问题
         CurOpFailpointHelpers::waitWhileFailPointEnabled(
             &hangWithLockDuringBatchInsert, opCtx, "hangWithLockDuringBatchInsert");
     };
 
+    // 事务状态检查和标志设置
     auto txnParticipant = TransactionParticipant::get(opCtx);
     auto inTxn = txnParticipant && opCtx->inMultiDocumentTransaction();
     bool shouldProceedWithBatchInsert = true;
 
     try {
+        // 尝试获取集合
         acquireCollection();
     } catch (const DBException& ex) {
+        // 集合获取失败的处理
         collection.reset();
         if (inTxn) {
             // It is not safe to ignore errors from collection creation while inside a
@@ -673,23 +721,32 @@ bool insertBatchAndHandleErrors(OperationContext* opCtx,
         }
     }
 
+    // 原子性批量插入尝试（性能优化路径）
     if (shouldProceedWithBatchInsert) {
         try {
+            // 原子性插入的条件检查：
+            // 1. 非上限集合（上限集合需要强制插入顺序）
+            // 2. 非事务环境（事务有特殊的错误处理需求）
+            // 3. 批次大小大于1（单个文档无需原子性优化）
             if (!collection->getCollectionPtr()->isCapped() && !inTxn && batch.size() > 1) {
                 // First try doing it all together. If all goes well, this is all we need to do.
                 // See Collection::_insertDocuments for why we do all capped inserts one-at-a-time.
                 lastOpFixer->startingOp(nss);
+                // 执行原子性插入：一次性插入整个批次
                 insertDocumentsAtomically(opCtx,
                                           *collection,
                                           batch.begin(),
                                           batch.end(),
                                           source == OperationSource::kFromMigrate);
                 lastOpFixer->finishedOpSuccessfully();
+                // 更新全局计数器
                 globalOpCounters.gotInserts(batch.size());
                 SingleWriteResult result;
                 result.setN(1);
 
+                // 为批次中的每个文档填充成功结果
                 std::fill_n(std::back_inserter(out->results), batch.size(), std::move(result));
+                // 更新写入关注度指标（时序插入在上层处理）
                 if (source != OperationSource::kTimeseriesInsert) {
                     ServerWriteConcernMetrics::get(opCtx)->recordWriteConcernForInserts(
                         opCtx->getWriteConcern(), batch.size());
@@ -706,27 +763,35 @@ bool insertBatchAndHandleErrors(OperationContext* opCtx,
 
     // Try to insert the batch one-at-a-time. This path is executed for singular batches,
     // multi-statement transactions, capped collections, and if we failed all-at-once inserting.
+    // 逐个插入处理（降级路径和特殊情况处理）
     for (auto it = batch.begin(); it != batch.end(); ++it) {
+        // 更新操作计数器
         globalOpCounters.gotInsert();
+        // 记录写入关注度指标（时序插入在上层处理）
         if (source != OperationSource::kTimeseriesInsert) {
             ServerWriteConcernMetrics::get(opCtx)->recordWriteConcernForInsert(
                 opCtx->getWriteConcern());
         }
         try {
+            // 写入冲突重试机制：处理并发写入导致的临时失败
             writeConflictRetry(opCtx, "insert", nss, [&] {
                 try {
+                    // 确保集合可用
                     if (!collection)
                         acquireCollection();
                     // Transactions are not allowed to operate on capped collections.
+                    // 事务约束检查：事务不允许操作上限集合
                     uassertStatusOK(
                         checkIfTransactionOnCappedColl(opCtx, collection->getCollectionPtr()));
                     lastOpFixer->startingOp(nss);
+                    // 执行单个文档的原子插入
                     insertDocumentsAtomically(
                         opCtx, *collection, it, it + 1, source == OperationSource::kFromMigrate);
                     lastOpFixer->finishedOpSuccessfully();
                     SingleWriteResult result;
                     result.setN(1);
                     out->results.emplace_back(std::move(result));
+                    // 更新插入计数
                     if (source != OperationSource::kTimeseriesInsert) {
                         curOp.debug().additiveMetrics.incrementNinserted(1);
                     }
@@ -741,16 +806,22 @@ bool insertBatchAndHandleErrors(OperationContext* opCtx,
                 }
             });
         } catch (const DBException& ex) {
+            // 错误处理：判断是否可以继续处理后续文档
             bool canContinue = handleError(
                 opCtx, ex, nss, ordered, false /* multiUpdate */, boost::none /* sampleId */, out);
 
             if (!canContinue) {
                 // Failed in ordered batch, or in a transaction, or from some unrecoverable error.
+                // 不可恢复的错误情况：
+                // - 有序批次中的失败
+                // - 事务中的失败  
+                // - 其他不可恢复的错误
                 return false;
             }
         }
     }
 
+    // 成功处理完所有文档，返回可以继续
     return true;
 }
 
@@ -1242,7 +1313,9 @@ WriteResult performInserts(OperationContext* opCtx,
     size_t nextOpIndex = 0;
     size_t bytesInBatch = 0;
     std::vector<InsertStatement> batch;
+    // 默认 500
     const size_t maxBatchSize = internalInsertMaxBatchSize.load();
+    // 默认 256k
     const size_t maxBatchBytes = write_ops::insertVectorMaxBytes;
     batch.reserve(std::min(wholeOp.getDocuments().size(), maxBatchSize));
 
