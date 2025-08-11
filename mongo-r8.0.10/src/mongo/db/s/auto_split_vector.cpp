@@ -381,6 +381,7 @@ std::pair<std::vector<BSONObj>, bool> autoSplitVector(OperationContext* opCtx,
                 }
 
                 // BSON 大小检查：确保添加新分裂点不会超过大小限制
+                // 该函数会返回所有的分裂点信息，分裂点过多容易造成响应包超过64M, 所以这里有这个限制
                 const auto additionalKeySize =
                     currentKey.objsize() + estimatedAdditionalBytesPerItemInBSONArray;
                 if (checkMaxBSONSize(additionalKeySize)) {
@@ -402,6 +403,7 @@ std::pair<std::vector<BSONObj>, bool> autoSplitVector(OperationContext* opCtx,
                 numScannedKeys = 0;
 
                 // 用户限制检查：如果指定了分裂点数量限制，在达到限制时停止
+                // +1的目的是为了让最后一个 chunk 不会太小，所以多算了一次分裂点，主要是为了让想知道最后一个预期分类的后面的数据是否过小
                 if (limit && splitKeys.size() == static_cast<size_t>(*limit) + 1) {
                     // If the user has specified a limit, calculate the first `limit + 1` split
                     // points (avoid creating small chunks)
@@ -411,6 +413,7 @@ std::pair<std::vector<BSONObj>, bool> autoSplitVector(OperationContext* opCtx,
                 LOGV2_DEBUG(5865003, 4, "Picked a split key", "key"_attr = redact(currentKey));
             }
         }
+
 
         // Avoid creating small chunks by fairly recalculating the last split points if the last
         // chunk would be too small (containing less than `80% maxDocsPerChunk` documents).

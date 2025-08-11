@@ -273,6 +273,30 @@ TransactionOperations::ApplyOpsInfo TransactionOperations::getApplyOpsInfo(
             prepare};
 }
 
+/**
+ * 事务操作oplog记录的核心函数
+ * 
+ * 核心功能：
+ * 1. 将事务中的多个操作分批打包成applyOps命令，写入oplog集合
+ * 2. 维护事务中各个oplog条目之间的链式关系（通过prevOpTime字段）
+ * 3. 正确设置事务相关的元数据字段（prepare、partialTxn、count等）
+ * 4. 处理findAndModify操作的pre/post图像存储到config.image_collection
+ * 5. 支持不同的oplog分组格式（原子事务 vs 可重试操作）
+ * 
+ * 设计要点：
+ * - 分批策略：根据BSON大小限制和操作数量限制将事务操作分组
+ * - 链式结构：每个applyOps条目通过prevOpTime指向前一个条目，形成完整的事务链
+ * - 兼容性：支持prepare事务、部分事务、批量写入等不同场景
+ * - 约束检查：确保每个事务最多只有一个pre/post图像写入
+ * 
+ * @param oplogSlots 预分配的oplog时间戳槽位
+ * @param applyOpsOperationAssignment 预先计算的applyOps分组信息
+ * @param wallClockTime 墙上时钟时间
+ * @param oplogGroupingFormat oplog分组格式（原子 vs 可重试）
+ * @param logApplyOpsFn 实际写入oplog的回调函数
+ * @param prePostImageToWriteToImageCollection 输出参数，返回需要写入图像集合的数据
+ * @return 实际使用的oplog槽位数量
+ */
 std::size_t TransactionOperations::logOplogEntries(
     const std::vector<OplogSlot>& oplogSlots,
     const ApplyOpsInfo& applyOpsOperationAssignment,
@@ -281,6 +305,7 @@ std::size_t TransactionOperations::logOplogEntries(
     LogApplyOpsFn logApplyOpsFn,
     boost::optional<TransactionOperation::ImageBundle>* prePostImageToWriteToImageCollection)
     const {
+    // 验证预分配的oplog槽位数量是否正确
     invariant(oplogSlots.size() == applyOpsOperationAssignment.numberOfOplogSlotsRequired,
               "Wrong number of oplogSlots reserved");
 
@@ -301,19 +326,28 @@ std::size_t TransactionOperations::logOplogEntries(
     // statements have been packed, it should point to stmts.end(), which is the loop's
     // termination condition.
     auto stmtsIter = _transactionOperations.begin();
+    // applyOps条目迭代器，用于遍历预先分组的操作
     auto applyOpsIter = applyOpsOperationAssignment.applyOpsEntries.begin();
     const bool prepare = applyOpsOperationAssignment.prepare;
+    // 判断是否为可重试操作的分组格式
     const bool applyOpsAppliedSeparately =
         oplogGroupingFormat == WriteUnitOfWork::kGroupForPossiblyRetryableOperations;
+    
+    // 主循环：为每个applyOps条目生成oplog记录
     while (stmtsIter != _transactionOperations.end()) {
         tassert(6278509,
                 "Not enough \"applyOps\" entries",
                 applyOpsIter != applyOpsOperationAssignment.applyOpsEntries.end());
+        
+        // 获取当前applyOps条目信息
         const auto& applyOpsEntry = *applyOpsIter++;
         BSONObjBuilder applyOpsBuilder;
         boost::optional<repl::ReplOperation::ImageBundle> imageToWrite;
 
+        // 计算下一个处理位置：当前位置 + 当前条目包含的操作数量
         const auto nextStmt = stmtsIter + applyOpsEntry.operations.size();
+        
+        // 将事务操作打包到applyOps命令中
         TransactionOperations::packTransactionStatementsForApplyOps(stmtsIter,
                                                                     nextStmt,
                                                                     applyOpsEntry.operations,
@@ -326,9 +360,12 @@ std::size_t TransactionOperations::logOplogEntries(
         auto firstOp = stmtsIter == _transactionOperations.begin();
         auto lastOp = nextStmt == _transactionOperations.end();
 
+        // 判断是否为隐式prepare（最后一个操作且为prepare事务）
         auto implicitPrepare = lastOp && prepare;
+        // 判断是否为部分事务（非最后操作且非分离应用模式）
         auto isPartialTxn = !lastOp && !applyOpsAppliedSeparately;
 
+        // 检查图像写入约束：每个事务最多只能有一个findAndModify操作的pre/post图像
         if (imageToWrite) {
             uassert(6054002,
                     str::stream() << NamespaceString::kConfigImagesNamespace.toStringForErrorMsg()
@@ -340,9 +377,12 @@ std::size_t TransactionOperations::logOplogEntries(
 
         // A 'prepare' oplog entry should never include a 'partialTxn' field.
         invariant(!(isPartialTxn && implicitPrepare));
+        
+        // 为prepare事务添加prepare标志
         if (implicitPrepare) {
             applyOpsBuilder.append("prepare", true);
         }
+        // 为部分事务添加partialTxn标志
         if (isPartialTxn) {
             applyOpsBuilder.append("partialTxn", true);
         }
@@ -357,21 +397,24 @@ std::size_t TransactionOperations::logOplogEntries(
         // 'applyOps' field.
         // See SERVER-40676 and SERVER-40678.
         if (lastOp && !firstOp && !applyOpsAppliedSeparately) {
+            // 为多条目事务的最后一个applyOps添加count字段，用于从库优化应用性能
             applyOpsBuilder.append("count", static_cast<long long>(_transactionOperations.size()));
         }
 
+        // 构建oplog条目的基本结构
         repl::MutableOplogEntry oplogEntry;
-        oplogEntry.setOpType(repl::OpTypeEnum::kCommand);
-        oplogEntry.setNss(NamespaceString::kAdminCommandNamespace);
-        oplogEntry.setOpTime(oplogSlots[applyOpsEntry.oplogSlotIndex]);
-        oplogEntry.setPrevWriteOpTimeInTransaction(prevWriteOpTime);
-        oplogEntry.setWallClockTime(wallClockTime);
-        oplogEntry.setObject(applyOpsBuilder.done());
+        oplogEntry.setOpType(repl::OpTypeEnum::kCommand);  // 设置为命令类型
+        oplogEntry.setNss(NamespaceString::kAdminCommandNamespace);  // 设置为admin命名空间
+        oplogEntry.setOpTime(oplogSlots[applyOpsEntry.oplogSlotIndex]);  // 设置操作时间戳
+        oplogEntry.setPrevWriteOpTimeInTransaction(prevWriteOpTime);  // 设置事务中前一个写操作时间
+        oplogEntry.setWallClockTime(wallClockTime);  // 设置墙上时间
+        oplogEntry.setObject(applyOpsBuilder.done());  // 设置applyOps命令对象
 
         // TODO SERVER-69286: replace this temporary fix to set the top-level tenantId to the
         // tenantId on the first op in the list
         oplogEntry.setTid(stmtsIter->getTid());
 
+        // 调用日志记录函数，实际写入oplog
         prevWriteOpTime =
             logApplyOpsFn(&oplogEntry,
                           firstOp,
@@ -380,8 +423,10 @@ std::size_t TransactionOperations::logOplogEntries(
                                                                : std::vector<StmtId>{}),
                           oplogGroupingFormat);
 
+        // 测试/调试钩子：在记录applyOps日志后暂停
         hangAfterLoggingApplyOpsForTransaction.pauseWhileSet();
 
+        // 处理pre/post图像：设置时间戳并准备写入图像集合
         if (imageToWrite) {
             invariant(!(*prePostImageToWriteToImageCollection));
             imageToWrite->timestamp = prevWriteOpTime.getTimestamp();
@@ -392,8 +437,10 @@ std::size_t TransactionOperations::logOplogEntries(
         stmtsIter = nextStmt;
     }
 
+    // 返回使用的oplog槽位总数
     return applyOpsOperationAssignment.numberOfOplogSlotsRequired;
 }
+
 
 const std::vector<TransactionOperations::TransactionOperation>&
 TransactionOperations::getOperationsForOpObserver() const {
