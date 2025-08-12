@@ -437,17 +437,85 @@ NamespaceString NamespaceString::getTimeseriesViewNamespace() const {
     return {dbName(), coll().substr(kTimeseriesBucketsCollectionPrefix.size())};
 }
 
+/**
+ * 隐式复制命名空间检测函数 - MongoDB复制系统的特殊集合识别机制
+ * 
+ * 核心功能：
+ * 1. 识别需要隐式复制但不生成完整oplog条目的特殊系统集合
+ * 2. 区分隐式复制与显式复制的集合类型，支持复制行为差异化处理
+ * 3. 为变更流、OpObserver和复制协调器提供集合类型判断依据
+ * 4. 确保特殊系统集合的复制一致性和数据完整性保证
+ * 5. 支持分片环境下的元数据集合复制策略决策
+ * 
+ * 设计原理：
+ * - 选择性复制：仅复制操作的子集，减少oplog开销和网络传输
+ * - 系统集合特化：针对特殊用途的集合采用定制化的复制策略
+ * - 复制层次化：区分用户数据复制与系统元数据复制的不同需求
+ * - 一致性保证：确保即使是隐式复制也满足副本集的一致性要求
+ * 
+ * 隐式复制特点：
+ * - 不生成完整的oplog条目，但保证数据复制
+ * - 通过特殊的复制机制同步到从节点
+ * - 主要用于系统内部元数据和状态信息
+ * - 对用户透明，不影响业务逻辑
+ * 
+ * 适用场景：
+ * - 变更流预镜像集合的部分写入复制
+ * - 配置数据库中镜像集合的状态同步
+ * - 变更集合的增量复制和压缩操作
+ * - 系统集合的选择性元数据复制
+ * 
+ * 重要约束：
+ * - 隐式复制集合必须同时是可复制集合（isReplicated() == true）
+ * - 仅限于config数据库中的特定系统集合
+ * - 不支持用户自定义集合的隐式复制
+ * - 隐式复制行为由MongoDB内核控制，不可配置
+ * 
+ * @return bool 如果命名空间需要隐式复制返回true，否则返回false
+ */
 bool NamespaceString::isImplicitlyReplicated() const {
+    // 配置数据库检查：隐式复制仅适用于config数据库中的特殊集合
+    // 原因：config数据库包含MongoDB集群的关键元数据和系统状态信息
+    // 这些信息需要在副本集间保持同步，但不需要完整的oplog记录
     if (db_deprecated() == DatabaseName::kConfig.db(omitTenant)) {
-        if (isChangeStreamPreImagesCollection() || isConfigImagesCollection() ||
+        // 变更流预镜像集合检查：用于存储变更流操作的文档镜像
+        // 功能：在文档被修改或删除前保存其完整镜像
+        // 隐式复制原因：
+        // 1. 预镜像数据量大，完整oplog复制成本高
+        // 2. 主要用于变更流功能，不是核心业务数据
+        // 3. 可以通过特殊机制实现选择性同步
+        if (isChangeStreamPreImagesCollection() || 
+            // 配置镜像集合检查：存储配置变更的镜像信息
+            // 用途：跟踪分片配置、索引状态等关键配置的历史版本
+            // 隐式复制原因：配置镜像主要用于审计和回滚，不需要实时oplog同步
+            isConfigImagesCollection() ||
+            // 变更集合检查：存储变更流事件和压缩后的变更记录
+            // 特点：包含增量变更、事件聚合和数据压缩信息
+            // 隐式复制原因：
+            // 1. 变更记录具有时效性，过期数据可以选择性清理
+            // 2. 压缩操作产生的中间状态不需要完整复制
+            // 3. 通过批量同步机制更高效
             isChangeCollection()) {
+            
             // Implicitly replicated namespaces are replicated, although they only replicate a
             // subset of writes.
+            // 一致性断言：确保隐式复制的集合同时也是可复制的集合
+            // 重要性：
+            // 1. 维护复制系统的逻辑一致性
+            // 2. 确保隐式复制集合仍然参与副本集的数据同步
+            // 3. 防止出现既不复制又不隐式复制的系统集合
+            // 4. 为复制协调器提供正确的集合分类信息
             invariant(isReplicated());
             return true;
         }
     }
 
+    // 默认情况：大多数集合不需要隐式复制
+    // 包括：
+    // 1. 所有用户数据集合 - 使用标准oplog复制
+    // 2. 其他数据库中的系统集合 - 根据具体情况决定复制策略
+    // 3. local数据库集合 - 通常不复制或有特殊处理
+    // 4. admin数据库集合 - 使用标准复制机制
     return false;
 }
 

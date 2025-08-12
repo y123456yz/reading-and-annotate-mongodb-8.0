@@ -483,6 +483,19 @@ void acquireOplogSlotsForInserts(OperationContext* opCtx,
  * @param begin 插入语句迭代器的开始位置
  * @param end 插入语句迭代器的结束位置
  * @param fromMigrate 是否来自迁移操作，影响oplog记录方式
+ * 
+ * void insertDocumentsAtomically(...) {
+    // 开始事务
+    WriteUnitOfWork wuow(opCtx, oplogEntryGroupType);
+    
+    // 1. 文档写入存储引擎
+    // 2. 索引更新  
+    // 3. oplog写入
+    uassertStatusOK(collection_internal::insertDocuments(...));
+    
+    // 原子性提交：要么全部成功，要么全部回滚
+    wuow.commit();
+}
  */
 void insertDocumentsAtomically(OperationContext* opCtx,
                                const CollectionAcquisition& collection,

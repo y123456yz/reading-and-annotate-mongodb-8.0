@@ -228,27 +228,84 @@ Status allowedToInsertDocuments(OperationContext* opCtx,
     return Status::OK();
 }
 
+/**
+ * 文档插入底层实现函数 - MongoDB集合写入的核心执行引擎
+ * 
+ * 核心功能：
+ * 1. 执行底层文档插入操作，包括存储引擎写入、索引更新和oplog记录
+ * 2. 处理特殊集合类型的写入约束，如上限集合的并发控制和容量管理
+ * 3. 管理RecordId生成策略，支持聚簇集合、副本记录ID和普通集合
+ * 4. 集成OpObserver事件系统，触发oplog生成、变更流和复制逻辑
+ * 5. 实施分片环境下的孤儿文档检测和fromMigrate标记处理
+ * 
+ * 设计原理：
+ * - 分层处理：锁检查 -> RecordId生成 -> 存储写入 -> 索引更新 -> 事件通知
+ * - 批量优化：一次性处理多个文档，减少系统调用和锁争用开销
+ * - 异常安全：完整的错误处理和回滚机制，确保数据一致性
+ * - 存储抽象：支持不同存储引擎的RecordId策略和写入模式
+ * 
+ * 适用场景：
+ * - 常规插入操作的最终执行阶段
+ * - 副本集oplog应用的底层写入
+ * - 分片数据迁移的目标端写入
+ * - 初始化同步和恢复过程的批量写入
+ * 
+ * 重要约束：
+ * - 调用者必须持有适当的集合锁（MODE_IX或更强）
+ * - 索引上限集合强制单文档插入以避免删除-插入竞争
+ * - 聚簇集合要求文档包含聚簇键字段
+ * - 非复制集合不触发OpObserver事件通知
+ * 
+ * @param opCtx 操作上下文，包含事务状态、锁信息、复制设置等
+ * @param collection 目标集合指针，提供存储和索引访问接口
+ * @param begin 插入语句迭代器开始位置，指向第一个待插入文档
+ * @param end 插入语句迭代器结束位置，标记批次边界
+ * @param opDebug 调试信息收集器，用于性能统计和监控（可选）
+ * @param fromMigrate 是否来自分片迁移，影响变更流和oplog标记
+ * @return Status 操作结果，成功返回OK，失败返回具体错误码和描述
+ */
 Status insertDocumentsImpl(OperationContext* opCtx,
                            const CollectionPtr& collection,
                            const std::vector<InsertStatement>::const_iterator begin,
                            const std::vector<InsertStatement>::const_iterator end,
                            OpDebug* opDebug,
                            bool fromMigrate) {
+    // 获取集合命名空间：用于锁验证、日志记录和错误报告
     const auto& nss = collection->ns();
 
+    // 锁状态断言：确保调用者持有适当的锁级别
+    // 支持的锁模式：
+    // 1. MODE_IX：普通集合的意向排他锁
+    // 2. 写锁：oplog集合需要更强的锁保护
+    // 3. 租户锁：变更集合需要租户级别的意向排他锁
     dassert(shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(nss, MODE_IX) ||
             (nss.isOplog() && shard_role_details::getLocker(opCtx)->isWriteLocked()) ||
             (nss.isChangeCollection() && nss.tenantId() &&
              shard_role_details::getLocker(opCtx)->isLockHeldForMode(
                  {ResourceType::RESOURCE_TENANT, *nss.tenantId()}, MODE_IX)));
 
+    // 批次大小计算：确定当前批次包含的文档数量
+    // 用途：
+    // 1. 批次大小验证（如上限集合的单文档限制）
+    // 2. 容器预分配以优化性能
+    // 3. 性能统计和监控数据收集
     const size_t count = std::distance(begin, end);
 
+    // 插入权限检查：验证当前批次是否允许插入
+    // 主要检查：索引上限集合的批量插入限制
+    // 原因：避免删除-插入操作的竞争条件
     auto allowStatus = allowedToInsertDocuments(opCtx, collection, count);
     if (!allowStatus.isOK()) {
         return allowStatus;
     }
 
+    // 上限集合并发控制：获取元数据排他锁以序列化写入
+    // 适用条件：需要上限锁的复制集合（通常是非聚簇上限集合）
+    // 目的：
+    // 1. 保证插入顺序在从节点上的一致性（SERVER-21483）
+    // 2. 防止主节点并发度超过从节点，帮助从节点跟上复制
+    // 3. 保护'_cappedFirstRecord'等关键元数据
+    // 注意：聚簇上限集合由于聚簇键的单调性，天然保证插入顺序，无需此锁
     if (collection->needsCappedLock()) {
         // X-lock the metadata resource for this replicated, non-clustered capped collection until
         // the end of the WUOW. Non-clustered capped collections require writes to be serialized on
@@ -261,11 +318,16 @@ Status insertDocumentsImpl(OperationContext* opCtx,
         Lock::ResourceLock heldUntilEndOfWUOW{opCtx, ResourceId(RESOURCE_METADATA, nss), MODE_X};
     }
 
+    // Record容器初始化：为存储引擎写入准备数据结构
+    // 预分配容量以避免动态扩容的性能开销
     std::vector<Record> records;
     records.reserve(count);
     std::vector<Timestamp> timestamps;
     timestamps.reserve(count);
 
+    // 上限集合RecordId预留机制：处理需要上限快照的集合
+    // 条件：使用上限快照 且 调用者未提供RecordId
+    // 目的：预先分配RecordId并在CappedVisibilityObserver中注册，处理可见性
     std::vector<RecordId> cappedRecordIds;
     // For capped collections requiring capped snapshots, usually RecordIds are reserved and
     // registered here to handle visibility. If the RecordId is provided by the caller, it is
@@ -275,29 +337,41 @@ Status insertDocumentsImpl(OperationContext* opCtx,
         cappedRecordIds = collection->reserveCappedRecordIds(opCtx, count);
     }
 
+    // Record构建循环：为每个文档生成Record对象
     size_t i = 0;
     for (auto it = begin; it != end; it++, i++) {
         const auto& doc = it->doc;
 
+        // RecordId生成策略：根据集合类型选择合适的ID生成方式
         RecordId recordId;
         if (collection->isClustered()) {
+            // 聚簇集合：基于聚簇键生成RecordId
+            // 要求：存储引擎必须使用String格式的键
+            // 过程：从文档中提取聚簇键字段，生成对应的RecordId
             invariant(collection->getRecordStore()->keyFormat() == KeyFormat::String);
             recordId = uassertStatusOK(
                 record_id_helpers::keyForDoc(doc,
                                              collection->getClusteredInfo()->getIndexSpec(),
                                              collection->getDefaultCollator()));
         } else if (!it->replicatedRecordId.isNull()) {
+            // 副本记录ID：用于复制RecordId的集合
+            // 场景：某些特殊集合需要在主从节点间保持相同的RecordId
             // The 'replicatedRecordId' being set indicates that this insert belongs to a replicated
             // recordId collection, and we need to use the given recordId while inserting.
             recordId = it->replicatedRecordId;
         } else if (!it->recordId.isNull()) {
+            // 测试指定RecordId：通常仅在测试环境中使用
+            // 用途：避免为上限集合自动生成RecordId，便于测试控制
             // This case would only normally be called in a testing circumstance to avoid
             // automatically generating record ids for capped collections.
             recordId = it->recordId;
         } else if (cappedRecordIds.size()) {
+            // 预留的上限集合RecordId：使用之前预留的ID
             recordId = std::move(cappedRecordIds[i]);
         }
 
+        // 文档损坏故障点：测试框架支持，模拟文档损坏场景
+        // 功能：插入截断的记录（一半大小），用于测试错误处理
         if (MONGO_unlikely(corruptDocumentOnInsert.shouldFail())) {
             // Insert a truncated record that is half the expected size of the source document.
             records.emplace_back(
@@ -306,6 +380,8 @@ Status insertDocumentsImpl(OperationContext* opCtx,
             continue;
         }
 
+        // RecordId强制设置故障点：测试框架支持，手动指定RecordId
+        // 用途：在特定测试场景中覆盖自动生成的RecordId
         explicitlySetRecordIdOnInsert.execute([&](const BSONObj& data) {
             const auto docToMatch = data["doc"].Obj();
             if (doc.woCompare(docToMatch) == 0) {
@@ -316,13 +392,24 @@ Status insertDocumentsImpl(OperationContext* opCtx,
             }
         });
 
+        // 构建最终的Record对象：包含RecordId、文档数据和时间戳
         records.emplace_back(Record{std::move(recordId), RecordData(doc.objdata(), doc.objsize())});
         timestamps.emplace_back(it->oplogSlot.getTimestamp());
     }
 
+
+    // 先写数据，再写索引，最后写oplog
+
+    // 存储引擎写入：将所有记录批量写入存储引擎
+    // 核心操作：
+    // 1. 将文档数据持久化到存储引擎
+    // 2. 分配最终的RecordId（如果之前未指定）
+    // 3. 处理重复键错误和其他存储引擎异常
     Status status = collection->getRecordStore()->insertRecords(opCtx, &records, timestamps);
 
     if (!status.isOK()) {
+        // 聚簇集合重复键错误处理：转换为用户友好的错误消息
+        // 目的：保持与索引重复键错误的一致性，维护用户代码兼容性
         if (auto extraInfo = status.extraInfo<DuplicateKeyErrorInfo>();
             extraInfo && collection->isClustered()) {
             // Generate a useful error message that is consistent with duplicate key error messages
@@ -345,21 +432,30 @@ Status insertDocumentsImpl(OperationContext* opCtx,
         return status;
     }
 
+    // BsonRecord构建：为索引更新准备BSON记录
+    // 目的：将存储引擎记录转换为索引系统需要的格式
     std::vector<BsonRecord> bsonRecords;
     bsonRecords.reserve(count);
     int recordIndex = 0;
     for (auto it = begin; it != end; it++) {
+        // 获取存储引擎分配的最终RecordId
         RecordId loc = records[recordIndex++].id;
+        
+        // RecordId范围验证：确保Long格式的RecordId在有效范围内
         if (collection->getRecordStore()->keyFormat() == KeyFormat::Long) {
             invariant(RecordId::minLong() < loc);
             invariant(loc < RecordId::maxLong());
         }
 
+        // 构建BsonRecord：包含位置、时间戳和文档引用
         BsonRecord bsonRecord = {
             std::move(loc), Timestamp(it->oplogSlot.getTimestamp()), &(it->doc)};
         bsonRecords.emplace_back(std::move(bsonRecord));
     }
 
+    // 复制RecordId收集：为OpObserver准备RecordId列表
+    // 条件：集合启用了RecordId复制
+    // 用途：在oplog条目中包含RecordId信息，支持精确的复制
     // An empty vector of recordIds is ignored by the OpObserver. When non-empty,
     // the OpObserver will add recordIds to the generated oplog entries.
     std::vector<RecordId> recordIds;
@@ -370,6 +466,12 @@ Status insertDocumentsImpl(OperationContext* opCtx,
         }
     }
 
+    // 索引更新：批量更新所有相关索引
+    // 过程：
+    // 1. 为每个文档生成索引键
+    // 2. 将键插入到对应的索引结构中
+    // 3. 处理唯一约束和重复键检测
+    // 4. 统计插入的索引键数量
     int64_t keysInserted = 0;
     status =
         collection->getIndexCatalog()->indexRecords(opCtx, collection, bsonRecords, &keysInserted);
@@ -377,9 +479,12 @@ Status insertDocumentsImpl(OperationContext* opCtx,
         return status;
     }
 
+    // 性能统计更新：记录插入的索引键数量用于监控
     if (opDebug) {
         opDebug->additiveMetrics.incrementKeysInserted(keysInserted);
         // 'opDebug' may be deleted at rollback time in case of multi-document transaction.
+        // 回滚处理：在事务回滚时调整统计数据
+        // 注意：多文档事务中opDebug可能在回滚时被删除，需要特殊处理
         if (!opCtx->inMultiDocumentTransaction()) {
             shard_role_details::getRecoveryUnit(opCtx)->onRollback(
                 [opDebug, keysInserted](OperationContext*) {
@@ -388,6 +493,8 @@ Status insertDocumentsImpl(OperationContext* opCtx,
         }
     }
 
+    // OpObserver事件通知：触发oplog记录、变更流和其他观察者
+    // 跳过条件：隐式复制的集合（如local数据库中的特殊集合）
     if (!nss.isImplicitlyReplicated()) {
         opCtx->getServiceContext()->getOpObserver()->onInserts(
             opCtx,
@@ -399,8 +506,12 @@ Status insertDocumentsImpl(OperationContext* opCtx,
             /*defaultFromMigrate=*/fromMigrate);
     }
 
+    // 上限集合容量管理：确保集合大小不超过配置的最大值
+    // 机制：如果插入导致集合超出容量，删除最老的文档
+    // 参数：传入第一个新记录的ID作为容量检查的起点
     cappedDeleteUntilBelowConfiguredMaximum(opCtx, collection, records.begin()->id);
 
+    // 返回成功状态：所有插入操作和相关处理已完成
     return Status::OK();
 }
 
@@ -494,23 +605,73 @@ Status insertDocumentForBulkLoader(OperationContext* opCtx,
     return loc.getStatus();
 }
 
+/**
+ * 批量文档插入核心函数 - MongoDB集合写入路径的主要入口点
+ * 
+ * 核心功能：
+ * 1. 执行批量文档插入操作，支持高效的多文档原子性写入
+ * 2. 实施全面的文档验证机制，包括结构验证、加密字段检查等
+ * 3. 处理特殊集合类型的插入约束，如索引上限集合的单文档限制
+ * 4. 集成OpObserver事件通知，支持oplog记录和变更流生成
+ * 5. 管理上限集合的容量维护和等待者通知机制
+ * 
+ * 设计原理：
+ * - 分层验证：从故障点检查到文档验证再到加密字段验证的层次化处理
+ * - 快照一致性：通过快照ID确保操作过程中的一致性状态
+ * - 异常安全：完整的错误处理和资源清理机制
+ * - 性能优化：批量处理减少系统调用和锁开销
+ * 
+ * 适用场景：
+ * - 客户端批量插入操作的后端实现
+ * - 副本集oplog应用的文档插入
+ * - 迁移和同步过程中的数据写入
+ * - 初始化同步期间的批量数据加载
+ * 
+ * 重要约束：
+ * - 要求调用者持有适当的集合锁（MODE_IX或写锁）
+ * - 索引上限集合限制批量大小为1，防止删除-插入竞争
+ * - 加密集合禁止包含预留的安全内容字段
+ * - 需要_id索引的集合要求所有文档包含_id字段
+ * 
+ * @param opCtx 操作上下文，包含事务状态、锁信息、复制设置等
+ * @param collection 目标集合指针，提供集合元数据和存储访问接口
+ * @param begin 插入语句迭代器开始位置，指向第一个待插入文档
+ * @param end 插入语句迭代器结束位置，标记批次边界
+ * @param opDebug 调试信息收集器，用于性能分析和监控（可选）
+ * @param fromMigrate 是否来自迁移操作，影响oplog记录和变更流处理
+ * @return Status 操作结果状态，成功返回OK，失败返回具体错误信息
+ */
 Status insertDocuments(OperationContext* opCtx,
                        const CollectionPtr& collection,
                        std::vector<InsertStatement>::const_iterator begin,
                        std::vector<InsertStatement>::const_iterator end,
                        OpDebug* opDebug,
                        bool fromMigrate) {
+    // 获取集合命名空间：用于后续的权限检查、日志记录和错误报告
     const auto& nss = collection->ns();
 
+    // 故障点检查：测试框架支持，允许在特定集合上模拟插入失败
+    // 用途：
+    // 1. 集成测试中验证错误处理路径的正确性
+    // 2. 压力测试期间模拟各种故障场景
+    // 3. 开发阶段调试复杂的插入流程
     auto status = checkFailCollectionInsertsFailPoint(nss, (begin != end ? begin->doc : BSONObj()));
     if (!status.isOK()) {
         return status;
     }
 
     // Should really be done in the collection object at creation and updated on index create.
+    // _id索引存在性检查：确定集合是否具有_id索引
+    // 重要性：
+    // 1. 有_id索引的集合要求所有文档必须包含_id字段
+    // 2. 这是MongoDB文档唯一性保证的基础
+    // 3. 影响后续的文档验证逻辑
+    // 注释说明：理想情况下应该在集合创建时完成并在索引创建时更新
     const bool hasIdIndex = collection->getIndexCatalog()->findIdIndex(opCtx);
 
+    // 文档级验证循环：逐个检查批次中的每个文档
     for (auto it = begin; it != end; it++) {
+        // _id字段必需性验证：有_id索引的集合必须包含_id字段
         if (hasIdIndex && it->doc["_id"].eoo()) {
             return Status(ErrorCodes::InternalError,
                           str::stream()
@@ -518,13 +679,26 @@ Status insertDocuments(OperationContext* opCtx,
                               << nss.toStringForErrorMsg());
         }
 
+        // 文档结构和模式验证：执行JSON Schema验证、数据类型检查等
+        // 功能：
+        // 1. 验证文档是否符合集合定义的JSON Schema
+        // 2. 检查数据类型的正确性和约束条件
+        // 3. 验证必需字段的存在性
+        // 4. 检查字段值的范围和格式约束
         auto status = collection->checkValidationAndParseResult(opCtx, it->doc);
         if (!status.isOK()) {
             return status;
         }
 
+        // 获取文档验证设置：确定当前的验证策略和安全策略
         auto& validationSettings = DocumentValidationSettings::get(opCtx);
 
+        // 加密字段冲突检查：防止用户文档包含系统预留的安全字段
+        // 场景：启用客户端字段级加密(CSFLE)的集合
+        // 限制原因：
+        // 1. kSafeContent是MongoDB内部用于存储加密元数据的预留字段
+        // 2. 用户文档不应包含此字段，避免与加密系统冲突
+        // 3. 临时重新分片集合是例外，因为它们可能包含系统生成的数据
         if (collection->getCollectionOptions().encryptedFieldConfig &&
             !collection->ns().isTemporaryReshardingCollection() &&
             !validationSettings.isSchemaValidationDisabled() &&
@@ -536,31 +710,70 @@ Status insertDocuments(OperationContext* opCtx,
         }
     }
 
+    // 快照一致性基线：记录操作开始时的快照ID
+    // 目的：
+    // 1. 确保整个插入操作过程中使用一致的数据视图
+    // 2. 检测并发操作是否影响了当前事务的一致性
+    // 3. 为调试并发问题提供重要的诊断信息
     const SnapshotId sid = shard_role_details::getRecoveryUnit(opCtx)->getSnapshotId();
 
+    // 核心插入逻辑：调用底层实现函数执行实际的插入操作
+    // insertDocumentsImpl职责：
+    // 1. 执行锁检查和批次大小验证
+    // 2. 生成RecordId并写入存储引擎
+    // 3. 更新所有相关的索引结构
+    // 4. 触发OpObserver事件（oplog、变更流等）
+    // 5. 处理上限集合的容量管理
     status = insertDocumentsImpl(opCtx, collection, begin, end, opDebug, fromMigrate);
     if (!status.isOK()) {
         return status;
     }
+    
+    // 快照一致性验证：确保操作过程中快照ID未发生变化
+    // 断言意义：
+    // 1. 验证插入操作没有触发不当的快照切换
+    // 2. 确保MVCC（多版本并发控制）机制正确工作
+    // 3. 检测存储引擎层面的一致性问题
     invariant(sid == shard_role_details::getRecoveryUnit(opCtx)->getSnapshotId());
 
     // Capture the recordStore here instead of the CollectionPtr object itself, because the record
     // store's lifetime is controlled by the collection IX lock held on the write paths, whereas the
     // CollectionPtr is just a front to the collection and its lifetime is shorter
+    // 上限集合等待者通知机制：在事务提交时通知等待空间的读取者
+    // 设计考虑：
+    // 1. 捕获recordStore而不是CollectionPtr，因为recordStore的生命周期由写入路径持有的IX锁控制
+    // 2. CollectionPtr只是集合的前端，生命周期较短
+    // 3. onCommit确保只在成功提交后才通知等待者
+    // 4. 上限集合的读取者可能在等待新数据到达
     shard_role_details::getRecoveryUnit(opCtx)->onCommit(
         [recordStore = collection->getRecordStore()](OperationContext*,
                                                      boost::optional<Timestamp>) {
+            // 通知上限集合等待者：唤醒可能正在等待新数据的读取操作
+            // 应用场景：
+            // 1. 尾部游标（tailable cursor）等待新文档
+            // 2. 变更流等待新的变更事件
+            // 3. 实时应用监听集合变化
             recordStore->notifyCappedWaitersIfNeeded();
         });
 
+    // 调试故障点：在插入完成后暂停执行，用于测试和调试
+    // 支持的参数：
+    // 1. collectionNS: 指定特定集合的命名空间
+    // 2. first_id: 指定第一个文档的_id值（必须是字符串类型）
+    // 使用场景：
+    // 1. 测试插入操作与其他操作的并发交互
+    // 2. 验证插入后的系统状态
+    // 3. 调试复杂的多操作流程
     hangAfterCollectionInserts.executeIf(
         [&](const BSONObj& data) {
+            // 构建等待条件描述信息
             const auto& firstIdElem = data["first_id"];
             std::string whenFirst;
             if (firstIdElem) {
                 whenFirst += " when first _id is ";
                 whenFirst += firstIdElem.str();
             }
+            // 记录暂停信息并等待故障点被禁用
             LOGV2(20289,
                   "hangAfterCollectionInserts fail point enabled. Blocking "
                   "until fail point is disabled.",
@@ -569,15 +782,21 @@ Status insertDocuments(OperationContext* opCtx,
             hangAfterCollectionInserts.pauseWhileSet(opCtx);
         },
         [&](const BSONObj& data) {
+            // 故障点触发条件检查：
+            // 1. 解析故障点配置中的集合命名空间
             const auto fpNss = NamespaceStringUtil::parseFailPointData(data, "collectionNS");
             const auto& firstIdElem = data["first_id"];
             // If the failpoint specifies no collection or matches the existing one, hang.
+            // 2. 检查是否应该触发故障点：
+            //    - 故障点未指定集合或匹配当前集合
+            //    - 未指定first_id或匹配第一个文档的_id
             return (fpNss.isEmpty() || nss == fpNss) &&
                 (!firstIdElem ||
                  (begin != end && firstIdElem.type() == mongo::String &&
                   begin->doc["_id"].str() == firstIdElem.str()));
         });
 
+    // 返回成功状态：所有插入操作已完成
     return Status::OK();
 }
 
