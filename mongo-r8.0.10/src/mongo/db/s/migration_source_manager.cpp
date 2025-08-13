@@ -142,7 +142,7 @@ BSONObj computeOtherBound(OperationContext* opCtx,
     if (splitKeys.size()) {
         return std::move(splitKeys.front());
     }
-
+    
     return needMaxBound ? max : min;
 }
 
@@ -318,7 +318,7 @@ MigrationSourceManager::MigrationSourceManager(OperationContext* opCtx,
             return metadata;
         }();
 
-        // 如果未指定最大值，根据最小值计算最大值
+        // 如果未指定最大值，根据最小值计算最大值，_shardsvrMoveRange 中不会携带max
         if (!_args.getMax().has_value()) {
             const auto& min = *_args.getMin();
 
@@ -333,7 +333,7 @@ MigrationSourceManager::MigrationSourceManager(OperationContext* opCtx,
             const auto max = computeOtherBound(_opCtx,
                                                nss(),
                                                min,
-                                               //源分片处理的时候才通过路由表重新填充
+                                               // 这是这个chunk的max
                                                owningChunk.getMax(),
                                                cm->getShardKeyPattern(),
                                                _args.getMaxChunkSizeBytes(),

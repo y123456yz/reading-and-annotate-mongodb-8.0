@@ -1063,31 +1063,77 @@ Status WiredTigerRecordStore::doInsertRecords(OperationContext* opCtx,
     return _insertRecords(opCtx, records->data(), timestamps.data(), records->size());
 }
 
+/**
+ * WiredTiger记录存储的核心插入函数 - MongoDB存储引擎层的记录写入实现
+ * 
+ * 核心功能：
+ * 1. 将多个记录批量插入到WiredTiger存储引擎表中
+ * 2. 为非oplog集合自动生成或验证RecordId的唯一性和递增性
+ * 3. 为oplog集合从时间戳中提取RecordId，确保oplog条目的时序性
+ * 4. 管理存储引擎事务的时间戳设置和提交模式
+ * 5. 更新集合的统计信息（文档数量和数据大小）
+ * 6. 支持oplog截断标记的实时更新和维护
+ * 
+ * 设计原理：
+ * - 批量处理：一次性处理多个记录，减少存储引擎调用开销
+ * - RecordId管理：根据集合类型采用不同的ID生成策略
+ * - 事务一致性：确保所有插入操作在同一WiredTiger事务中完成
+ * - 性能优化：通过预分配ID块和批量写入优化性能
+ * - 完整性保证：严格的参数验证和错误处理机制
+ * 
+ * 适用场景：
+ * - 普通集合的文档插入操作
+ * - oplog集合的条目写入（副本集日志）
+ * - 批量数据导入和迁移操作
+ * - 索引构建过程中的临时数据存储
+ * 
+ * 重要约束：
+ * - 必须在WriteUnitOfWork事务上下文中调用
+ * - oplog集合要求记录按时间戳严格递增顺序插入
+ * - 调用者需确保records数组和timestamps数组大小一致
+ * - 不支持重复的RecordId（除非_overwrite=true）
+ * 
+ * @param opCtx 操作上下文，包含事务、会话、锁等状态信息
+ * @param records 待插入的记录数组，包含RecordId和数据内容
+ * @param timestamps 每个记录对应的时间戳数组，用于事务时序控制
+ * @param nRecords 记录数量，必须与records数组大小一致
+ * @return Status 操作结果状态，成功返回OK，失败返回具体错误信息
+ */
 Status WiredTigerRecordStore::_insertRecords(OperationContext* opCtx,
                                              Record* records,
                                              const Timestamp* timestamps,
                                              size_t nRecords) {
+    // 确保当前操作在写入事务单元中执行，这是存储引擎写入的基本要求
     invariant(shard_role_details::getLocker(opCtx)->inAWriteUnitOfWork());
 
+    // 创建WiredTiger游标，用于实际的存储引擎操作
+    // _overwrite标志决定是否允许覆盖现有记录（主要用于clustered集合）
     WiredTigerCursor curwrap(*WiredTigerRecoveryUnit::get(opCtx), _uri, _tableId, _overwrite);
-    curwrap.assertInActiveTxn();
+    curwrap.assertInActiveTxn();  // 确保游标在活跃事务中
     WT_CURSOR* c = curwrap.get();
     invariant(c);
 
+    // 参数验证：确保至少有一个记录要插入
     invariant(nRecords != 0);
 
+    // ========== RecordId生成和验证逻辑 ==========
     if (_keyFormat == KeyFormat::Long) {
+        // 检查是否提供了RecordId（非oplog集合可能需要自动生成）
         bool areRecordIdsProvided = !records->id.isNull() && !_isOplog;
-        RecordId highestRecordIdProvided;
+        RecordId highestRecordIdProvided;  // 跟踪提供的最高RecordId
 
+        // 为非oplog集合预分配RecordId块，提高ID生成效率
+        // oplog集合的RecordId从时间戳中提取，不需要预分配
         long long nextId =
             (_isOplog || areRecordIdsProvided) ? 0 : _reserveIdBlock(opCtx, nRecords);
 
         // Non-clustered record stores will extract the RecordId key for the oplog and generate
         // unique int64_t RecordIds if RecordIds are not set.
+        // 为每个记录处理RecordId：oplog从时间戳提取，普通集合自动生成或验证
         for (size_t i = 0; i < nRecords; i++) {
             auto& record = records[i];
             if (_isOplog) {
+                // oplog集合：从时间戳中提取RecordId，确保oplog条目的时序性
                 auto swRecordId = record_id_helpers::keyForOptime(timestamps[i], KeyFormat::Long);
                 if (!swRecordId.isOK())
                     return swRecordId.getStatus();
@@ -1095,7 +1141,9 @@ Status WiredTigerRecordStore::_insertRecords(OperationContext* opCtx,
                 // In the normal write paths, a timestamp is always set. It is only in unusual cases
                 // like inserting the oplog seed document where the caller does not provide a
                 // timestamp.
+                // 处理特殊情况：没有提供时间戳时从BSON文档中提取
                 if (MONGO_unlikely(timestamps[i].isNull() || kDebugBuild)) {
+                    // 从oplog条目的'ts'字段中提取时间戳
                     auto swRecordIdFromBSON =
                         record_id_helpers::extractKeyOptime(record.data.data(), record.data.size());
                     if (!swRecordIdFromBSON.isOK())
@@ -1103,6 +1151,7 @@ Status WiredTigerRecordStore::_insertRecords(OperationContext* opCtx,
 
                     // Double-check that the 'ts' field in the oplog entry matches the assigned
                     // timestamp, if it was provided.
+                    // 调试模式下验证提供的时间戳与文档中的时间戳一致
                     dassert(timestamps[i].isNull() ||
                                 swRecordIdFromBSON.getValue() == swRecordId.getValue(),
                             fmt::format(
@@ -1116,19 +1165,23 @@ Status WiredTigerRecordStore::_insertRecords(OperationContext* opCtx,
                 }
                 // The records being inserted into the oplog must have increasing
                 // recordId. Therefore the last record has the highest recordId.
+                // 确保oplog条目按RecordId严格递增顺序插入，维护oplog的时序性
                 dassert(i == 0 || records[i].id > records[i - 1].id);
             } else {
+                // 普通集合：自动生成RecordId或验证提供的RecordId
                 // Some RecordStores, like TemporaryRecordStores, may want to set their own
                 // RecordIds.
                 if (!areRecordIdsProvided) {
                     // Since a recordId wasn't provided for the first record, the recordId
                     // shouldn't have been provided for any record.
+                    // 自动生成模式：为每个记录分配递增的RecordId
                     invariant(record.id.isNull());
                     record.id = RecordId(nextId++);
                     invariant(record.id.isValid());
                 } else {
                     // Since a recordId was provided for the first record, the recordId
                     // should have been provided for all records.
+                    // 手动提供模式：验证所有记录都有有效的RecordId
                     invariant(!record.id.isNull());
                     if (record.id > highestRecordIdProvided) {
                         highestRecordIdProvided = record.id;
@@ -1141,25 +1194,34 @@ Status WiredTigerRecordStore::_insertRecords(OperationContext* opCtx,
         // any of the inserts we are performing has a higher recordId.
         // We only have to do this when the records we are inserting were accompanied
         // by caller provided recordIds.
+        // 更新记录存储的最高RecordId计数器，防止ID重复
         if (areRecordIdsProvided) {
             _updateLargestRecordId(opCtx, highestRecordIdProvided.getLong());
         }
     }
 
+    // 初始化资源消耗指标收集器，用于性能监控
     auto& metricsCollector = ResourceConsumption::MetricsCollector::get(opCtx);
 
-    int64_t totalLength = 0;
+    // ========== 批量插入到WiredTiger存储引擎 ==========
+    int64_t totalLength = 0;  // 统计插入数据的总大小
     for (size_t i = 0; i < nRecords; i++) {
         auto& record = records[i];
         totalLength += record.data.size();
+        
+        // 验证RecordId的有效性和合法性
         invariant(!record.id.isNull());
         invariant(!record_id_helpers::isReserved(record.id));
+        
         Timestamp ts = timestamps[i];
         if (_isOplog) {
+            // oplog特殊处理：设置无序提交以触发日志刷新
             // Setting this transaction to be unordered will trigger a journal flush. Because these
             // are direct writes into the oplog, the machinery to trigger a journal flush is
             // bypassed. A followup oplog read will require a fres value to make progress.
             shard_role_details::getRecoveryUnit(opCtx)->setOrderedCommit(false);
+            
+            // 验证oplog RecordId与时间戳的一致性
             auto oplogKeyTs = Timestamp(record.id.getLong());
             if (!ts.isNull()) {
                 invariant(oplogKeyTs == ts);
@@ -1169,20 +1231,28 @@ Status WiredTigerRecordStore::_insertRecords(OperationContext* opCtx,
                           shard_role_details::getRecoveryUnit(opCtx)->getCommitTimestamp());
             }
         }
+        
+        // 设置事务时间戳，确保读写一致性
         if (!ts.isNull()) {
             LOGV2_DEBUG(22403, 4, "inserting record with timestamp {ts}", "ts"_attr = ts);
             fassert(39001, shard_role_details::getRecoveryUnit(opCtx)->setTimestamp(ts));
         }
+        
+        // 准备WiredTiger游标的键值对
         CursorKey key = makeCursorKey(record.id, _keyFormat);
-        setKey(c, &key);
+        setKey(c, &key);  // 设置游标键
         WiredTigerItem value(record.data.data(), record.data.size());
-        c->set_value(c, value.Get());
+        c->set_value(c, value.Get());  // 设置游标值
+        
+        // 执行实际的WiredTiger插入操作
         int ret = WT_OP_CHECK(wiredTigerCursorInsert(*WiredTigerRecoveryUnit::get(opCtx), c));
 
+        // 处理重复键错误（仅限clustered集合）
         if (ret == WT_DUPLICATE_KEY) {
             invariant(!_overwrite);
             invariant(_keyFormat == KeyFormat::String);
 
+            // 测试模式下获取冲突的文档内容
             BSONObj foundValueObj;
             if (TestingProctor::instance().isEnabled()) {
                 WT_ITEM foundValue;
@@ -1190,6 +1260,7 @@ Status WiredTigerRecordStore::_insertRecords(OperationContext* opCtx,
                 foundValueObj = BSONObj(reinterpret_cast<const char*>(foundValue.data));
             }
 
+            // 返回包含详细冲突信息的错误状态
             return Status{DuplicateKeyErrorInfo{BSONObj(),
                                                 BSONObj(),
                                                 BSONObj(),
@@ -1198,33 +1269,44 @@ Status WiredTigerRecordStore::_insertRecords(OperationContext* opCtx,
                           "Duplicate cluster key found"};
         }
 
+        // 检查其他WiredTiger错误
         if (ret)
             return wtRCToStatus(ret, c->session, "WiredTigerRecordStore::insertRecord");
 
         // Increment metrics for each insert separately, as opposed to outside of the loop. The API
         // requires that each record be accounted for separately.
+        // 更新资源消耗指标（排除oplog和变更流集合）
         if (!_isOplog && !_isChangeCollection) {
             auto keyLength = computeRecordIdSize(record.id);
             metricsCollector.incrementOneDocWritten(_uri, value.size + keyLength);
         }
     }
+    
+    // ========== 更新集合统计信息 ==========
+    // 原子性地更新记录数量和数据大小
     _changeNumRecordsAndDataSize(opCtx, nRecords, totalLength);
 
+    // ========== oplog截断标记维护 ==========
     if (_oplogTruncateMarkers) {
         invariant(_isOplog);
         // records[nRecords - 1] is the record in the oplog with the highest recordId.
+        // 更新oplog截断标记，用于控制oplog大小和自动清理旧条目
         auto wall = [&] {
+            // 从最后一个oplog条目中提取墙上时钟时间
             BSONObj obj = records[nRecords - 1].data.toBson();
             BSONElement ele = obj[repl::DurableOplogEntry::kWallClockTimeFieldName];
             if (!ele) {
                 // This shouldn't happen in normal cases, but this is needed because some tests do
                 // not add wall clock times. Note that, with this addition, it's possible that the
                 // oplog may grow larger than expected if --oplogMinRetentionHours is set.
+                // 测试场景下的兜底处理：如果没有墙上时钟时间，使用当前时间
                 return Date_t::now();
             } else {
                 return ele.Date();
             }
         }();
+        
+        // 在事务提交时更新当前截断标记的统计信息
         _oplogTruncateMarkers->updateCurrentMarkerAfterInsertOnCommit(
             opCtx, totalLength, records[nRecords - 1].id, wall, nRecords);
     }

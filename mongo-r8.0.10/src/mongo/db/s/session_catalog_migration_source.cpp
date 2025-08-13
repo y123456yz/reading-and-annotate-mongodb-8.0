@@ -443,12 +443,89 @@ SessionCatalogMigrationSource::OplogResult SessionCatalogMigrationSource::getLas
     }
 }
 
+/**
+ * 获取下一个会话oplog条目的主调度函数 - 分片迁移过程中的会话数据传输核心
+ * 
+ * 核心功能：
+ * 1. 统一协调历史会话数据和增量新写操作两个数据源的oplog获取
+ * 2. 实现分阶段迁移策略：优先处理历史数据，再处理实时增量数据
+ * 3. 确保会话oplog条目的有序传输和完整性保证
+ * 4. 支持可重试写入、内部事务和普通事务的统一处理
+ * 5. 维护迁移过程中的状态一致性和数据完整性
+ * 
+ * 设计原理：
+ * - 双数据源管理：历史会话数据(_sessionOplogIterators)和新写操作(_newWriteOpTimeList)
+ * - 优先级调度：先耗尽历史数据，再处理增量数据，确保时序正确性
+ * - 状态驱动：通过内部状态管理确保数据获取的一致性
+ * - 容错处理：支持oplog丢失、回滚等异常情况的恢复
+ * 
+ * 迁移阶段：
+ * Phase 1 - 历史数据迁移：
+ *   - 从config.transactions表扫描得到的会话记录
+ *   - 通过TransactionHistoryIterator遍历oplog链
+ *   - 处理可重试写入和已提交事务的历史操作
+ * 
+ * Phase 2 - 增量数据捕获：
+ *   - 迁移过程中新产生的写操作
+ *   - 通过OpObserver实时通知的opTime队列
+ *   - 确保迁移期间的数据变更不丢失
+ * 
+ * 支持的会话类型：
+ * - 可重试写入：支持insert/update/delete/findAndModify的幂等重试
+ * - 内部事务：retryable internal transaction的完整状态迁移
+ * - 普通事务：多文档事务的哨兵条目生成
+ * - ApplyOps优化：批量操作的解包和分发处理
+ * 
+ * 性能优化：
+ * - 预取机制：提前获取和缓冲oplog条目
+ * - 分片键过滤：自动跳过不相关的oplog条目
+ * - 镜像处理：异步获取findAndModify的前置/后置镜像
+ * - 会话转换：内部事务到父会话的自动转换
+ * 
+ * 错误处理：
+ * - Rollback检测：通过rollbackId检测和处理数据回滚
+ * - Oplog截断：生成哨兵条目标识历史丢失
+ * - 网络重试：支持分布式环境下的网络故障恢复
+ * 
+ * @param opCtx 操作上下文，包含事务、会话、锁等状态信息
+ * @return bool 如果成功获取到oplog条目返回true，如果没有更多数据返回false
+ */
 bool SessionCatalogMigrationSource::fetchNextOplog(OperationContext* opCtx) {
+    // ========== 第一优先级：处理历史会话数据 ==========
+    // 首先尝试从会话目录（config.transactions）中获取历史会话数据
+    // 这是迁移的第一阶段，确保所有已存在的会话状态都被正确迁移
     if (_fetchNextOplogFromSessionCatalog(opCtx)) {
+        // 成功获取到历史会话数据的oplog条目
+        // 调用者可以通过getLastFetchedOplog()获取具体的oplog内容
+        // 
+        // 历史数据的特点：
+        // 1. 来源于config.transactions表的扫描结果
+        // 2. 通过TransactionHistoryIterator遍历oplog链
+        // 3. 按会话分组，每个会话内部按时间顺序处理
+        // 4. 包含可重试写入和已提交事务的完整历史
         return true;
     }
 
+    // ========== 第二优先级：处理增量新写操作 ==========
+    // 当历史数据耗尽后，开始处理迁移过程中产生的新写操作
+    // 这是迁移的第二阶段，确保迁移期间的数据变更不丢失
     return _fetchNextNewWriteOplog(opCtx);
+    
+    // 增量数据的特点：
+    // 1. 来源于OpObserver的实时通知
+    // 2. 通过opTime队列管理新写操作
+    // 3. 支持可重试写入和事务的实时捕获
+    // 4. 确保迁移期间的数据一致性
+    //
+    // 返回值说明：
+    // - true: 成功获取到oplog条目，调用者应继续处理
+    // - false: 当前没有更多数据，调用者应等待新数据或结束迁移
+    //
+    // 调用时序：
+    // 1. 迁移开始：主要返回历史数据
+    // 2. 历史数据耗尽：开始返回增量数据
+    // 3. 进入临界区：只返回剩余的增量数据
+    // 4. 迁移完成：返回false，结束数据传输
 }
 
 std::shared_ptr<Notification<bool>> SessionCatalogMigrationSource::getNotificationForNewOplog() {
@@ -802,42 +879,110 @@ void SessionCatalogMigrationSource::_tryFetchNextNewWriteOplog(stdx::unique_lock
     }
 }
 
+/**
+ * 获取下一个新写操作的oplog条目函数 - 分片迁移过程中的会话增量oplog处理
+ * 
+ * 核心功能：
+ * 1. 从新写操作oplog缓冲区中获取下一个需要迁移的oplog条目
+ * 2. 处理可重试写入和内部事务的oplog条目预处理和镜像获取
+ * 3. 支持前置/后置镜像的异步获取和会话信息的向下兼容转换
+ * 4. 管理oplog条目的生命周期，确保按正确顺序返回原始条目和镜像条目
+ * 5. 维护迁移过程中新产生的会话写操作的完整历史传输
+ * 
+ * 设计原理：
+ * - 双阶段返回：先返回镜像条目(如果存在)，再返回原始oplog条目
+ * - 会话兼容性：将内部事务的会话信息转换为父会话格式
+ * - 异步处理：通过锁机制和缓冲区实现高效的并发访问
+ * - 完整性保证：确保所有相关的oplog条目都被正确迁移
+ * 
+ * 适用场景：
+ * - chunk迁移过程中捕获迁移期间新产生的会话写操作
+ * - 可重试写入的增量同步和历史重建
+ * - 内部事务和普通事务的oplog条目统一处理
+ * - 分片间会话状态的一致性维护
+ * 
+ * 状态管理：
+ * - _lastFetchedNewWriteOplogImage: 当前待返回的镜像条目
+ * - _lastFetchedNewWriteOplog: 当前待返回的原始oplog条目
+ * - _unprocessedNewWriteOplogBuffer: 已处理但未返回的oplog条目缓冲区
+ * 
+ * @param opCtx 操作上下文，包含事务、会话、锁等状态信息
+ * @return bool 如果成功获取到下一个oplog条目返回true，否则返回false
+ */
 bool SessionCatalogMigrationSource::_fetchNextNewWriteOplog(OperationContext* opCtx) {
+    // 获取新写操作的互斥锁，确保并发安全访问
     stdx::unique_lock<Latch> lk(_newOplogMutex);
 
+    // ========== 第一阶段：处理镜像条目返回 ==========
+    // 检查是否存在待返回的前置/后置镜像条目
     if (_lastFetchedNewWriteOplogImage) {
         // When `_lastFetchedNewWriteOplogImage` is set, it means we found an oplog entry with
         // a pre/post image. At this step, we've already returned the image oplog entry, but we
         // have yet to return the original oplog entry stored in `_lastFetchedNewWriteOplog`. We
         // will unset this value and return such that the next call to `getLastFetchedOplog`
         // will return `_lastFetchedNewWriteOplog`.
+        // 
+        // 双阶段返回机制的第二阶段：
+        // 1. 第一次调用时返回了镜像条目（_lastFetchedNewWriteOplogImage）
+        // 2. 第二次调用时返回原始条目（_lastFetchedNewWriteOplog）
+        // 3. 这样确保findAndModify等操作的完整oplog信息都被传输
         _lastFetchedNewWriteOplogImage.reset();
         return true;
     }
 
+    // 重置上一次获取的oplog条目，准备获取新的条目
     _lastFetchedNewWriteOplog.reset();
 
+    // ========== 第二阶段：填充未处理的oplog缓冲区 ==========
+    // 确保未处理的oplog缓冲区中有可用的条目
     while (_unprocessedNewWriteOplogBuffer.empty()) {
+        // 如果新写操作时间戳列表为空，说明没有更多的新写操作需要处理
         if (_newWriteOpTimeList.empty()) {
             return false;
         }
+        
+        // 尝试从oplog时间戳队列中获取下一个oplog条目
+        // 这个函数会从磁盘读取oplog，并根据条目类型进行相应处理
         _tryFetchNextNewWriteOplog(lk, opCtx);
     }
 
+    // ========== 第三阶段：处理缓冲区中的oplog条目 ==========
+    // 从缓冲区中获取下一个要处理的oplog条目
     auto nextNewWriteOplog = _unprocessedNewWriteOplogBuffer.back();
+    
+    // 释放锁以执行可能耗时的I/O操作（获取前置/后置镜像）
+    // 这避免了在执行磁盘读取时持有锁导致的性能问题
     lk.unlock();
+    
+    // 异步获取该oplog条目相关的前置/后置镜像
+    // 对于findAndModify等操作，可能需要额外的镜像数据用于重试
     auto nextNewWriteImageOplog = fetchPrePostImageOplog(opCtx, &(nextNewWriteOplog));
+    
+    // 重新获取锁以更新内部状态
     lk.lock();
 
+    // ========== 第四阶段：设置返回状态 ==========
+    // 确保状态变量的一致性，避免状态混乱
     invariant(!_lastFetchedNewWriteOplogImage);
     invariant(!_lastFetchedNewWriteOplog);
+    
+    // 如果存在前置/后置镜像，首先设置镜像条目
     if (nextNewWriteImageOplog) {
+        // 增加迁移计数器，用于进度监控
         _sessionOplogEntriesToBeMigratedSoFar.addAndFetch(1);
+        
+        // 进行会话信息的向下兼容转换
+        // 将内部事务的会话ID转换为对应的父会话ID，确保接收端能正确处理
         _lastFetchedNewWriteOplogImage = downConvertSessionInfoIfNeeded(*nextNewWriteImageOplog);
     }
+    
+    // 设置原始oplog条目，同样进行会话信息转换
     _lastFetchedNewWriteOplog = downConvertSessionInfoIfNeeded(nextNewWriteOplog);
+    
+    // 从缓冲区中移除已处理的条目
     _unprocessedNewWriteOplogBuffer.pop_back();
 
+    // 成功获取到oplog条目
     return true;
 }
 

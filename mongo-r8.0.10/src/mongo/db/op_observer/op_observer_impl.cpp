@@ -582,6 +582,45 @@ void OpObserverImpl::onAbortIndexBuild(OperationContext* opCtx,
 
 namespace {
 
+/**
+ * 插入操作oplog记录函数 - MongoDB普通写入模式的oplog生成核心
+ * 
+ * 核心功能：
+ * 1. 为每个插入操作生成独立的oplog条目并写入WiredTiger存储引擎
+ * 2. 构建完整的oplog条目链，支持可重试写入的oplog关联
+ * 3. 处理分片环境下的resharding目标分片路由和迁移标记
+ * 4. 管理oplog时间戳预分配和存储引擎RecordId映射
+ * 5. 支持租户迁移场景下的oplog元数据传播
+ * 
+ * 设计原理：
+ * - 批量构建：一次性构建所有oplog条目，减少锁争用和系统调用
+ * - 时间戳一致性：预分配或使用现有的oplog时间戳确保顺序性
+ * - 链式关联：通过prevOpTime字段建立oplog条目间的因果关系
+ * - 存储优化：直接写入oplog集合，避免多次序列化开销
+ * 
+ * 适用场景：
+ * - 普通写入模式（非批量写入、非多文档事务）的插入操作
+ * - 可重试写入需要生成独立oplog条目的场景
+ * - 分片环境下需要记录路由信息的插入操作
+ * - 副本集主节点的实时oplog生成
+ * 
+ * 重要约束：
+ * - 仅用于普通写入模式，批量写入和多文档事务有专门处理
+ * - 要求调用者已获取oplog写入锁（AutoGetOplogFastPath）
+ * - 必须在WriteUnitOfWork事务上下文中执行
+ * - 需要确保fromMigrate数组大小与插入操作数量一致
+ * 
+ * @param opCtx 操作上下文，包含事务、会话、锁等状态信息
+ * @param oplogEntryTemplate oplog条目模板，包含公共字段如命名空间、UUID等
+ * @param begin 插入语句迭代器开始位置，指向第一个待处理文档
+ * @param end 插入语句迭代器结束位置，标记批次边界
+ * @param recordIds 存储引擎分配的记录ID列表，用于oplog条目记录
+ * @param fromMigrate 每个插入的迁移标志数组，标识是否来自分片迁移
+ * @param shardingWriteRouter 分片写入路由器，处理resharding目标分片计算
+ * @param collectionPtr 目标集合指针，提供文档键提取等操作
+ * @param operationLogger 操作日志记录器，负责实际的oplog写入
+ * @return std::vector<repl::OpTime> 返回所有插入操作的oplog时间戳列表
+ */
 std::vector<repl::OpTime> _logInsertOps(OperationContext* opCtx,
                                         MutableOplogEntry* oplogEntryTemplate,
                                         std::vector<InsertStatement>::const_iterator begin,
@@ -593,84 +632,130 @@ std::vector<repl::OpTime> _logInsertOps(OperationContext* opCtx,
                                         OperationLogger* operationLogger) {
     invariant(begin != end);
 
+    // 获取命名空间信息，用于oplog条目构建和验证
     auto nss = oplogEntryTemplate->getNss();
+    
     // The number of entries in 'fromMigrate' should be consistent with the number of insert
     // operations in [begin, end). Also, 'fromMigrate' is a sharding concept, so there is no
     // need to check 'fromMigrate' for inserts that are not replicated. See SERVER-75829.
+    // 验证fromMigrate数组大小与插入操作数量的一致性
+    // fromMigrate是分片概念，仅对需要复制的插入操作进行检查
     invariant(std::distance(fromMigrate.begin(), fromMigrate.end()) == std::distance(begin, end),
               oplogEntryTemplate->toReplOperation().toBSON().toString());
 
     // If this oplog entry is from a tenant migration, include the tenant migration
     // UUID and optional donor timeline metadata.
+    // 租户迁移支持：如果当前操作来自租户迁移，添加迁移UUID和时间线元数据
     if (const auto& recipientInfo = repl::tenantMigrationInfo(opCtx)) {
+        // 设置租户迁移UUID，用于目标租户的oplog标识
         oplogEntryTemplate->setFromTenantMigration(recipientInfo->uuid);
+        
+        // 变更流支持：如果租户启用了变更流且提供了源oplog数据，设置时间线信息
         if (oplogEntryTemplate->getTid() &&
             change_stream_serverless_helpers::isChangeStreamEnabled(
                 opCtx, *oplogEntryTemplate->getTid()) &&
             recipientInfo->donorOplogEntryData) {
+            // 设置源集群的oplog时间戳，用于跨集群事件关联
             oplogEntryTemplate->setDonorOpTime(recipientInfo->donorOplogEntryData->donorOpTime);
+            // 设置applyOps索引，用于事务操作的精确定位
             oplogEntryTemplate->setDonorApplyOpsIndex(
                 recipientInfo->donorOplogEntryData->applyOpsIndex);
         }
     }
 
+    // 计算当前批次的插入操作数量
     const size_t count = end - begin;
+    
     // Either no recordIds were passed in, or the number passed in is equal to the number
     // of inserts that happened.
+    // 验证recordIds数组：要么为空，要么数量与插入操作数量一致
     invariant(recordIds.empty() || recordIds.size() == count,
               str::stream() << "recordIds' size: " << recordIds.size()
                             << ", is non-empty but not equal to count: " << count);
 
     // Use OplogAccessMode::kLogOp to avoid recursive locking.
+    // 获取oplog集合的快速访问路径，使用kLogOp模式避免递归锁定
+    // 这是专门为oplog写入优化的访问模式，减少锁争用
     AutoGetOplogFastPath oplogWrite(opCtx, OplogAccessMode::kLogOp);
 
+    // 开启写入单元，确保所有oplog条目的原子性写入
     WriteUnitOfWork wuow(opCtx);
 
-    std::vector<repl::OpTime> opTimes(count);
-    std::vector<Timestamp> timestamps(count);
-    std::vector<BSONObj> bsonOplogEntries(count);
-    std::vector<Record> records(count);
+    // 预分配存储容器，避免动态扩容的性能开销
+    std::vector<repl::OpTime> opTimes(count);       // 存储每个oplog条目的时间戳
+    std::vector<Timestamp> timestamps(count);      // 存储时间戳用于存储引擎
+    std::vector<BSONObj> bsonOplogEntries(count);  // 存储序列化的BSON oplog条目
+    std::vector<Record> records(count);            // 存储引擎记录结构
+    
+    // 遍历每个插入语句，构建对应的oplog条目
     for (size_t i = 0; i < count; i++) {
         // Make a copy from the template for each insert oplog entry.
+        // 为每个插入操作创建oplog条目模板的副本
         MutableOplogEntry oplogEntry = *oplogEntryTemplate;
+        
         // Make a mutable copy.
+        // 获取插入语句的oplog时间戳槽位（可能已预分配）
         auto insertStatementOplogSlot = begin[i].oplogSlot;
+        
         // Fetch optime now, if not already fetched.
+        // 如果时间戳槽位为空，立即分配新的oplog时间戳
         if (insertStatementOplogSlot.isNull()) {
             insertStatementOplogSlot = operationLogger->getNextOpTimes(opCtx, 1U)[0];
         }
+        
+        // 提取文档的分片键和ID，用于oplog条目的o2字段
+        // 这些信息对于分片环境下的oplog应用和变更流至关重要
         const auto docKey = getDocumentKey(collectionPtr, begin[i].doc).getShardKeyAndId();
+        
+        // 设置存储引擎记录ID（如果可用）
         if (!recordIds.empty()) {
             oplogEntry.setRecordId(recordIds[i]);
         }
-        oplogEntry.setObject(begin[i].doc);
-        oplogEntry.setObject2(docKey);
-        oplogEntry.setOpTime(insertStatementOplogSlot);
+        
+        // 设置oplog条目的核心字段
+        oplogEntry.setObject(begin[i].doc);        // o字段：实际插入的文档
+        oplogEntry.setObject2(docKey);             // o2字段：文档的分片键和ID
+        oplogEntry.setOpTime(insertStatementOplogSlot);  // ts字段：oplog时间戳
+        
+        // 设置resharding目标分片信息（如果处于resharding过程中）
+        // 这用于数据重新分片时的精确路由
         oplogEntry.setDestinedRecipient(
             shardingWriteRouter.getReshardingDestinedRecipient(begin[i].doc));
+        
+        // 故障点支持：允许测试框架手动设置目标分片
         addDestinedRecipient.execute([&](const BSONObj& data) {
             auto recipient = data["destinedRecipient"].String();
             oplogEntry.setDestinedRecipient(boost::make_optional<ShardId>({recipient}));
         });
 
+        // 构建oplog条目链：设置前一个oplog条目的时间戳
+        // 这对于可重试写入和oplog完整性验证至关重要
         repl::OplogLink oplogLink;
         if (i > 0)
-            oplogLink.prevOpTime = opTimes[i - 1];
+            oplogLink.prevOpTime = opTimes[i - 1];  // 链接到前一个oplog条目
 
+        // 设置迁移标志：标识当前插入是否来自分片迁移
         oplogEntry.setFromMigrateIfTrue(fromMigrate[i]);
 
+        // 添加oplog条目链信息：包括语句ID、前置时间戳等
+        // 这对可重试写入的去重和幂等性保证至关重要
         operationLogger->appendOplogEntryChainInfo(
             opCtx, &oplogEntry, &oplogLink, begin[i].stmtIds);
 
-        opTimes[i] = insertStatementOplogSlot;
-        timestamps[i] = insertStatementOplogSlot.getTimestamp();
-        bsonOplogEntries[i] = oplogEntry.toBSON();
+        // 收集构建完成的oplog条目信息
+        opTimes[i] = insertStatementOplogSlot;                    // 保存oplog时间戳
+        timestamps[i] = insertStatementOplogSlot.getTimestamp();  // 提取时间戳组件
+        bsonOplogEntries[i] = oplogEntry.toBSON();               // 序列化为BSON格式
+        
         // The storage engine will assign the RecordId based on the "ts" field of the oplog entry,
         // see record_id_helpers::extractKey.
+        // 构建存储引擎记录：RecordId由存储引擎根据ts字段自动分配
         records[i] = Record{
             RecordId(), RecordData(bsonOplogEntries[i].objdata(), bsonOplogEntries[i].objsize())};
     }
 
+    // 测试支持的故障点：在oplog时间戳生成和实际写入之间暂停
+    // 用于测试并发场景和时序相关的边界条件
     sleepBetweenInsertOpTimeGenerationAndLogOp.execute([&](const BSONObj& data) {
         auto numMillis = data["waitForMillis"].numberInt();
         LOGV2(7456300,
@@ -682,19 +767,29 @@ std::vector<repl::OpTime> _logInsertOps(OperationContext* opCtx,
         sleepmillis(numMillis);
     });
 
+    // 验证oplog时间戳的有效性
     invariant(!opTimes.empty());
     auto lastOpTime = opTimes.back();
     invariant(!lastOpTime.isNull());
+    
+    // 获取墙上时钟时间，用于oplog条目的wall字段
     auto wallClockTime = oplogEntryTemplate->getWallClockTime();
+    
+    // 批量写入oplog记录到存储引擎
+    // 核心操作：将所有构建好的oplog条目原子性地写入oplog集合
     operationLogger->logOplogRecords(opCtx,
-                                     nss,
-                                     &records,
-                                     timestamps,
-                                     oplogWrite.getCollection(),
-                                     lastOpTime,
-                                     wallClockTime,
-                                     /*isAbortIndexBuild=*/false);
+                                     nss,                        // 命名空间
+                                     &records,                   // oplog记录数组
+                                     timestamps,                 // 时间戳数组
+                                     oplogWrite.getCollection(), // oplog集合引用
+                                     lastOpTime,                 // 最后一个oplog时间戳
+                                     wallClockTime,              // 墙上时钟时间
+                                     /*isAbortIndexBuild=*/false); // 非索引构建中止操作
+    
+    // 提交写入单元，确保所有oplog条目持久化到存储引擎
     wuow.commit();
+    
+    // 返回所有插入操作的oplog时间戳，供调用者后续处理
     return opTimes;
 }
 
@@ -815,6 +910,7 @@ void OpObserverImpl::onInserts(OperationContext* opCtx,
             operation.setInitializedStatementIds(iter->stmtIds);
             // 将操作添加到批量上下文中
             batchedWriteContext.addBatchedOperation(opCtx, operation);
+            // 批量写的oplog是在WriteUnitOfWork::commit()->onBatchedWriteCommit()中写入的。
         }
     } else if (inMultiDocumentTransaction) {
         // 多文档事务模式：将操作添加到事务参与者中
@@ -949,9 +1045,40 @@ void OpObserverImpl::onDeleteGlobalIndexKey(OperationContext* opCtx,
         opCtx, &oplogEntry, _operationLogger.get(), isRequiredInMultiDocumentTransaction);
 }
 
+/**
+ * 更新操作的观察者函数 - MongoDB oplog记录的核心入口
+ * 
+ * 核心功能：
+ * 1. 处理单个文档更新操作的oplog记录和复制日志生成
+ * 2. 支持三种不同的写入模式：普通写入、批量写入、多文档事务
+ * 3. 处理可重试写入的findAndModify操作的前置/后置镜像存储
+ * 4. 管理变更流预镜像收集和镜像集合的数据记录
+ * 5. 处理分片环境下的resharding目标分片路由和文档键提取
+ * 6. 支持租户迁移和集群间数据同步的元数据传播
+ * 
+ * 写入模式处理：
+ * - 普通写入：直接记录到oplog，支持立即的镜像存储和会话更新
+ * - 批量写入：累积操作到BatchedWriteContext，延迟批量提交
+ * - 多文档事务：添加到TransactionParticipant，事务提交时统一处理
+ * 
+ * 镜像处理机制：
+ * - 可重试findAndModify：在侧集合中存储前置/后置镜像用于重试
+ * - 变更流：在专门的预镜像集合中存储文档变更前的状态
+ * - 分片文档键：提取和记录文档在分片环境中的路由键信息
+ * 
+ * 完整性保证：
+ * - 严格的参数验证和early return优化
+ * - 完整的错误处理和故障点支持
+ * - 原子性操作和会话状态一致性维护
+ * 
+ * @param opCtx 操作上下文，包含会话、事务、锁等状态信息
+ * @param args 更新操作的详细参数，包含集合、更新内容、条件等
+ * @param opAccumulator 可选的操作状态累积器，收集opTime和镜像信息等执行结果
+ */
 void OpObserverImpl::onUpdate(OperationContext* opCtx,
                               const OplogUpdateEntryArgs& args,
                               OpStateAccumulator* opAccumulator) {
+    // 故障点支持：测试框架可以通过故障点模拟更新失败场景
     failCollectionUpdates.executeIf(
         [&](const BSONObj&) {
             uasserted(40654,
@@ -962,24 +1089,30 @@ void OpObserverImpl::onUpdate(OperationContext* opCtx,
         },
         [&](const BSONObj& data) {
             // If the failpoint specifies no collection or matches the existing one, fail.
+            // 故障点条件检查：如果指定了集合名称，只对匹配的集合生效
             const auto fpNss = NamespaceStringUtil::parseFailPointData(data, "collectionNS");
             return fpNss.isEmpty() || args.coll->ns() == fpNss;
         });
 
     // Do not log a no-op operation; see SERVER-21738
+    // 早期退出优化：如果更新内容为空（no-op操作），直接返回，避免无意义的oplog记录
     if (args.updateArgs->update.isEmpty()) {
         return;
     }
 
+    // 获取操作环境和状态信息
     auto txnParticipant = TransactionParticipant::get(opCtx);
     const auto& nss = args.coll->ns();
     auto replCoord = repl::ReplicationCoordinator::get(opCtx);
     const bool isOplogDisabled = replCoord->isOplogDisabledFor(opCtx, nss);
+    
+    // 检查当前操作的执行模式
     const bool inMultiDocumentTransaction =
         txnParticipant && !isOplogDisabled && txnParticipant.transactionIsOpen();
     auto& batchedWriteContext = BatchedWriteContext::get(opCtx);
     const bool inBatchedWrite = batchedWriteContext.writesAreBatched();
 
+    // 早期退出检查：如果不需要记录oplog或处于特殊状态，直接返回
     if (_skipOplogOps(isOplogDisabled,
                       inBatchedWrite,
                       inMultiDocumentTransaction,
@@ -988,53 +1121,83 @@ void OpObserverImpl::onUpdate(OperationContext* opCtx,
         return;
     }
 
+    // 初始化分片写入路由器，用于计算resharding目标分片
     auto shardingWriteRouter = std::make_unique<ShardingWriteRouter>(opCtx, nss);
     OpTimeBundle opTime;
+    
     if (inBatchedWrite) {
+        // ========== 批量写入模式 ==========
+        // 创建更新操作的oplog条目，但不立即写入
         auto operation = MutableOplogEntry::makeUpdateOperation(
             nss, args.coll->uuid(), args.updateArgs->update, args.updateArgs->criteria);
+            
+        // 设置resharding目标分片信息
         operation.setDestinedRecipient(
             shardingWriteRouter->getReshardingDestinedRecipient(args.updateArgs->updatedDoc));
+            
+        // 设置迁移标志，标识操作是否来自chunk迁移
         operation.setFromMigrateIfTrue(args.updateArgs->source == OperationSource::kFromMigrate);
+        
+        // 设置差异插入检查标志，用于特殊的更新操作验证
         if (args.updateArgs->mustCheckExistenceForInsertOperations) {
             operation.setCheckExistenceForDiffInsert(true);
         }
+        
+        // 设置复制的记录ID，用于存储引擎层面的记录标识
         if (!args.updateArgs->replicatedRecordId.isNull()) {
             operation.setRecordId(args.updateArgs->replicatedRecordId);
         }
+        
+        // 将操作添加到批量上下文中，延迟到commit时统一处理
         batchedWriteContext.addBatchedOperation(opCtx, operation);
+        
     } else if (inMultiDocumentTransaction) {
+        // ========== 多文档事务模式 ==========
+        
+        // 检查是否为可重试内部事务
         const bool inRetryableInternalTransaction =
             isInternalSessionForRetryableWrite(*opCtx->getLogicalSessionId());
 
+        // 验证可重试写入只能在可重试内部事务中执行
         invariant(
             inRetryableInternalTransaction ||
                 args.retryableFindAndModifyLocation == RetryableFindAndModifyLocation::kNone,
             str::stream()
                 << "Attempted a retryable write within a non-retryable multi-document transaction");
 
+        // 创建事务中的更新操作条目
         auto operation = MutableOplogEntry::makeUpdateOperation(
             nss, args.coll->uuid(), args.updateArgs->update, args.updateArgs->criteria);
 
+        // 可重试内部事务的特殊处理
         if (inRetryableInternalTransaction) {
+            // 设置语句ID用于可重试写入的去重
             operation.setInitializedStatementIds(args.updateArgs->stmtIds);
+            
+            // 处理前置镜像存储（用于可重试findAndModify）
             if (args.updateArgs->storeDocOption == CollectionUpdateArgs::StoreDocOption::PreImage) {
                 invariant(!args.updateArgs->preImageDoc.isEmpty(),
                           str::stream()
                               << "Pre-image document must be present for pre-image recording");
                 operation.setPreImage(args.updateArgs->preImageDoc.getOwned());
                 operation.setPreImageRecordedForRetryableInternalTransaction();
+                
+                // 如果需要在侧集合中存储镜像
                 if (args.retryableFindAndModifyLocation ==
                     RetryableFindAndModifyLocation::kSideCollection) {
                     operation.setNeedsRetryImage(repl::RetryImageEnum::kPreImage);
                 }
             }
+            
+            // 处理后置镜像存储（用于可重试findAndModify）
             if (args.updateArgs->storeDocOption ==
                 CollectionUpdateArgs::StoreDocOption::PostImage) {
                 invariant(!args.updateArgs->updatedDoc.isEmpty(),
                           str::stream()
                               << "Update document must be present for post-image recording");
                 operation.setPostImage(args.updateArgs->updatedDoc.getOwned());
+                
+                // 如果需要在侧集合中存储镜像
                 if (args.retryableFindAndModifyLocation ==
                     RetryableFindAndModifyLocation::kSideCollection) {
                     operation.setNeedsRetryImage(repl::RetryImageEnum::kPostImage);
@@ -1042,10 +1205,12 @@ void OpObserverImpl::onUpdate(OperationContext* opCtx,
             }
         }
 
+        // 设置复制的记录ID
         if (!args.updateArgs->replicatedRecordId.isNull()) {
             operation.setRecordId(args.updateArgs->replicatedRecordId);
         }
 
+        // 变更流预镜像处理：为变更流收集文档变更前的状态
         if (args.updateArgs->changeStreamPreAndPostImagesEnabledForCollection) {
             invariant(!args.updateArgs->preImageDoc.isEmpty(),
                       str::stream()
@@ -1055,6 +1220,7 @@ void OpObserverImpl::onUpdate(OperationContext* opCtx,
                 ChangeStreamPreImageRecordingMode::kPreImagesCollection);
         }
 
+        // 分片环境下的文档键提取：获取更新后文档的分片键
         const auto& scopedCollectionDescription = shardingWriteRouter->getCollDesc();
         // ShardingWriteRouter only has boost::none scopedCollectionDescription when not in a
         // sharded cluster.
@@ -1064,41 +1230,60 @@ void OpObserverImpl::onUpdate(OperationContext* opCtx,
                     .getOwned());
         }
 
+        // 设置resharding目标分片和迁移标志
         operation.setDestinedRecipient(
             shardingWriteRouter->getReshardingDestinedRecipient(args.updateArgs->updatedDoc));
         operation.setFromMigrateIfTrue(args.updateArgs->source == OperationSource::kFromMigrate);
+        
+        // 设置差异插入检查标志
         if (args.updateArgs->mustCheckExistenceForInsertOperations) {
             operation.setCheckExistenceForDiffInsert(true);
         }
+        
+        // 将操作添加到事务参与者中
         txnParticipant.addTransactionOperation(opCtx, operation);
+        
     } else {
+        // ========== 普通写入模式 ==========
+        
+        // 创建oplog条目，立即处理并写入
         MutableOplogEntry oplogEntry;
+        
+        // 设置resharding目标分片信息
         oplogEntry.setDestinedRecipient(
             shardingWriteRouter->getReshardingDestinedRecipient(args.updateArgs->updatedDoc));
 
+        // 可重试findAndModify的镜像处理
         if (args.retryableFindAndModifyLocation ==
             RetryableFindAndModifyLocation::kSideCollection) {
             // If we've stored a preImage:
             if (args.updateArgs->storeDocOption == CollectionUpdateArgs::StoreDocOption::PreImage) {
+                // 标记需要存储前置镜像到重试镜像集合
                 oplogEntry.setNeedsRetryImage({repl::RetryImageEnum::kPreImage});
             } else if (args.updateArgs->storeDocOption ==
                        CollectionUpdateArgs::StoreDocOption::PostImage) {
                 // Or if we're storing a postImage.
+                // 标记需要存储后置镜像到重试镜像集合
                 oplogEntry.setNeedsRetryImage({repl::RetryImageEnum::kPostImage});
             }
         }
 
+        // 设置复制的记录ID
         if (!args.updateArgs->replicatedRecordId.isNull()) {
             oplogEntry.setRecordId(args.updateArgs->replicatedRecordId);
         }
 
+        // 调用专门的更新oplog记录函数，立即写入oplog
         opTime = replLogUpdate(opCtx, args, &oplogEntry, _operationLogger.get());
+        
+        // 将执行结果保存到操作累积器中
         if (opAccumulator) {
             opAccumulator->opTime.writeOpTime = opTime.writeOpTime;
             opAccumulator->opTime.wallClockTime = opTime.wallClockTime;
 
             // If the oplog entry has `needsRetryImage` (retryable findAndModify), gather the
             // pre/post image information to be stored in the the image collection.
+            // 如果需要存储重试镜像，收集镜像信息到累积器中
             if (oplogEntry.getNeedsRetryImage()) {
                 opAccumulator->retryableFindAndModifyImageToWrite =
                     repl::ReplOperation::ImageBundle{
@@ -1111,12 +1296,14 @@ void OpObserverImpl::onUpdate(OperationContext* opCtx,
             }
         }
 
+        // 更新会话事务记录，用于可重试写入和会话管理
         SessionTxnRecord sessionTxnRecord;
         sessionTxnRecord.setLastWriteOpTime(opTime.writeOpTime);
         sessionTxnRecord.setLastWriteDate(opTime.wallClockTime);
         onWriteOpCompleted(opCtx, args.updateArgs->stmtIds, sessionTxnRecord, nss);
     }
 
+    // 将分片写入路由器保存到累积器装饰器中，供后续处理使用
     if (opAccumulator) {
         shardingWriteRouterOpStateAccumulatorDecoration(opAccumulator) =
             std::move(shardingWriteRouter);
@@ -1873,6 +2060,8 @@ void OpObserverImpl::onBatchedWriteStart(OperationContext* opCtx) {
     batchedWriteContext.setWritesAreBatched(true);
 }
 
+// OpObserverImpl::onInserts中生成oplog
+// 批量写的oplog是在WriteUnitOfWork::commit()->onBatchedWriteCommit()中写入的。
 void OpObserverImpl::onBatchedWriteCommit(OperationContext* opCtx,
                                           WriteUnitOfWork::OplogEntryGroupType oplogGroupingFormat,
                                           OpStateAccumulator* opAccumulator) {

@@ -554,20 +554,98 @@ size_t checkForConflictingDeletions(OperationContext* opCtx,
     return store.count(opCtx, overlappingRangeDeletionsQuery(range, uuid));
 }
 
+/**
+ * 本地持久化范围删除任务函数 - MongoDB分片环境下的范围清理任务存储
+ * 
+ * 核心功能：
+ * 1. 将分片迁移或chunk移动产生的范围删除任务持久化到本地存储
+ * 2. 确保范围删除任务在节点重启后能够恢复和继续执行
+ * 3. 防止重复的范围删除任务通过DuplicateKey检测提供幂等性保证
+ * 4. 支持自定义写关注级别，确保任务持久化的可靠性要求
+ * 5. 维护config.rangeDeletions集合中的任务文档完整性
+ * 
+ * 设计原理：
+ * - 持久化存储：使用PersistentTaskStore确保任务在故障后可恢复
+ * - 幂等性保证：通过捕获DuplicateKey异常防止重复任务创建
+ * - 写关注支持：允许调用者指定数据持久化的可靠性级别
+ * - 错误转换：将存储层错误转换为更具描述性的应用层错误
+ * 
+ * 适用场景：
+ * - chunk迁移完成后需要清理源分片上的孤立文档
+ * - 分片重新平衡过程中的范围数据清理任务调度
+ * - 节点故障恢复时重建未完成的范围删除任务队列
+ * - 分片拓扑变更导致的数据重分布清理工作
+ * 
+ * 重要约束：
+ * - 任务ID必须全局唯一，通常使用迁移ID作为标识符
+ * - 范围删除任务必须包含完整的集合UUID和chunk范围信息
+ * - 调用者需确保在适当的锁保护下执行以避免并发冲突
+ * - 写关注级别需要根据业务要求选择合适的持久化保证
+ * 
+ * @param opCtx 操作上下文，包含事务、会话、锁等状态信息
+ * @param deletionTask 要持久化的范围删除任务对象，包含目标范围、集合UUID等信息
+ * @param writeConcern 写关注选项，指定数据持久化的可靠性级别（如majority、local等）
+ * @throws 31375 如果检测到重复的迁移ID，抛出匿名错误防止任务重复
+ * @throws DBException 其他数据库操作异常会直接向上传播
+ */
 void persistRangeDeletionTaskLocally(OperationContext* opCtx,
                                      const RangeDeletionTask& deletionTask,
                                      const WriteConcernOptions& writeConcern) {
+    // 创建持久化任务存储实例，指向config.rangeDeletions集合
+    // 这个集合专门用于存储分片环境下的范围删除任务
     PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionNamespace);
+    
     try {
+        // 尝试将范围删除任务添加到持久化存储中
+        // 核心操作：将deletionTask序列化并插入到config.rangeDeletions集合
+        // 
+        // 插入的文档结构大致如下：
+        // {
+        //   "_id": <migrationId>,                    // 唯一标识符，通常是迁移UUID
+        //   "nss": "<database>.<collection>",        // 目标集合的命名空间
+        //   "collectionUuid": <UUID>,               // 集合的唯一标识符
+        //   "range": {                              // 要删除的文档范围
+        //     "min": <BSONObj>,                     // 范围最小值（包含）
+        //     "max": <BSONObj>                      // 范围最大值（不包含）
+        //   },
+        //   "whenToClean": "now"|"delayed",         // 清理时机策略
+        //   "pending": true,                        // 是否处于等待状态
+        //   "processing": false,                    // 是否正在处理中
+        //   "numOrphanDocs": <long>                 // 孤立文档数量估计
+        // }
         store.add(opCtx, deletionTask, writeConcern);
+        
     } catch (const ExceptionFor<ErrorCodes::DuplicateKey>&) {
+        // 重复键异常处理：当尝试插入具有相同_id的任务时触发
+        // 这通常发生在以下场景：
+        // 1. 网络重试导致的重复请求
+        // 2. 故障恢复时重复创建已存在的任务
+        // 3. 并发迁移操作使用了相同的迁移ID
+        //
         // Convert a DuplicateKey error to an anonymous error.
+        // 将DuplicateKey错误转换为匿名错误，提供更详细的上下文信息
         uasserted(31375,
                   str::stream() << "While attempting to write range deletion task for migration "
                                 << ", found document with the same migration id. Attempted range "
                                    "deletion task: "
                                 << deletionTask.toBSON());
+        
+        // 错误信息包含：
+        // - 具体的操作描述（写入范围删除任务）
+        // - 冲突的原因（相同的迁移ID）
+        // - 尝试插入的完整任务内容（用于调试）
+        //
+        // 这种设计的优势：
+        // 1. 提供详细的错误上下文，便于问题诊断
+        // 2. 使用匿名错误码，避免客户端对特定错误的依赖
+        // 3. 包含完整的任务信息，支持重试或手动处理
     }
+    
+    // 函数成功完成时的状态：
+    // 1. 范围删除任务已成功持久化到config.rangeDeletions集合
+    // 2. 任务将被RangeDeleterService发现并加入执行队列
+    // 3. 后续的范围删除操作将根据任务配置自动执行
+    // 4. 任务状态变更（如从pending到processing）将同步更新到存储
 }
 
 long long retrieveNumOrphansFromShard(OperationContext* opCtx,
