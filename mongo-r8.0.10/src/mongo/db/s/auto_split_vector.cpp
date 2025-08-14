@@ -398,6 +398,9 @@ std::pair<std::vector<BSONObj>, bool> autoSplitVector(OperationContext* opCtx,
 
                 // 添加有效的分裂点：
                 resultArraySize += additionalKeySize;
+                // yang add todo xxxxxxxxxxx, 可以提取判断currentKey和firstKeyInOriginalChunk比较一下，如果相等，则提前返回 ChunkTooBig，
+                // 而不用到MigrationChunkClonerSource::_storeCurrentRecordId 去判断，可以少扫描2次index数据，一次是因为这里的limit+1，一次是_storeCurrentRecordId
+                // 此外，这里是不是可以把分裂点更新到config.chunks表，这样可以避免在迁移源端再次扫描索引数据
                 splitKeys.push_back(currentKey.getOwned());
                 lastSplitPoint = splitKeys.back();
                 numScannedKeys = 0;

@@ -239,25 +239,57 @@ SessionCatalogMigrationDestination::~SessionCatalogMigrationDestination() {
     }
 }
 
+/**
+ * 启动会话迁移的后台线程
+ * 
+ * 核心功能：
+ * 1. 将状态从 NotStarted 切换到 Migrating
+ * 2. 创建独立的后台线程执行会话数据迁移任务
+ * 3. 在后台线程中调用 _retrieveSessionStateFromSource 持续拉取源分片的会话数据
+ * 4. 处理异常情况，包括兼容旧版本源分片（CommandNotFound错误）
+ * 
+ * 调用时机：
+ * - 在迁移流程的第4阶段被调用（与初始数据克隆并行进行）
+ * - 与数据迁移同时进行，确保会话相关的oplog也能被及时传输
+ * 
+ * 线程安全：
+ * - 使用互斥锁保护状态变更
+ * - 后台线程独立运行，不阻塞主迁移流程
+ * 
+ * 异常处理：
+ * - 捕获 CommandNotFound 错误（兼容v3.7之前版本的源分片）
+ * - 其他异常会调用 _errorOccurred 设置错误状态
+ * MigrationDestinationManager::_migrateDriver
+ */
 void SessionCatalogMigrationDestination::start(ServiceContext* service) {
     {
+        // 加锁保护状态变更，确保线程安全
         stdx::lock_guard<Latch> lk(_mutex);
+        // 验证当前状态必须是未开始状态
         invariant(_state == State::NotStarted);
+        // 将状态切换到迁移中
         _state = State::Migrating;
     }
 
+    // 创建后台工作线程，执行会话数据迁移任务
     _thread = stdx::thread([=, this] {
         try {
+            // 调用核心函数从源分片检索会话状态
+            // 这个函数会持续运行直到迁移完成或发生错误
             _retrieveSessionStateFromSource(service);
         } catch (const DBException& ex) {
+            // 处理命令未找到异常，这通常发生在源分片版本较老的情况下
             if (ex.code() == ErrorCodes::CommandNotFound) {
                 // TODO: remove this after v3.7
                 //
                 // This means that the donor shard is running at an older version so it is safe to
                 // just end this because there is no session information to transfer.
+                // 
+                // 这意味着源分片运行在较老版本，没有会话信息需要传输，可以安全结束
                 return;
             }
 
+            // 其他类型的异常，设置错误状态并记录错误信息
             _errorOccurred(ex.toString());
         }
     });
@@ -280,6 +312,37 @@ void SessionCatalogMigrationDestination::join() {
 }
 
 /**
+ * 后台线程主函数：从源分片持续检索会话状态和oplog条目
+ * 
+ * 核心功能：
+ * 1. 建立与源分片的连接，循环发送 _getNextSessionMods 命令获取会话相关oplog
+ * 2. 解析每批oplog条目，调用 _processSessionOplog 处理retryable writes和事务记录
+ * 3. 管理迁移状态转换：Migrating -> ReadyToCommit -> Committing -> Done
+ * 4. 确保在finish()被调用后彻底排空源分片的oplog缓冲区
+ * 5. 等待所有写操作达到多数派写关注，保证数据持久性
+ * 
+ * 状态转换逻辑：
+ * - 首次排空缓冲区：Migrating -> ReadyToCommit （等待提交信号）
+ * - 收到finish()调用：ReadyToCommit -> Committing （开始最终排空）
+ * - 再次排空缓冲区：Committing -> Done （迁移完成）
+ * 
+ * 容错机制：
+ * - 检查错误状态并及时退出
+ * - 处理TransactionTooOld异常（跳过过期事务）
+ * - 响应CancellationToken中断请求
+ * - 在每次批处理后等待写关注确认
+ * 
+ * 线程安全：
+ * - 通过互斥锁保护状态访问
+ * - 使用CancelableOperationContext响应外部中断
+ * - 独立于主迁移线程运行，不阻塞chunk数据传输
+ * 
+ * 调用上下文：
+ * - 由start()在后台线程中启动
+ * - 与第4阶段的数据克隆并行执行
+ * - 为第6-7阶段的会话完成提供数据支撑
+ */
+/**
  * Outline:
  *
  * 1. Get oplog with session info from the source shard.
@@ -293,15 +356,22 @@ void SessionCatalogMigrationDestination::join() {
  * 6. Wait for writes to be committed to majority of the replica set.
  */
 void SessionCatalogMigrationDestination::_retrieveSessionStateFromSource(ServiceContext* service) {
+    // 初始化专用的客户端线程，用于会话目录迁移
     Client::initThread("sessionCatalogMigrationProducer-" + _migrationSessionId.toString(),
                        service->getService(ClusterRole::ShardServer),
                        Client::noSession());
+    
+    // 标记是否在提交后排空过oplog缓冲区
     bool oplogDrainedAfterCommiting = false;
+    // 记录上次处理的oplog结果，用于状态链接
     ProcessOplogResult lastResult;
+    // 记录上次等待的操作时间
     repl::OpTime lastOpTimeWaited;
 
+    // 主循环：持续从源分片拉取会话oplog直到完成
     while (true) {
         {
+            // 检查错误状态，如果发生错误则立即退出
             stdx::lock_guard<Latch> lk(_mutex);
             if (_state == State::ErrorOccurred) {
                 return;
@@ -311,15 +381,19 @@ void SessionCatalogMigrationDestination::_retrieveSessionStateFromSource(Service
         BSONObj nextBatch;
         BSONArray oplogArray;
         {
+            // 创建可取消的操作上下文，支持外部中断
             auto executor = Grid::get(service)->getExecutorPool()->getFixedExecutor();
             auto uniqueCtx = CancelableOperationContext(
                 cc().makeOperationContext(), _cancellationToken, executor);
             auto opCtx = uniqueCtx.get();
+            // 设置在stepDown或stepUp时总是中断
             opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
 
+            // 从源分片获取下一批会话oplog条目
             nextBatch = getNextSessionOplogBatch(opCtx, _fromShard, _migrationSessionId);
             oplogArray = BSONArray{nextBatch[kOplogField].Obj()};
 
+            // 如果oplog数组为空，说明当前缓冲区已排空
             if (oplogArray.isEmpty()) {
                 {
                     stdx::lock_guard<Latch> lk(_mutex);
@@ -329,6 +403,8 @@ void SessionCatalogMigrationDestination::_retrieveSessionStateFromSource(Service
                         // that it doesn't miss any new oplog created between the time window where
                         // this depleted the buffer from the source shard and receiving the commit
                         // command.
+                        // 只有在Committing状态下收到空结果才认为迁移完成
+                        // 这确保不会错过在排空缓冲区和收到提交命令之间产生的新oplog
                         if (oplogDrainedAfterCommiting) {
                             LOGV2(5087100,
                                   "Recipient finished draining oplog entries for retryable writes "
@@ -337,13 +413,15 @@ void SessionCatalogMigrationDestination::_retrieveSessionStateFromSource(Service
                                   logAttrs(_nss),
                                   "migrationSessionId"_attr = _migrationSessionId,
                                   "fromShard"_attr = _fromShard);
-                            break;
+                            break; // 迁移完成，退出主循环
                         }
 
+                        // 标记在提交后已排空一次
                         oplogDrainedAfterCommiting = true;
                     }
                 }
 
+                // 等待上次处理的oplog达到多数派写关注
                 WriteConcernResult unusedWCResult;
                 uassertStatusOK(
                     waitForWriteConcern(opCtx, lastResult.oplogTime, kMajorityWC, &unusedWCResult));
@@ -351,8 +429,10 @@ void SessionCatalogMigrationDestination::_retrieveSessionStateFromSource(Service
                 {
                     stdx::lock_guard<Latch> lk(_mutex);
                     // Note: only transition to "ready to commit" if state is not error/force stop.
+                    // 仅在非错误/强制停止状态下转换到"准备提交"
                     if (_state == State::Migrating) {
                         // We depleted the buffer at least once, transition to ready for commit.
+                        // 第一次排空缓冲区，转换到准备提交状态
                         LOGV2(5087101,
                               "Recipient finished draining oplog entries for retryable writes and "
                               "transactions from donor for the first time, before receiving "
@@ -364,12 +444,16 @@ void SessionCatalogMigrationDestination::_retrieveSessionStateFromSource(Service
                     }
                 }
 
+                // 记录上次等待的操作时间
                 lastOpTimeWaited = lastResult.oplogTime;
             }
         }
 
+        // 处理当前批次中的每个oplog条目
         for (BSONArrayIteratorSorted oplogIter(oplogArray); oplogIter.more();) {
             auto oplogEntry = oplogIter.next().Obj();
+            
+            // failpoint：在处理pre/post image相关oplog前故意失败
             interruptBeforeProcessingPrePostImageOriginatingOp.executeIf(
                 [&](const auto&) {
                     uasserted(6749200,
@@ -380,17 +464,21 @@ void SessionCatalogMigrationDestination::_retrieveSessionStateFromSource(Service
                     return !oplogEntry["needsRetryImage"].eoo() ||
                         !oplogEntry["preImageOpTime"].eoo() || !oplogEntry["postImageOpTime"].eoo();
                 });
+            
             try {
+                // 处理单条会话oplog，更新本地会话目录
                 lastResult =
                     _processSessionOplog(oplogEntry, lastResult, service, _cancellationToken);
             } catch (const ExceptionFor<ErrorCodes::TransactionTooOld>&) {
                 // This means that the server has a newer txnNumber than the oplog being
                 // migrated, so just skip it
+                // 服务器有更新的事务号，跳过这个过期的oplog条目
                 continue;
             }
         }
     }
 
+    // 最终确保所有写操作达到多数派写关注
     WriteConcernResult unusedWCResult;
 
     auto executor = Grid::get(service)->getExecutorPool()->getFixedExecutor();
@@ -402,6 +490,7 @@ void SessionCatalogMigrationDestination::_retrieveSessionStateFromSource(Service
         waitForWriteConcern(uniqueOpCtx.get(), lastResult.oplogTime, kMajorityWC, &unusedWCResult));
 
     {
+        // 设置最终状态为完成
         stdx::lock_guard<Latch> lk(_mutex);
         _state = State::Done;
     }
