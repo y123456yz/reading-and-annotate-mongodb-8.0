@@ -89,6 +89,7 @@ ShardVersion ShardVersionPlacementIgnoredNoIndexes() {
                                      boost::optional<CollectionIndexes>(boost::none));
 }
 
+// StartChunkCloneRequest::appendAsCommand发送_recvChunkStart 命令，RecvChunkStartCommand::errmsgRun 接收命令处理
 class RecvChunkStartCommand : public ErrmsgCommandDeprecated {
 public:
     RecvChunkStartCommand() : ErrmsgCommandDeprecated("_recvChunkStart") {}
@@ -172,6 +173,7 @@ public:
      * 
      * 该函数是 chunk 迁移流程在目标分片端的入口点，为后续的数据接收和处理做准备。
      */
+    // StartChunkCloneRequest::appendAsCommand 发送 _recvChunkStart 命令，RecvChunkStartCommand::errmsgRun 接收命令处理
     bool RecvChunkStartCommand::errmsgRun(OperationContext* opCtx,
                                           const DatabaseName& dbName,
                                           const BSONObj& cmdObj,

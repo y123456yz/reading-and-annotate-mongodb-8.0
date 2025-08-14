@@ -471,7 +471,9 @@ bool processActionStreamPolicyResponse(OperationContext* opCtx,
     return status.isOK();
 };
 
-
+// yang add todo xxxxxxxx 可以写一篇有关jumbo chunk的文章，何时置位jumbo,jumbo chunk的影响，如何处理jumbo chunk
+// 源分片 MigrationChunkClonerSource::startClone->MigrationChunkClonerSource::_storeCurrentRecordId 中会返回 ErrorCodes::ChunkTooBig
+// config server接收到应答后在 processRebalanceResponse 中识别ErrorCodes::ChunkTooBig，然后把该chunk标记为jumbo
 bool processRebalanceResponse(OperationContext* opCtx,
                               BalancerCommandsScheduler& commandScheduler,
                               const MigrateInfo& migrateInfo,
@@ -553,6 +555,28 @@ protected:
     MoveUnshardedPolicy& _moveUnshardedPolicy;
 };
 
+/*
+RebalanceChunkTask::processResponse 在每次 chunk 迁移结束后被调用，用来判断该次迁移是否“算成功”并进行必要的补救／清理操作。它直接委托给了 processRebalanceResponse，主要逻辑包括：
+
+成功（Status::isOK）
+直接返回 true，表示该 chunk 已经迁移完成。
+
+ChunkTooBig 或 ExceededMemoryLimit
+这两种错误表明 chunk 太大或内存队列溢出，无法完整迁移：
+调用 ShardingCatalogManager::splitOrMarkJumbo(...) 在 config server 上拆分该 chunk（或标记为 jumbo）
+返回 true，表示“逻辑上”处理完毕，不再在下轮重试它的迁移。
+IndexNotFound（仅在开启可选哈希索引特性时）
+如果是哈希分片缺少 shard‐key 索引：
+
+日志警告
+禁用该集合的自动均衡
+返回 false，表示该迁移“失败”且不计入成功数。
+其它错误
+
+记录 error 日志
+返回 false，表示此 chunk 本轮迁移失败，下轮仍可重试。
+*/
+// Balancer::_doMigrations
 class RebalanceChunkTask : public MigrationTask {
 public:
     RebalanceChunkTask(OperationContext* opCtx,

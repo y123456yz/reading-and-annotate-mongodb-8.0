@@ -430,7 +430,10 @@ Status MigrationChunkClonerSource::startClone(OperationContext* opCtx,
             _jumboChunkCloneState.emplace();
         } else if (!storeCurrentRecordIdStatus.isOK()) {
             // 其他错误：如果不是 ChunkTooBig 错误，则直接返回失败
-            return storeCurrentRecordIdStatus;
+            // jumbo chunk如果不允许迁移，这里直接返回，也就是不做迁移
+            if (!_forceJumbo) {
+                return storeCurrentRecordIdStatus;
+            }
         }
     }
 
@@ -450,7 +453,7 @@ Status MigrationChunkClonerSource::startClone(OperationContext* opCtx,
         ? MigrationSecondaryThrottleOptions::createWithWriteConcern(_writeConcern)
         : MigrationSecondaryThrottleOptions::create(MigrationSecondaryThrottleOptions::kOff);
 
-    // 构建 startChunkClone 命令：
+    // 构建 _recvChunkStart 命令：, 目标集群通过 RecvChunkStartCommand::errmsgRun 接收该命令并处理
     // 功能：创建发送给接收端的完整命令对象
     // 参数：包含迁移所需的所有元数据和配置信息
     StartChunkCloneRequest::appendAsCommand(&cmdBuilder,
@@ -1461,6 +1464,8 @@ MigrationChunkClonerSource::_getIndexScanExecutor(OperationContext* opCtx,
  * - 异常捕获：处理执行器扫描过程中的异常
  * 
  * 该函数是常规大小chunk高效迁移的基础，通过预收集记录ID实现高性能的批量数据访问。
+// 源分片 MigrationChunkClonerSource::startClone->MigrationChunkClonerSource::_storeCurrentRecordId 中会返回 ErrorCodes::ChunkTooBig
+// config server接收到应答后在 processRebalanceResponse 中识别ErrorCodes::ChunkTooBig，然后把该chunk标记为jumbo
  */
 Status MigrationChunkClonerSource::_storeCurrentRecordId(OperationContext* opCtx) {
     // 获取集合访问权限：以意向共享模式锁定集合

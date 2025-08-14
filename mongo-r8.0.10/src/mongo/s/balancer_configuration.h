@@ -150,7 +150,11 @@ private:
     MigrationSecondaryThrottleOptions _secondaryThrottle;
 
     bool _waitForDelete{false};
-
+    /*
+        // Now set "forceJumbo: true" in config.settings.
+    assert.commandWorked(st.s.getDB("config").settings.update(
+        {_id: "balancer"}, {$set: {attemptToBalanceJumboChunks: true}}, true));
+    */
     bool _attemptToBalanceJumboChunks{false};
 };
 

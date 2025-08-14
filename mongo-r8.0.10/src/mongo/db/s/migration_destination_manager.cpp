@@ -578,6 +578,7 @@ BSONObj MigrationDestinationManager::getMigrationStatusReport(
  * - 统计收集：启动性能统计计数器用于监控和调优
  * 
  * 该函数是chunk迁移接收端的核心入口，为后续的数据克隆、增量同步、关键区域管理等阶段奠定基础。
+ * RecvChunkStartCommand::errmsgRun 中调用执行
  */
 Status MigrationDestinationManager::start(OperationContext* opCtx,
                                           const NamespaceString& nss,
@@ -707,6 +708,7 @@ Status MigrationDestinationManager::start(OperationContext* opCtx,
     // 迁移线程启动：创建并启动后台线程执行实际的迁移工作
     // 迁移线程将执行数据克隆、增量同步、关键区域管理等核心操作
     _migrateThreadHandle = stdx::thread([this, cancellationToken = _cancellationSource.token()]() {
+        // MigrationDestinationManager::_migrateThread
         _migrateThread(cancellationToken);
     });
 
@@ -1789,6 +1791,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx,
             // 3. Insert a pending range deletion task for the incoming range.
             // 阶段3：为传入的范围插入待处理的范围删除任务
             // 创建接收端范围删除任务：标记为待处理状态
+            // 任务正是用来在迁移失败／中断时“回滚”目标分片上已写入的脏数据的
             RangeDeletionTask recipientDeletionTask(*_migrationId,
                                                     _nss,
                                                     donorCollectionOptionsAndIndexes.uuid,
@@ -1844,6 +1847,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx,
             _setState(kClone);  // 设置状态为克隆中
 
             // 启动会话迁移服务
+            // SessionCatalogMigrationDestination::start
             _sessionMigration->start(opCtx->getServiceContext());
 
             _chunkMarkedPending = true;  // no lock needed, only the migrate thread looks.

@@ -2218,6 +2218,7 @@ void ShardingCatalogManager::bumpMultipleCollectionPlacementVersionsAndChangeMet
         writeConcern);
 }
 
+// ShardingCatalogManager::splitOrMarkJumbo
 void ShardingCatalogManager::splitOrMarkJumbo(OperationContext* opCtx,
                                               const NamespaceString& nss,
                                               const BSONObj& minKey,

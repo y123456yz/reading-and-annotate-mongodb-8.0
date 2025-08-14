@@ -137,7 +137,8 @@ private:
     const std::vector<ChunkHistory> _history;
 
     // Indicates whether this chunk should be treated as jumbo and not attempted to be moved or
-    // split
+    // split 
+    // ShardingCatalogManager::splitOrMarkJumbo 如果chunk无法分割会调用它，标记为jumbo
     AtomicWord<bool> _jumbo;
 };
 

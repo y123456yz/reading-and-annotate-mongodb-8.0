@@ -1003,6 +1003,31 @@ private:
 
     // False if the move chunk request specified ForceJumbo::kDoNotForce, true otherwise.
     // 是否强制巨型块：控制是否允许迁移超大块
+    /*
+    // 普通 moveChunk：
+sh.moveChunk(
+  "test.coll",                // ns
+  { _id: MinKey },            // chunkRange.find
+  "shardB",                   // to
+  { forceJumbo: true }        // 额外选项
+);
+
+db.adminCommand({
+  _shardsvrMoveRange: "test.coll",
+  min: { _id: 0 },
+  max: { _id: 1000000 },
+  fromShard: "shardA",
+  toShard: "shardB",
+  writeConcern: { w: "majority" },
+  forceJumbo: true           // 允许迁移 jumbo chunk
+});
+
+全局修改
+    // Now set "forceJumbo: true" in config.settings.
+    assert.commandWorked(st.s.getDB("config").settings.update(
+        {_id: "balancer"}, {$set: {attemptToBalanceJumboChunks: true}}, true));
+    */
+    // MigrationChunkClonerSource::_storeCurrentRecordId
     const bool _forceJumbo;
     
     // 巨型块克隆状态：处理超大块的特殊状态

@@ -177,8 +177,8 @@ StatusWith<StartChunkCloneRequest> StartChunkCloneRequest::createFromCommand(Nam
     return request;
 }
 
-// MigrationChunkClonerSource::startClone 调用
-/// 构建 startChunkClone 命令：
+// StartChunkCloneRequest::appendAsCommand 发送 _recvChunkStart 命令，RecvChunkStartCommand::errmsgRun 接收命令处理
+/// 构建 _recvChunkStart 命令：
 void StartChunkCloneRequest::appendAsCommand(
     BSONObjBuilder* builder,
     const NamespaceString& nss,
