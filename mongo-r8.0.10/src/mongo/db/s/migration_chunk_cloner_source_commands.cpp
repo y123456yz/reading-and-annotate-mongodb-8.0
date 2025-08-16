@@ -218,6 +218,9 @@ sequenceDiagram
 
 // 接收端接收到发送端发送的 _recvChunkStart 命令后启动克隆流程，接收端通过 RecvChunkStartCommand  MigrationDestinationManager::_migrateDriver 发送 _migrateClone 给发送端，
 // 发送端接收到 _migrateClone 命令后，启动克隆流程，调用nextCloneBatch发送数据给客户端
+
+// *  目标分片：MigrationBatchFetcher<Inserter>::_fetchBatch 发送 _migrateClone 请求给源分片
+// *  源分片：InitialCloneCommand::run 接收 _migrateClone 并执行数据获取，
 class InitialCloneCommand : public BasicCommand {
 public:
     InitialCloneCommand() : BasicCommand("_migrateClone") {}

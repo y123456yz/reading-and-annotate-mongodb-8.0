@@ -190,11 +190,93 @@ private:
 
     // Given session id and namespace, create migrateCloneRequest.
     // Only should be created once for the lifetime of the object.
+    /**
+     * _createMigrateCloneRequest 函数的作用：
+     * 构建用于chunk迁移数据获取的_migrateClone命令请求对象。
+     * 
+     * 核心功能：
+     * 1. 命令构建：创建标准的_migrateClone内部命令BSON对象
+     * 2. 命名空间序列化：将目标集合的命名空间信息序列化到请求中
+     * 3. 会话信息附加：添加迁移会话ID以确保请求的唯一性和可追踪性
+     * 4. 请求标准化：确保请求格式符合MongoDB内部迁移协议规范
+     * 
+     * 设计特点：
+     * - 轻量级构建：只包含最核心的必要字段，减少网络开销
+     * - 会话关联：通过sessionId确保请求与特定迁移操作的关联
+     * - 格式标准：使用标准的BSON构建器确保数据格式正确性
+     * - 一次创建：在对象生命周期内只创建一次，避免重复构建开销
+     * 
+     * 请求内容：
+     * - _migrateClone：命令标识符，指示这是一个迁移克隆请求
+     * - 命名空间：序列化的目标集合命名空间信息
+     * - 会话ID：唯一标识当前迁移会话的标识符
+     * 
+     * 使用场景：
+     * - 在MigrationBatchFetcher构造时被调用一次
+     * - 生成的请求对象在整个迁移过程中被重复使用
+     * - 每次_fetchBatch调用都使用这个预构建的请求对象
+     * 
+     * 网络协议：
+     * - 该请求会被发送到源分片的admin数据库
+     * - 源分片接收后根据会话状态返回相应的数据批次
+     * - 支持流式数据传输，每次返回一个批次直到完成
+     * 
+     * 性能考虑：
+     * - 预构建避免了每次fetch时的重复构建开销
+     * - 最小化请求大小以减少网络传输成本
+     * - 使用高效的BSON构建器进行对象创建
+     * 
+     * 该函数是chunk迁移网络协议的基础，确保请求格式的正确性和一致性。
+     * 
+     * @return BSONObj 构建完成的_migrateClone命令请求对象
+     */
+    // Given session id and namespace, create migrateCloneRequest.
+    // Only should be created once for the lifetime of the object.
     BSONObj _createMigrateCloneRequest() const {
+        // 创建BSON对象构建器，用于逐步构建命令请求
+        // BSONObjBuilder提供了类型安全的BSON文档构建接口
         BSONObjBuilder builder;
+        
+        // 添加_migrateClone命令标识符字段
+        // 字段说明：
+        // - "_migrateClone": MongoDB内部迁移克隆命令的标准名称
+        // - 值为序列化的命名空间字符串：指定要迁移数据的目标集合
+        // 
+        // NamespaceStringUtil::serialize的作用：
+        // - 将NamespaceString对象转换为标准的字符串格式
+        // - 使用默认序列化上下文确保格式一致性
+        // - 处理特殊字符和命名空间验证
+        // 
+        // 序列化格式通常为："database.collection"
+        // 例如："myapp.users", "inventory.products"
         builder.append("_migrateClone",
-                       NamespaceStringUtil::serialize(_nss, SerializationContext::stateDefault()));
+                    NamespaceStringUtil::serialize(_nss, SerializationContext::stateDefault()));
+        
+        // 附加迁移会话ID到请求中
+        // 会话ID的重要作用：
+        // 1. 唯一性标识：确保每个迁移操作有唯一的会话标识
+        // 2. 状态追踪：源分片通过会话ID追踪迁移进度和状态
+        // 3. 幂等性保证：重复请求可以通过会话ID进行去重处理
+        // 4. 错误恢复：异常情况下可以通过会话ID恢复迁移状态
+        // 5. 并发控制：多个并发迁移通过不同会话ID进行隔离
+        // 
+        // append方法会将MigrationSessionId对象的内容序列化到BSON中
+        // 通常包含会话UUID、事务号等关键信息
+        // "sessionId":"shard2ReplSet_shard3ReplSet_689c943e517105ded4a54eee"
         _sessionId.append(&builder);
+        
+        // 构建并返回最终的BSON对象
+        // obj()方法完成BSON文档的构建并返回不可变的BSONObj实例
+        // 
+        // 最终生成的请求格式示例：
+        // {
+        //   "_migrateClone": "mydb.mycollection",
+        //   "sessionId": "sessionId":"shard2ReplSet_shard3ReplSet_689c943e517105ded4a54eee"
+        // }
+        // 
+        // 注意：这里只包含基础字段，其他如迁移范围(min/max)、
+        // 集合UUID、迁移ID等信息在实际使用时可能会在
+        // _fetchBatch方法中动态添加或通过其他方式传递
         return builder.obj();
     }
 

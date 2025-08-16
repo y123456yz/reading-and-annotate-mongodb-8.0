@@ -255,6 +255,8 @@ MigrationBatchFetcher<Inserter>::MigrationBatchFetcher(
  * @param opCtx 操作上下文，提供中断检查和超时控制
  * @return BSONObj 包含数据批次的BSON响应对象
  * @throws DBException 当网络通信或命令执行失败时
+ *  目标分片：MigrationBatchFetcher<Inserter>::_fetchBatch 发送 _migrateClone 请求给源分片
+ *  源分片：InitialCloneCommand::run 接收 _migrateClone 并执行数据获取，
  */
 template <typename Inserter>
 BSONObj MigrationBatchFetcher<Inserter>::_fetchBatch(OperationContext* opCtx) {
@@ -348,7 +350,6 @@ BSONObj MigrationBatchFetcher<Inserter>::_fetchBatch(OperationContext* opCtx) {
  * - 支持优雅的线程池关闭和资源清理
  * - 传播获取和插入过程中的异常
  * - 支持迁移中断和取消操作
- * 
  * 该函数是chunk迁移数据传输的核心调度器，确保高效、可靠的数据迁移。
  */
 template <typename Inserter>

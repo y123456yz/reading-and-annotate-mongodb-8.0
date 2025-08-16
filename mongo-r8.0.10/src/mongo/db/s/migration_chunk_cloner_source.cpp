@@ -815,56 +815,160 @@ void MigrationChunkClonerSource::_decrementOutstandingOperationTrackRequests() {
     }
 }
 
+/**
+ * MigrationChunkClonerSource::_nextCloneBatchFromIndexScan 函数的作用：
+ * 专门用于巨型块(jumbo chunk)迁移的直接索引扫描数据获取函数。
+ * 
+ * 核心功能：
+ * 1. 巨型块专用处理：为超过常规大小限制的chunk提供流式数据传输能力
+ * 2. 直接索引扫描：使用分片键索引直接扫描而非预存储的记录ID
+ * 3. 流式数据传输：避免将所有记录ID加载到内存，支持超大数据量的迁移
+ * 4. 执行器状态管理：管理索引扫描执行器的生命周期和状态恢复
+ * 5. 批次大小控制：动态控制单次传输批次以避免BSON大小限制
+ * 6. 性能监控统计：记录克隆进度和传输量统计信息
+ * 
+ * 适用场景：
+ * - 强制迁移的巨型块：_forceJumbo=true 且 _jumboChunkCloneState 存在
+ * - 超大数据集：无法将所有记录ID预加载到内存的chunk
+ * - 内存受限环境：需要控制内存使用量的迁移场景
+ * - 手动强制迁移：管理员明确指定强制迁移超大块的情况
+ * 
+ * 工作原理：
+ * - 创建或恢复索引扫描执行器进行范围扫描
+ * - 逐个获取chunk范围内的文档并验证有效性
+ * - 控制批次大小避免超出BSON最大用户大小限制
+ * - 支持执行器状态的保存和恢复以支持中断恢复
+ * - 使用让步机制定期释放CPU资源
+ * 
+ * 性能特点：
+ * - 内存使用可控：不需要预存储大量记录ID
+ * - 流式处理：边扫描边传输，减少内存峰值
+ * - 支持让步：定期让步CPU避免长时间阻塞
+ * - 状态持久化：支持中断后恢复扫描位置
+ * 
+ * 与常规迁移对比：
+ * - 常规迁移：预存储记录ID + 随机访问（内存效率高，适合中小型chunk）
+ * - 巨型块迁移：直接索引扫描 + 流式传输（CPU效率高，适合超大chunk）
+ * 
+ * 错误处理：
+ * - 执行器异常：捕获并重新抛出带上下文的异常
+ * - 中断支持：响应操作上下文的中断请求
+ * - 状态管理：确保执行器状态的正确保存和恢复
+ * 
+ * 该函数是巨型块迁移的核心实现，使得MongoDB能够迁移任意大小的chunk。
+ */
 void MigrationChunkClonerSource::_nextCloneBatchFromIndexScan(OperationContext* opCtx,
                                                               const CollectionPtr& collection,
                                                               BSONArrayBuilder* arrBuilder) {
+    // 让步跟踪器初始化：
+    // 功能：创建基于时间和迭代次数的让步控制器
+    // 参数1：快速时钟源，提供高精度时间测量
+    // 参数2：让步迭代间隔，从全局查询配置参数加载
+    // 参数3：让步时间周期，从全局查询配置参数加载（毫秒）
+    // 目的：定期让步CPU资源，避免长时间阻塞其他操作，确保系统响应性
     ElapsedTracker tracker(opCtx->getServiceContext()->getFastClockSource(),
                            internalQueryExecYieldIterations.load(),
                            Milliseconds(internalQueryExecYieldPeriodMS.load()));
 
+    // 执行器创建或恢复分支：
+    // 条件：如果巨型块克隆状态中没有执行器，则创建新的索引扫描执行器
+    // 原因：首次调用时需要创建执行器，后续调用时重用现有执行器
     if (!_jumboChunkCloneState->clonerExec) {
+        // 创建索引扫描执行器：
+        // 功能：基于分片键索引创建范围扫描的计划执行器
+        // 参数1：操作上下文，提供事务和中断支持
+        // 参数2：集合对象，用于访问集合数据和索引
+        // 参数3：索引扫描选项，IXSCAN_FETCH表示扫描并获取完整文档
+        // 返回：包含计划执行器的StatusWith对象
+        // 用途：执行器负责按分片键顺序扫描chunk范围内的所有文档
         auto exec = uassertStatusOK(_getIndexScanExecutor(
             opCtx, collection, InternalPlanner::IndexScanOptions::IXSCAN_FETCH));
+        
+        // 存储执行器：将创建的执行器保存到巨型块克隆状态中
+        // 目的：后续批次调用时可以重用同一个执行器，保持扫描连续性
         _jumboChunkCloneState->clonerExec = std::move(exec);
     } else {
+        // 执行器恢复分支：如果执行器已存在，则恢复其运行状态
+        // 原因：执行器在前一个批次结束时被分离，需要重新附加到操作上下文
+        
+        // 重新附加到操作上下文：
+        // 功能：将执行器与当前操作上下文关联
+        // 目的：执行器需要操作上下文来访问存储引擎和处理中断
         _jumboChunkCloneState->clonerExec->reattachToOperationContext(opCtx);
+        
+        // 恢复执行器状态：
+        // 功能：恢复执行器的内部状态，包括索引扫描位置
+        // 参数：集合对象的引用，用于重新建立与集合的连接
+        // 重要性：确保扫描从上次中断的位置继续，避免数据重复或遗漏
         _jumboChunkCloneState->clonerExec->restoreState(&collection);
     }
 
+    // 执行状态初始化：定义执行器的当前执行状态
+    // 用途：跟踪执行器的返回状态（ADVANCED/IS_EOF/ERROR等）
     PlanExecutor::ExecState execState;
+    
     try {
+        // 文档变量声明：用于存储执行器返回的文档数据
         BSONObj obj;
-        RecordId recordId;
+        RecordId recordId;  // 记录ID（在IXSCAN_FETCH模式下不使用）
+        
+        // 主扫描循环：持续从执行器获取文档直到满足退出条件
+        // 执行器模式：IXSCAN_FETCH 模式下会自动获取完整文档内容
         while (PlanExecutor::ADVANCED ==
                (execState = _jumboChunkCloneState->clonerExec->getNext(&obj, nullptr))) {
 
+            // 执行状态更新：在互斥锁保护下更新巨型块克隆状态
+            // 目的：记录当前执行器状态，用于监控和状态查询
             stdx::unique_lock<Latch> lk(_mutex);
             _jumboChunkCloneState->clonerState = execState;
             lk.unlock();
 
+            // 中断检查：检查操作上下文是否收到中断请求
+            // 重要性：长时间运行的扫描操作需要支持中断以保持系统响应性
+            // 异常：如果收到中断请求，会抛出异常终止扫描过程
             opCtx->checkForInterrupt();
 
             // Use the builder size instead of accumulating the document sizes directly so
             // that we take into consideration the overhead of BSONArray indices.
+            // BSON大小限制检查：
+            // 策略：使用构建器大小而不是直接累积文档大小，以考虑BSONArray索引的开销
+            // 条件1：arrBuilder->arrSize() - 数组中已有文档（确保有进展）
+            // 条件2：大小检查 - 当前长度 + 文档大小 + 1024字节缓冲 > BSON最大用户大小
+            // 操作：如果超出大小限制，将文档推回执行器并退出循环
             if (arrBuilder->arrSize() &&
                 (arrBuilder->len() + obj.objsize() + 1024) > BSONObjMaxUserSize) {
+                // 文档推回执行器：
+                // 功能：将当前文档推回执行器的结果队列
+                // 目的：确保下次批次调用时可以继续处理此文档，避免数据丢失
+                // 原理：执行器内部维护一个推回缓冲区用于此目的
                 _jumboChunkCloneState->clonerExec->stashResult(obj);
-                break;
+                break;  // 退出循环，结束当前批次
             }
 
+            // 文档添加到传输批次：
+            // 操作：将文档添加到BSON数组构建器中
+            // 结果：文档将包含在返回给接收端的批次中
             arrBuilder->append(obj);
 
+            // 克隆统计更新：在互斥锁保护下更新已克隆文档计数
+            // 目的：跟踪巨型块的克隆进度，用于监控和日志记录
             lk.lock();
             _jumboChunkCloneState->docsCloned++;
             lk.unlock();
 
+            // 全局统计更新：
+            // 功能：更新分片系统的全局克隆统计信息
+            // 统计1：源端克隆文档计数增加1
+            // 统计2：源端克隆字节数增加文档大小
+            // 用途：集群级别的迁移监控和性能分析
             ShardingStatistics::get(opCtx).countDocsClonedOnDonor.addAndFetch(1);
             ShardingStatistics::get(opCtx).countBytesClonedOnDonor.addAndFetch(obj.objsize());
         }
+        
     } catch (DBException& exception) {
         exception.addContext("Executor error while scanning for documents belonging to chunk");
         throw;
-    }
+   }
 
     stdx::unique_lock<Latch> lk(_mutex);
     _jumboChunkCloneState->clonerState = execState;
@@ -873,7 +977,6 @@ void MigrationChunkClonerSource::_nextCloneBatchFromIndexScan(OperationContext* 
     _jumboChunkCloneState->clonerExec->saveState();
     _jumboChunkCloneState->clonerExec->detachFromOperationContext();
 }
-
 /**
  * MigrationChunkClonerSource::_nextCloneBatchFromCloneRecordIds 函数的作用：
  * 基于预存储的记录ID获取下一批克隆文档，是常规大小chunk的高效数据传输核心实现。
@@ -1070,6 +1173,9 @@ uint64_t MigrationChunkClonerSource::getCloneBatchBufferAllocationSize() {
  * 
  * 该函数是 InitialCloneCommand 的核心依赖，负责实际的数据获取和传输准备。
  * // InitialCloneCommand::run调用，获取本次需要迁移的 doc 添加到 arrBuilder 中。
+ * 
+*  目标分片：MigrationBatchFetcher<Inserter>::_fetchBatch 发送 _migrateClone 请求给源分片
+*  源分片：InitialCloneCommand::run 接收 _migrateClone 并执行数据获取，
  */
 
 Status MigrationChunkClonerSource::nextCloneBatch(OperationContext* opCtx,
@@ -1394,30 +1500,121 @@ StatusWith<BSONObj> MigrationChunkClonerSource::_callRecipient(OperationContext*
     return responseStatus.data.getOwned();
 }
 
+/**
+ * MigrationChunkClonerSource::_getIndexScanExecutor 函数的作用：
+ * 为chunk迁移创建基于分片键索引的范围扫描执行器，是迁移过程中数据获取的基础设施。
+ * 
+ * 核心功能：
+ * 1. 分片键索引查找：在集合中找到与分片键模式匹配的索引
+ * 2. 范围边界扩展：将chunk的min/max边界扩展到匹配索引的完整键模式
+ * 3. 索引扫描执行器创建：基于扩展后的范围创建高效的索引扫描执行器
+ * 4. 多键索引支持：允许在分片键字段上使用多键索引（基于分片键单值不变式）
+ * 5. 让步策略配置：配置自动让步策略以保持系统响应性
+ * 
+ * 使用场景：
+ * - 巨型块迁移：为_nextCloneBatchFromIndexScan提供流式扫描能力
+ * - 记录ID收集：为_storeCurrentRecordId提供索引扫描基础
+ * - 范围验证：确保扫描严格限制在指定的chunk范围内
+ * 
+ * 索引选择策略：
+ * - 分片键前缀匹配：查找以分片键为前缀的索引
+ * - 多键索引兼容：基于分片键单值特性允许多键索引
+ * - 性能优化：选择最适合范围扫描的索引结构
+ * 
+ * 范围处理机制：
+ * - 边界扩展：将用户指定的min/max扩展到索引的完整键模式
+ * - 格式转换：将BSON对象转换为索引键格式
+ * - 包含性控制：使用半开区间[min, max)确保精确的范围控制
+ * 
+ * 让步和性能：
+ * - 自动让步：配置YIELD_AUTO策略定期释放锁和让步CPU
+ * - 中断支持：支持操作上下文的中断机制
+ * - 方向优化：使用FORWARD方向进行顺序扫描
+ * 
+ * 错误处理：
+ * - 索引缺失：如果找不到合适的分片键索引则返回错误
+ * - 参数验证：验证输入参数的有效性
+ * 
+ * 该函数是chunk迁移中索引扫描的统一入口点，为不同的迁移策略提供高效的数据访问能力。
+ */
 StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>>
 MigrationChunkClonerSource::_getIndexScanExecutor(OperationContext* opCtx,
                                                   const CollectionPtr& collection,
                                                   InternalPlanner::IndexScanOptions scanOption) {
     // Allow multiKey based on the invariant that shard keys must be single-valued. Therefore, any
     // multi-key index prefixed by shard key cannot be multikey over the shard key fields.
+    // 分片键索引查找：
+    // 多键索引支持：基于分片键必须是单值的不变式，允许多键索引
+    // 原理：任何以分片键为前缀的多键索引在分片键字段上不能是多键的
+    // 参数1：操作上下文，提供事务和中断支持
+    // 参数2：集合对象，用于访问集合的索引目录
+    // 参数3：分片键模式的BSON表示，用于匹配索引前缀
+    // 参数4：requireSingleKey=false，允许多键索引（基于上述不变式）
+    // 返回：找到的分片键前缀索引，如果未找到则返回nullptr
     const auto shardKeyIdx = findShardKeyPrefixedIndex(opCtx,
                                                        collection,
                                                        _shardKeyPattern.toBSON(),
                                                        /*requireSingleKey=*/false);
     if (!shardKeyIdx) {
+        // 索引缺失错误：无法找到与分片键模式匹配的索引
+        // 这通常表示集合结构问题或分片配置错误
         return {ErrorCodes::IndexNotFound,
                 str::stream() << "can't find index with prefix " << _shardKeyPattern.toBSON()
                               << " in storeCurrentRecordId for " << nss().toStringForErrorMsg()};
     }
 
     // Assume both min and max non-empty, append MinKey's to make them fit chosen index
+    // 范围边界扩展处理：
+    // 假设：min和max都非空，追加MinKey使它们适配选择的索引
+    // 目的：将用户指定的chunk边界扩展到索引的完整键模式
+    
+    // 创建键模式对象：基于找到的索引键模式
+    // 作用：提供键扩展和格式转换的工具方法
     const KeyPattern kp(shardKeyIdx->keyPattern());
 
+    // 最小边界扩展和格式化：
+    // extendRangeBound：将chunk的最小边界扩展到索引的完整键模式
+    // 参数1：getMin() - chunk的原始最小边界
+    // 参数2：false - 表示这是最小边界（不是最大边界）
+    // toKeyFormat：将扩展后的边界转换为索引键的内部格式
+    // 结果：适用于索引扫描的格式化最小边界
     BSONObj min = Helpers::toKeyFormat(kp.extendRangeBound(getMin(), false));
+    
+    // 最大边界扩展和格式化：
+    // extendRangeBound：将chunk的最大边界扩展到索引的完整键模式  
+    // 参数1：getMax() - chunk的原始最大边界
+    // 参数2：false - 表示这是最大边界的处理方式
+    // toKeyFormat：将扩展后的边界转换为索引键的内部格式
+    // 结果：适用于索引扫描的格式化最大边界
     BSONObj max = Helpers::toKeyFormat(kp.extendRangeBound(getMax(), false));
 
     // We can afford to yield here because any change to the base data that we might miss is already
     // being queued and will migrate in the 'transferMods' stage.
+    // 索引扫描执行器创建：
+    // 让步策略说明：这里可以进行让步，因为我们可能错过的任何基础数据变更
+    // 已经被排队并将在'transferMods'阶段进行迁移
+    // 
+    // 参数详解：
+    // - opCtx：操作上下文，提供事务管理和中断支持
+    // - &collection：集合对象引用，用于数据访问
+    // - *shardKeyIdx：分片键索引描述符，指定要使用的索引
+    // - min：格式化的最小边界，定义扫描范围的起始点
+    // - max：格式化的最大边界，定义扫描范围的结束点
+    // - BoundInclusion::kIncludeStartKeyOnly：边界包含策略
+    //   表示包含起始键但不包含结束键，即半开区间[min, max)
+    //   这确保了chunk边界的精确控制，避免重复或遗漏数据
+    // - PlanYieldPolicy::YieldPolicy::YIELD_AUTO：自动让步策略
+    //   执行器会根据时间和操作数量自动进行让步
+    //   在长时间运行的扫描中定期释放锁和让步CPU
+    // - InternalPlanner::Direction::FORWARD：扫描方向为正向
+    //   按照索引键的升序进行扫描，这通常是最高效的方式
+    // - scanOption：扫描选项，由调用方指定（IXSCAN_DEFAULT或IXSCAN_FETCH）
+    //   IXSCAN_DEFAULT：只返回索引键和记录ID
+    //   IXSCAN_FETCH：返回完整的文档内容
+    // 
+    // 返回：包含计划执行器的StatusWith对象
+    // 成功时：返回配置好的索引扫描执行器
+    // 失败时：返回错误状态，包含具体的失败原因
     return InternalPlanner::shardKeyIndexScan(opCtx,
                                               &collection,
                                               *shardKeyIdx,
