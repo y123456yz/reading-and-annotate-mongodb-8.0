@@ -460,6 +460,7 @@ void ReplicationConsistencyMarkersImpl::setOplogTruncateAfterPointToTopOfOplog(
     setOplogTruncateAfterPoint(opCtx, timestamp);
 }
 
+//JournalFlusher::run()->WiredTigerRecoveryUnit::waitUntilDurable->ReplicationCoordinatorExternalStateImpl::getToken->ReplicationConsistencyMarkersImpl::refreshOplogTruncateAfterPointIfPrimary
 boost::optional<OpTimeAndWallTime>
 ReplicationConsistencyMarkersImpl::refreshOplogTruncateAfterPointIfPrimary(
     OperationContext* opCtx) {

@@ -26,13 +26,14 @@ oplog hole 是指 oplog 某个 timestamp 的 entry 还没 durable，但更大的
 主要出现在 primary 并发写入时。
 影响 all_durable、majority commit、快照读等一致性点的推进。
 
+注意：上面的durable指的是数据write到了磁盘，但是不一定是fsync了，数据可能还在操作系统的page cache中。
 
 
 
 ============MongoDB 5.0内核一些时间戳的梳理==================
 
 //JournalFlusher::run()->WiredTigerRecoveryUnit::waitUntilDurable->ReplicationCoordinatorExternalStateImpl::getToken->ReplicationConsistencyMarkersImpl::refreshOplogTruncateAfterPointIfPrimary
-journalFlush线程定期sync wal日志到磁盘，然后从存储引擎获取all_duration对应时间戳， 这个时间戳最后写到了local库的replset.oplogTruncateAfterPoint
+journalFlush线程定期sync wal日志到磁盘，然后从存储引擎获取all_duration对应时间戳， 这个时间戳最后写到了local库的replset.oplogTruncateAfterPoint，所以这个表中的时间戳是真正fsync持久化的时间戳
 all_durable:  从存储引擎通过"get=all_durable"获取的时间戳,也就是存储引擎已提交事物的最小时间戳， 也就是oplog没有空洞的时间戳，可以参考ReplicationConsistencyMarkersImpl::refreshOplogTruncateAfterPointIfPrimary
     // Fetch the latest all_durable value from the storage engine. This value will be a timestamp
     // that has no holes (uncommitted transactions with lower timestamps) behind it.

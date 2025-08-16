@@ -1406,6 +1406,7 @@ std::size_t ReplicationCoordinatorExternalStateImpl::getOplogFetcherInitialSyncM
     return oplogFetcherInitialSyncMaxFetcherRestarts.load();
 }
 
+//JournalFlusher::run()->WiredTigerRecoveryUnit::waitUntilDurable->ReplicationCoordinatorExternalStateImpl::getToken->ReplicationConsistencyMarkersImpl::refreshOplogTruncateAfterPointIfPrimary
 JournalListener::Token ReplicationCoordinatorExternalStateImpl::getToken(OperationContext* opCtx) {
     // If in state PRIMARY, the oplogTruncateAfterPoint must be used for the Durable timestamp
     // in order to avoid majority confirming any writes that could later be truncated.

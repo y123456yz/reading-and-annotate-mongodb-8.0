@@ -199,6 +199,7 @@ MigrationBatchFetcher<Inserter>::MigrationBatchFetcher(
       _writeConcern{writeConcern},
       _isParallelFetchingSupported{parallelFetchingSupported},
       _secondaryThrottleTicket(outerOpCtx->getServiceContext(), 1, false /* trackPeakUsed */),
+      // 默认值 chunkMigrationFetcherMaxBufferedSizeBytesPerThread 
       _bufferSizeTracker(maxBufferedSizeBytesPerThread) {
     // (Ignore FCV check): This feature flag doesn't have any upgrade/downgrade concerns.
     if (mongo::feature_flags::gConcurrencyInChunkMigration.isEnabledAndIgnoreFCVUnsafe() &&
@@ -211,8 +212,66 @@ MigrationBatchFetcher<Inserter>::MigrationBatchFetcher(
     _inserterWorkers->startup();
 }
 
+/**
+ * MigrationBatchFetcher<Inserter>::_fetchBatch 函数的作用：
+ * 从源分片获取单个数据批次的核心网络通信函数。
+ * 
+ * 核心功能：
+ * 1. 网络通信执行：向源分片发送_migrateClone命令请求数据批次
+ * 2. 命令响应处理：接收并验证源分片返回的批次数据响应
+ * 3. 错误状态检查：确保命令执行成功，处理网络和远程错误
+ * 4. 数据完整性保证：验证响应的有效性和数据格式正确性
+ * 5. 重试策略控制：配置为不重试，确保迁移过程的确定性
+ * 
+ * 网络通信特点：
+ * - 使用主节点读取偏好确保数据一致性
+ * - 直接连接源分片避免路由开销
+ * - 同步阻塞调用，简化错误处理逻辑
+ * - 不启用重试机制，失败时立即报错
+ * 
+ * 命令格式：
+ * - 命令名称：_migrateClone（内部迁移命令）
+ * - 目标数据库：admin（管理数据库）
+ * - 请求内容：包含迁移范围、会话ID等参数
+ * - 响应格式：包含objects数组的BSON文档
+ * 
+ * 错误处理：
+ * - 网络错误：连接超时、网络中断等
+ * - 命令错误：源分片拒绝、权限不足等
+ * - 数据错误：响应格式不正确、数据损坏等
+ * - 双重状态检查：验证传输层和应用层状态
+ * 
+ * 性能考虑：
+ * - 批次大小由源分片控制，平衡内存和网络效率
+ * - 阻塞式调用适合流水线架构
+ * - 最小化网络往返次数
+ * 
+ * 返回值：
+ * - 成功时返回包含数据批次的BSON对象
+ * - 失败时抛出异常终止迁移过程
+ * 
+ * 该函数是chunk迁移数据传输的基础网络操作，确保可靠的数据获取。
+ * 
+ * @param opCtx 操作上下文，提供中断检查和超时控制
+ * @return BSONObj 包含数据批次的BSON响应对象
+ * @throws DBException 当网络通信或命令执行失败时
+ */
 template <typename Inserter>
 BSONObj MigrationBatchFetcher<Inserter>::_fetchBatch(OperationContext* opCtx) {
+    // 向源分片发送_migrateClone命令获取数据批次
+    // 这是chunk迁移过程中的核心网络通信操作
+    //
+    // 参数详解：
+    // - opCtx: 操作上下文，提供超时控制和中断检查
+    // - ReadPreferenceSetting(ReadPreference::PrimaryOnly): 读取偏好设置
+    //   强制从主节点读取，确保数据一致性和最新性
+    //   在分片迁移中必须从主节点获取数据避免读取延迟副本
+    // - DatabaseName::kAdmin: 目标数据库为admin
+    //   _migrateClone是管理命令，必须在admin数据库执行
+    // - _migrateCloneRequest: 预构建的迁移克隆请求对象
+    //   包含迁移范围、会话ID、批次大小等关键参数
+    // - Shard::RetryPolicy::kNoRetry: 重试策略设置为不重试
+    //   迁移过程需要确定性，避免重试导致的数据重复或状态混乱
     auto commandResponse = uassertStatusOKWithContext(
         _fromShard->runCommand(opCtx,
                                ReadPreferenceSetting(ReadPreference::PrimaryOnly),
@@ -221,9 +280,40 @@ BSONObj MigrationBatchFetcher<Inserter>::_fetchBatch(OperationContext* opCtx) {
                                Shard::RetryPolicy::kNoRetry),
         "_migrateClone failed: ");
 
+    // 验证命令响应的有效状态
+    // 即使网络通信成功，命令本身也可能失败
+    // 
+    // 双重状态检查机制：
+    // 1. 第一次检查：uassertStatusOKWithContext 验证网络传输层状态
+    // 2. 第二次检查：getEffectiveStatus 验证应用层命令执行状态
+    //
+    // getEffectiveStatus 的作用：
+    // - 从CommandResponse中提取实际的命令执行状态
+    // - 处理嵌套的错误状态码和错误消息
+    // - 区分网络错误和业务逻辑错误
+    // 
+    // 可能的失败原因：
+    // - 源分片拒绝迁移请求（权限、状态等）
+    // - 请求的数据范围不存在或已迁移
+    // - 源分片资源不足或过载
+    // - 数据完整性检查失败
     uassertStatusOKWithContext(Shard::CommandResponse::getEffectiveStatus(commandResponse),
                                "_migrateClone failed: ");
 
+    // 返回命令响应的BSON内容
+    // response字段包含实际的数据批次信息
+    // 
+    // 响应格式通常包含：
+    // - objects: 数据文档数组（核心数据内容）
+    // - numObjects: 当前批次中的文档数量
+    // - size: 当前批次的字节大小
+    // - ns: 命名空间信息
+    // - 其他元数据字段
+    //
+    // 空批次处理：
+    // - 当objects数组为空时，表示数据获取完成
+    // - 调用方通过_isEmptyBatch()检查空批次
+    // - 空批次是迁移完成的正常信号
     return commandResponse.response;
 }
 
@@ -431,6 +521,8 @@ void MigrationBatchFetcher<Inserter>::_runFetcher() try {
         // 将插入任务调度到插入器线程池中异步执行
         // 这实现了获取和插入的流水线并行处理，提高整体效率
         // 使用lambda捕获所有必要的变量，确保异步执行时数据有效
+
+        // _inserterWorkers 对应线程池中的线程回掉处理
         _inserterWorkers->schedule([this,
                                     batchSize,                     // 批次大小（用于缓冲区管理）
                                     fetchTime,                     // 获取时间（用于性能统计）

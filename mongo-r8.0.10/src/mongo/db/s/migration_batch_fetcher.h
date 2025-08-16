@@ -145,7 +145,8 @@ private:
     private:
         Mutex _mutex = MONGO_MAKE_LATCH("MigrationBatchFetcher::BufferSizeTracker::_mutex");
         stdx::condition_variable _hasAvailableSpace;
-
+       
+        // 默认值 chunkMigrationFetcherMaxBufferedSizeBytesPerThread = 4 * BSONObjMaxInternalSize
         const int _maxSizeBytes;
         int _currentSize{0};
     };
