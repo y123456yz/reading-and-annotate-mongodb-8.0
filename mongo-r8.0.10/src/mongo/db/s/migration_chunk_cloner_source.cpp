@@ -370,6 +370,7 @@ MigrationChunkClonerSource::~MigrationChunkClonerSource() {
  * - 状态检查：确保克隆器处于正确的初始状态
  * 
  * 该函数是整个迁移过程的数据传输启动点，为后续的批量数据传输奠定基础。
+ * 源分片调用 MigrationSourceManager::startClone-》MigrationChunkClonerSource::startClone
  */
 Status MigrationChunkClonerSource::startClone(OperationContext* opCtx,
                                               const UUID& migrationId,
@@ -1013,6 +1014,8 @@ void MigrationChunkClonerSource::_nextCloneBatchFromIndexScan(OperationContext* 
  * - 统计维护：准确记录各种异常情况的统计信息
  * 
  * 该函数专门用于常规大小的chunk，通过预存储记录ID实现高效的批量数据传输。
+ * 源分片: 记录需要迁移chunk的RecordId， MigrationChunkClonerSource::startClone->MigrationChunkClonerSource::_storeCurrentRecordId
+ * 源分片收到目标分片发来的_migrateClone请求: 根据上面记录的RecordId获取对应数据返回给目标分片 MigrationChunkClonerSource::startClone->MigrationChunkClonerSource::_nextCloneBatchFromCloneRecordIds
  */
 void MigrationChunkClonerSource::_nextCloneBatchFromCloneRecordIds(OperationContext* opCtx,
                                                                    const CollectionPtr& collection,
@@ -1663,7 +1666,10 @@ MigrationChunkClonerSource::_getIndexScanExecutor(OperationContext* opCtx,
  * 该函数是常规大小chunk高效迁移的基础，通过预收集记录ID实现高性能的批量数据访问。
 // 源分片 MigrationChunkClonerSource::startClone->MigrationChunkClonerSource::_storeCurrentRecordId 中会返回 ErrorCodes::ChunkTooBig
 // config server接收到应答后在 processRebalanceResponse 中识别ErrorCodes::ChunkTooBig，然后把该chunk标记为jumbo
- */
+ 
+ * 源分片: 记录需要迁移chunk的RecordId， MigrationChunkClonerSource::startClone->MigrationChunkClonerSource::_storeCurrentRecordId
+ * 源分片收到目标分片发来的_migrateClone请求: 根据上面记录的RecordId获取对应数据返回给目标分片 MigrationChunkClonerSource::startClone->MigrationChunkClonerSource::_nextCloneBatchFromCloneRecordIds
+*/
 Status MigrationChunkClonerSource::_storeCurrentRecordId(OperationContext* opCtx) {
     // 获取集合访问权限：以意向共享模式锁定集合
     // MODE_IS：允许并发读取，但阻止删除或重命名操作
@@ -1892,6 +1898,7 @@ long long xferMods(BSONArrayBuilder* arr,
  * - 中断处理：响应操作上下文的中断请求
  * 
  * 该函数是迁移过程中的关键控制点，确保在适当的时机进入关键区域以完成迁移。
+ * 源分片： MigrationChunkClonerSource::awaitUntilCriticalSectionIsAppropriate
  */
 Status MigrationChunkClonerSource::_checkRecipientCloningStatus(OperationContext* opCtx,
                                                                 Milliseconds maxTimeToWait) {
