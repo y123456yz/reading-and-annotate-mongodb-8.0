@@ -2102,40 +2102,148 @@ Status MigrationChunkClonerSource::_checkRecipientCloningStatus(OperationContext
     return {ErrorCodes::ExceededTimeLimit, "Timed out waiting for the cloner to catch up"};
 }
 
+/**
+ * MigrationChunkClonerSource::nextSessionMigrationBatch 函数的作用：
+ * 获取下一批会话迁移相关的oplog条目，用于在chunk迁移过程中传输会话和事务数据。
+ * 
+ * 核心功能：
+ * 1. 会话oplog批次收集：从会话目录源获取需要迁移的会话相关oplog条目
+ * 2. 批次大小控制：动态控制单次传输的oplog数据量，避免超出BSON大小限制
+ * 3. 写关注管理：标识需要等待大多数节点确认的关键oplog条目
+ * 4. 迭代式数据获取：持续获取oplog直到没有更多数据或达到批次大小限制
+ * 5. 内存优化：考虑BSONArray索引开销，精确控制传输数据量
+ * 
+ * 使用场景：
+ * - 在chunk迁移过程中传输会话相关的oplog数据
+ * - 确保可重试写操作和事务的会话状态正确迁移
+ * - 支持MongoDB多文档事务在分片环境中的数据一致性
+ * 
+ * 数据类型：
+ * - 可重试写操作的oplog条目：确保写操作的幂等性
+ * - 事务相关的oplog条目：保证事务操作的原子性
+ * - 会话生命周期事件：维护会话状态的连续性
+ * 
+ * 性能优化：
+ * - 批量传输：减少网络往返次数，提高传输效率
+ * - 大小控制：避免单次传输过大导致的内存问题
+ * - 懒加载：按需获取oplog，避免不必要的资源消耗
+ * - 状态缓存：利用会话目录源的内部缓存机制
+ * 
+ * 写关注策略：
+ * - 条件性等待：只对需要强一致性的oplog等待大多数确认
+ * - 性能平衡：在数据一致性和传输性能之间找到最佳平衡
+ * - 时间戳管理：返回需要等待写关注的最新oplog时间戳
+ * 
+ * 错误处理：
+ * - 大小超限保护：防止单个批次超出BSON最大用户大小
+ * - 数据完整性：确保oplog条目的完整性和有序性
+ * - 状态一致性：维护会话目录源的状态一致性
+ * 
+ * 该函数与fetchNextSessionMigrationBatch配合工作，是会话数据迁移的核心实现。
+ * 
+ * 参数说明：
+ * @param opCtx 操作上下文，提供事务和中断支持
+ * @param arrBuilder BSON数组构建器，用于收集oplog条目
+ * 
+ * 返回值：
+ * @return boost::optional<repl::OpTime> 需要等待写关注的最新oplog时间戳，如果不需要等待则为空
+ */
 boost::optional<repl::OpTime> MigrationChunkClonerSource::nextSessionMigrationBatch(
     OperationContext* opCtx, BSONArrayBuilder* arrBuilder) {
+    // 写关注时间戳初始化：
+    // 功能：存储需要等待大多数节点确认的最新oplog操作时间戳
+    // 用途：在批次传输完成后，调用方可以使用此时间戳等待写关注
+    // 策略：只有标记为需要等待大多数确认的oplog才会更新此时间戳
     repl::OpTime opTimeToWaitIfWaitingForMajority;
+    
+    // chunk范围定义：
+    // 功能：创建当前迁移chunk的范围对象
+    // 用途：用于验证oplog条目是否属于当前迁移的chunk范围
+    // 组成：包含最小边界和最大边界的范围定义
     const ChunkRange range(getMin(), getMax());
 
+    // 主oplog获取循环：
+    // 条件：持续循环直到会话目录源没有更多oplog可获取
+    // 目的：收集当前批次的所有可用会话oplog条目
     while (_sessionCatalogSource->hasMoreOplog()) {
+        // 获取最后获取的oplog结果：
+        // 功能：从会话目录源获取上次fetchNextOplog()调用的结果
+        // 内容：包含oplog条目、是否需要等待大多数确认等信息
+        // 缓存机制：会话目录源内部维护获取结果的缓存
         auto result = _sessionCatalogSource->getLastFetchedOplog();
 
+        // oplog有效性检查：
+        // 条件：如果获取的结果中没有有效的oplog条目
+        // 原因：可能是内部缓存为空或者需要继续获取下一个oplog
+        // 处理：触发下一次oplog获取并继续循环
         if (!result.oplog) {
+            // 获取下一个oplog：
+            // 功能：从oplog集合中获取下一个需要迁移的会话相关条目
+            // 状态更新：更新会话目录源的内部状态和缓存
+            // 过滤：只获取与当前chunk范围相关的oplog条目
             _sessionCatalogSource->fetchNextOplog(opCtx);
-            continue;
+            continue;  // 继续下一次循环尝试
         }
 
+        // oplog时间戳提取：
+        // 功能：从oplog条目中提取操作时间戳
+        // 用途：用于后续的写关注等待和时间戳比较
+        // 重要性：确保oplog条目按时间戳顺序处理
         auto newOpTime = result.oplog->getOpTime();
+        
+        // oplog文档序列化：
+        // 功能：将oplog条目转换为BSON文档格式
+        // 目的：准备用于网络传输的序列化数据
+        // 格式：标准的oplog条目BSON格式，包含所有必要字段
         auto oplogDoc = result.oplog->getEntry().toBSON();
 
         // Use the builder size instead of accumulating the document sizes directly so that we
         // take into consideration the overhead of BSONArray indices.
+        // BSON大小限制检查：
+        // 策略：使用构建器大小而不是直接累积文档大小，以考虑BSONArray索引的开销
+        // 条件1：arrBuilder->arrSize() - 确保数组中已有oplog条目（保证有进展）
+        // 条件2：大小检查 - 当前长度 + oplog文档大小 + 1024字节缓冲 > BSON最大用户大小
+        // 保护：防止单个批次超出BSON大小限制，确保网络传输的可靠性
         if (arrBuilder->arrSize() &&
             (arrBuilder->len() + oplogDoc.objsize() + 1024) > BSONObjMaxUserSize) {
+            // 批次大小超限处理：
+            // 操作：退出循环，结束当前批次的oplog收集
+            // 结果：当前oplog条目将在下次调用时被处理
+            // 优势：避免传输过大的批次，优化网络性能
             break;
         }
 
+        // oplog条目添加到批次：
+        // 操作：将序列化的oplog文档添加到BSON数组构建器中
+        // 结果：oplog条目将包含在返回给目标分片的批次中
+        // 顺序：按照从会话目录源获取的顺序添加，保持时间戳顺序
         arrBuilder->append(oplogDoc);
 
+        // 获取下一个oplog：
+        // 功能：推进会话目录源到下一个oplog条目
+        // 状态更新：更新内部游标位置和缓存状态
+        // 准备：为下次循环迭代准备下一个oplog条目
         _sessionCatalogSource->fetchNextOplog(opCtx);
 
+        // 写关注需求检查：
+        // 条件：如果当前oplog条目需要等待大多数节点确认
+        // 用途：确保关键的会话操作在大多数节点上持久化
+        // 例子：事务提交操作、重要的会话状态变更等
         if (result.shouldWaitForMajority) {
+            // 写关注时间戳更新：
+            // 条件：如果当前oplog的时间戳比已记录的时间戳更新
+            // 操作：更新需要等待写关注的最新时间戳
+            // 结果：调用方将等待此时间戳对应的操作在大多数节点上确认
             if (opTimeToWaitIfWaitingForMajority < newOpTime) {
                 opTimeToWaitIfWaitingForMajority = newOpTime;
             }
         }
     }
 
+    // 返回写关注时间戳：
+    // 内容：如果批次中包含需要等待大多数确认的oplog，返回最新的时间戳
+    // 用途：调用方可以使用此时间戳调用waitForWriteConcern()等待确认
+    // 优化：如果所有oplog都不需要等待大多数，返回空值以避免不必要的等待
     return boost::make_optional(opTimeToWaitIfWaitingForMajority);
 }
 

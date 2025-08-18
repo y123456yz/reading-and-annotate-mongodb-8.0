@@ -424,23 +424,108 @@ void SessionCatalogMigrationSource::onCloneCleanup() {
     }
 }
 
+/**
+ * SessionCatalogMigrationSource::getLastFetchedOplog 函数的作用：
+ * 获取最后一次获取的会话oplog条目，用于分片迁移过程中的会话数据传输核心逻辑。
+ * 
+ * 核心功能：
+ * 1. 统一访问接口：为调用者提供获取已缓存oplog条目的统一接口
+ * 2. 多数据源整合：整合历史会话数据和增量新写操作两个数据源的oplog条目
+ * 3. 镜像优先返回：优先返回前置/后置镜像条目，然后返回原始oplog条目
+ * 4. 写关注标识：标识返回的oplog条目是否需要等待大多数节点确认
+ * 5. 状态同步：提供迁移过程中会话oplog获取状态的实时查询
+ * 
+ * 设计原理：
+ * - 双数据源管理：区分历史会话数据和新写操作数据的不同处理逻辑
+ * - 优先级返回：镜像条目优先于原始条目，确保findAndModify等操作的完整性
+ * - 线程安全：通过分离的互斥锁保护不同数据源的并发访问
+ * - 缓存机制：避免重复获取，提高数据传输效率
+ * 
+ * 返回优先级（从高到低）：
+ * 1. 历史会话镜像条目 (_lastFetchedOplogImage)
+ * 2. 历史会话原始条目 (_lastFetchedOplog) 
+ * 3. 新写操作镜像条目 (_lastFetchedNewWriteOplogImage)
+ * 4. 新写操作原始条目 (_lastFetchedNewWriteOplog)
+ * 
+ * 使用场景：
+ * - 在chunk迁移过程中获取待传输的会话oplog条目
+ * - 配合fetchNextOplog()实现完整的会话数据迁移流程
+ * - 支持可重试写入、内部事务和普通事务的统一处理
+ * - 维护分片间会话状态的一致性传输
+ * 
+ * 性能优化：
+ * - 缓存访问：避免重复的磁盘I/O操作
+ * - 分离锁设计：减少锁竞争，提高并发性能
+ * - 惰性加载：按需获取oplog条目，节省内存资源
+ * 
+ * 错误处理：
+ * - 状态一致性：确保不同数据源状态的一致性检查
+ * - 并发安全：通过锁机制保护共享状态变量
+ * - 空值处理：正确处理无可用oplog条目的情况
+ * 
+ * 该函数是分片迁移会话数据传输的关键组件，与fetchNextOplog()配合实现完整的会话oplog获取流程。
+ * 
+ * @return OplogResult 包含oplog条目和是否需要等待大多数确认的结果对象
+ */
 SessionCatalogMigrationSource::OplogResult SessionCatalogMigrationSource::getLastFetchedOplog() {
+    // ========== 第一优先级：历史会话数据源 ==========
+    // 获取会话克隆互斥锁，保护历史会话数据相关的状态变量
+    // 这个锁保护从config.transactions扫描得到的历史会话oplog状态
     {
         stdx::lock_guard<Latch> _lk(_sessionCloneMutex);
+        
+        // 检查是否存在历史会话的前置/后置镜像条目
+        // 对于findAndModify等操作，需要先返回镜像数据，再返回原始操作
         if (_lastFetchedOplogImage) {
+            // 返回历史会话镜像条目，shouldWaitForMajority设为false
+            // 历史数据通常不需要等待写关注，因为它们已经是持久化的
             return OplogResult(_lastFetchedOplogImage, false);
-        } else if (_lastFetchedOplog) {
+        } 
+        // 检查是否存在历史会话的原始oplog条目
+        else if (_lastFetchedOplog) {
+            // 返回历史会话原始条目，shouldWaitForMajority设为false
+            // 这些是从TransactionHistoryIterator遍历oplog链得到的条目
             return OplogResult(_lastFetchedOplog, false);
         }
     }
 
+    // ========== 第二优先级：新写操作数据源 ==========
+    // 获取新oplog互斥锁，保护迁移过程中新产生的写操作相关状态
+    // 这个锁保护通过OpObserver实时通知的新写操作oplog状态
     {
         stdx::lock_guard<Latch> _lk(_newOplogMutex);
+        
+        // 检查是否存在新写操作的前置/后置镜像条目
+        // 迁移过程中新产生的findAndModify操作可能需要镜像数据
         if (_lastFetchedNewWriteOplogImage) {
+            // 返回新写操作镜像条目，shouldWaitForMajority设为false
+            // 镜像数据本身不需要等待写关注，因为它们是辅助数据
             return OplogResult(_lastFetchedNewWriteOplogImage, false);
         }
+        
+        // 返回新写操作的原始条目，shouldWaitForMajority设为true
+        // 新写操作的oplog条目需要等待大多数节点确认，确保数据一致性
+        // 这是为了防止在迁移过程中发生回滚导致的数据不一致
         return OplogResult(_lastFetchedNewWriteOplog, true);
     }
+    
+    // 函数执行流程说明：
+    // 1. 首先检查历史会话数据源（优先级高）
+    //    - 历史镜像条目 > 历史原始条目
+    // 2. 然后检查新写操作数据源（优先级低）  
+    //    - 新写镜像条目 > 新写原始条目
+    // 3. 分离的锁设计避免了长时间持锁和死锁问题
+    // 4. shouldWaitForMajority的设置体现了不同数据类型的一致性需求
+    //
+    // 调用时序：
+    // 1. 调用fetchNextOplog()获取下一个oplog条目
+    // 2. 调用getLastFetchedOplog()获取已缓存的oplog内容
+    // 3. 重复步骤1-2直到所有会话oplog都被处理完毕
+    //
+    // 与其他函数的协作：
+    // - fetchNextOplog(): 负责获取和缓存oplog条目
+    // - nextSessionMigrationBatch(): 使用此函数获取批次数据
+    // - fetchNextSessionMigrationBatch(): 整体协调会话数据传输
 }
 
 /**
