@@ -527,30 +527,90 @@ public:
         return nullptr;
     }
 
+    /**
+     * MigrateSessionCommand::run 函数的作用：
+     * 处理目标分片发送的 _getNextSessionMods 命令，负责提取和传输与会话相关的 oplog 条目。
+     * 这是 MongoDB 分片迁移过程中处理事务和会话相关数据的关键命令。
+     * 
+     * 核心功能：
+     * 1. 会话 oplog 提取：获取需要迁移的会话相关 oplog 条目
+     * 2. 批次处理：支持分批传输大量会话数据，避免内存溢出
+     * 3. 写关注确认：确保 oplog 条目已经在大多数节点上持久化
+     * 4. 回滚检测：通过 rollback ID 检测并防止数据回滚导致的不一致
+     * 5. 异步通知机制：当没有数据时提供通知机制，支持等待新数据
+     * 
+     * 使用场景：
+     * - 在 chunk 迁移过程中传输会话相关的 oplog 数据
+     * - 确保事务操作在迁移过程中的一致性
+     * - 支持 MongoDB 的多文档事务在分片环境中的正确迁移
+     * 
+     * 状态管理：
+     * - 该命令不是无状态的：调用会逐渐消耗包含 oplog 条目的缓冲区
+     * - 每次调用都会推进内部状态，直到所有相关 oplog 被传输完毕
+     * 
+     * 安全保障：
+     * - 写关注等待：确保 oplog 条目在大多数节点上提交
+     * - 回滚检测：防止因回滚导致的数据不一致
+     * - 会话验证：确保访问正确的迁移会话
+     * 
+     * 错误处理：
+     * - 会话不匹配：返回 IllegalOperation 错误
+     * - 回滚检测：返回错误并中止迁移
+     * - 克隆器状态异常：返回相应的状态错误
+     * 
+     * 与其他命令的关系：
+     * - InitialCloneCommand：传输基础数据
+     * - TransferModsCommand：传输数据修改
+     * - MigrateSessionCommand：传输会话和事务相关数据
+     * 
+     * 该函数确保了 MongoDB 事务和会话数据在分片迁移过程中的完整性和一致性。
+     */
     bool run(OperationContext* opCtx,
              const DatabaseName&,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
+        // 迁移会话ID提取和验证：
+        // 功能：从命令对象中提取迁移会话标识符
+        // 安全性：确保命令来自合法的迁移会话，防止非法访问
+        // 错误处理：如果会话ID格式不正确或缺失，会抛出异常
         const MigrationSessionId migrationSessionId(
             uassertStatusOK(MigrationSessionId::extractFromBSON(cmdObj)));
 
+        // 初始化会话批次数组构建器：用于收集会话相关的 oplog 条目
         BSONArrayBuilder arrBuilder;
+        // 迁移完成标志：指示迁移是否已进入关键区域或已中止
         bool hasMigrationCompleted = false;
 
+        // 循环获取会话 oplog 批次，直到获得数据或迁移完成
         do {
+            // 尝试获取下一批会话迁移数据
+            // 如果返回非空通知对象，说明当前没有可用数据，需要等待
             if (auto newOplogNotification =
                     fetchNextSessionMigrationBatch(opCtx, migrationSessionId, &arrBuilder)) {
+                // 等待通知信号：可能是新数据到达或迁移进入关键区域/中止
+                // get() 方法会阻塞直到收到通知
+                // 返回值：true 表示迁移已完成，false 表示有新数据可用
                 hasMigrationCompleted = newOplogNotification->get(opCtx);
             } else if (arrBuilder.arrSize() == 0) {
                 // If we didn't get a notification and the arrBuilder is empty, that means
                 // that the sessionMigration is not active for this migration (most likely
                 // because it's not a replica set).
+                // 如果没有获得通知且数组构建器为空，说明会话迁移对此迁移不活跃
+                // （很可能因为这不是一个副本集环境）
                 hasMigrationCompleted = true;
             }
+            // 继续循环条件：数组为空且迁移未完成
+            // 这确保了函数会持续尝试获取数据，直到有数据返回或迁移结束
         } while (arrBuilder.arrSize() == 0 && !hasMigrationCompleted);
 
+        // 将收集到的 oplog 条目数组添加到响应中
+        // 字段名 "oplog"：目标分片期望的会话 oplog 数组字段
+        // 即使为空数组，也会返回，让目标分片知道当前状态
         result.appendArray("oplog", arrBuilder.arr());
 
+        // 命令执行成功标识：
+        // 返回值：true 表示命令成功执行
+        // 效果：MongoDB 会将 result 对象作为成功响应返回给目标分片
         return true;
     }
 };

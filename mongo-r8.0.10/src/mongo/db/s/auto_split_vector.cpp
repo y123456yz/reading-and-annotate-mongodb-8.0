@@ -375,7 +375,8 @@ std::pair<std::vector<BSONObj>, bool> autoSplitVector(OperationContext* opCtx,
                 }
                 if (compareWithPreviousSplitPoint == 0) {
                     // Do not add again the same split point in case of frequent shard key.
-                    // 重复分裂点处理：将高频键记录到特殊集合中
+                    // 重复分裂点处理：将高频键记录到特殊集合中. yang add todo xxxxx 这里可以提前发现jumbo chunk
+                    // 如果是jumbo chunk，这里加入 tooFrequentKeys 而不是加入 splitKeys， 所以jumbo chunk 的分裂点不会被记录到 splitKeys 中
                     tooFrequentKeys.insert(currentKey.getOwned());
                     continue;
                 }

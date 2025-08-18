@@ -323,11 +323,65 @@ BSONObj createMigrateCloneRequest(const NamespaceString& nss, const MigrationSes
  *
  * 'sessionId' unique identifier for this migration.
  */
+/**
+ * createTransferModsRequest 函数的作用：
+ * 创建用于向源分片请求增量修改数据的BSON命令对象，在chunk迁移的增量同步阶段使用。
+ * 
+ * 核心功能：
+ * 1. 命令构建：构建 _transferMods 命令的BSON请求对象
+ * 2. 会话绑定：将迁移会话ID绑定到请求中，确保增量数据的一致性
+ * 3. 命名空间指定：指定要获取增量修改的目标集合
+ * 4. 序列化处理：正确序列化命名空间以适配网络传输
+ * 
+ * 使用场景：
+ * - 在迁移的catch-up阶段（阶段5）用于从源分片获取增量修改
+ * - 在steady状态期间持续获取源分片的数据变更
+ * - 确保目标分片能够获取到初始克隆后的所有数据变更
+ * 
+ * 网络通信：
+ * - 通过 Shard::runCommand 发送到源分片执行
+ * - 源分片接收后返回包含增量修改的响应
+ * - 支持删除操作（deleted字段）和插入/更新操作（reload字段）
+ * 
+ * 会话一致性：
+ * - 通过会话ID确保与同一迁移实例的连续性
+ * - 防止在分片故障转移时出现数据不一致
+ * - 保证增量同步的原子性和可靠性
+ * 
+ * 参数说明：
+ * @param nss 目标集合的命名空间（数据库名.集合名）
+ * @param sessionId 迁移会话的唯一标识符，用于保证会话一致性
+ * 
+ * 返回值：
+ * @return BSONObj 包含 _transferMods 命令和会话ID的BSON对象
+ * 
+ * 该函数生成的请求用于chunk迁移增量同步阶段的数据获取，确保目标分片数据的完整性。
+ * 目标分片: MigrationDestinationManager::_migrateDriver->createTransferModsRequest发送“_transferMods”请求
+ * 源分片收到请求后：TransferModsCommand::run
+ */
 BSONObj createTransferModsRequest(const NamespaceString& nss, const MigrationSessionId& sessionId) {
+    // 创建BSON对象构建器：用于构建 _transferMods 命令请求
     BSONObjBuilder builder;
+    
+    // 添加 _transferMods 命令字段：
+    // - 命令名：_transferMods，指示源分片返回增量修改数据
+    // - 命令值：序列化的目标集合命名空间
+    // - 序列化上下文：使用默认状态确保正确的命名空间格式
     builder.append("_transferMods",
                    NamespaceStringUtil::serialize(nss, SerializationContext::stateDefault()));
+    
+    // 添加迁移会话ID：
+    // - 将会话ID追加到BSON构建器中
+    // - 确保请求与特定的迁移实例关联
+    // - 防止不同迁移会话间的数据混乱
     sessionId.append(&builder);
+    
+    // 构建并返回最终的BSON命令对象：
+    // 生成的对象格式类似：
+    // {
+    //   "_transferMods": "mydb.mycollection",
+    //   "sessionId": "migration-session-uuid-12345"
+    // }
     return builder.obj();
 }
 

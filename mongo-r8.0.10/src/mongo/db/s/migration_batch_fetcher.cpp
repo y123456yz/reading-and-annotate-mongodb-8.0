@@ -537,6 +537,7 @@ void MigrationBatchFetcher<Inserter>::_runFetcher() try {
             
             // 执行实际的插入操作
             // inserter.run() 将批次中的文档插入到目标分片的集合中
+            // MigrationBatchInserter::run
             inserter.run(status);
 
             // 性能统计计算：定义辅助函数避免除零错误

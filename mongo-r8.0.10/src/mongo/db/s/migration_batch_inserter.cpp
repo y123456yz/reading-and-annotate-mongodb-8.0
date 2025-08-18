@@ -165,6 +165,7 @@ void MigrationBatchInserter::onCreateThread(const std::string& threadName) {
  * @param status 任务调度状态，必须为OK才能执行插入
  * 
  * 该函数是chunk迁移数据写入端的核心实现，确保数据的可靠传输和插入。
+ * MigrationBatchFetcher<Inserter>::_runFetcher()
  */
 void MigrationBatchInserter::run(Status status) const try {
     // Run is passed in a non-ok status if this function runs inline.
