@@ -1288,16 +1288,75 @@ void MigrationChunkClonerSource::_processDeferredXferMods(OperationContext* opCt
     });
 }
 
+/**
+ * MigrationChunkClonerSource::nextModsBatch 函数的作用：
+ * 获取下一批增量修改操作数据，是chunk迁移过程中传输增量变更的核心函数。
+ * 
+ * 核心功能：
+ * 1. 增量数据批次传输：收集并返回迁移过程中发生的插入、更新、删除操作
+ * 2. 延迟修改处理：处理在事务提交时无法确定后置镜像的延迟更新操作
+ * 3. 因果顺序保证：确保删除和更新操作按照因果顺序被消费和传输
+ * 4. 批次大小控制：动态控制单次传输的数据量，避免超出BSON大小限制
+ * 5. 快照一致性管理：放弃陈旧快照，确保读取的数据至少与最新更新一样新
+ * 
+ * 数据类型处理：
+ * - deleted数组：包含被删除文档的ID信息
+ * - reload数组：包含需要重新加载的完整文档（插入和更新操作）
+ * - size字段：传输数据的总字节大小
+ * 
+ * 处理策略：
+ * - 删除优先：总是先消费删除缓冲区，再消费更新缓冲区
+ * - 原子快照：在单个锁下获取删除和更新列表的"快照"
+ * - 延迟处理：优先处理延迟的xfer修改操作
+ * - 剩余恢复：将未消费的ID重新放回缓冲区
+ * 
+ * 一致性保证：
+ * - 因果顺序维护：如果删除在因果上先于对同一文档的更新，则没有问题
+ * - 快照更新：确保快照至少与这些更新一样新
+ * - 原子操作：删除和更新列表的获取在单个锁下完成
+ * 
+ * 性能优化：
+ * - 批量传输：减少网络往返次数
+ * - 大小控制：避免单次传输过大导致的内存问题
+ * - 状态缓存：通过计数器跟踪未传输的操作数量
+ * - 快照管理：及时放弃陈旧快照释放资源
+ * 
+ * 错误处理：
+ * - 状态验证：确保所有克隆数据都已被消耗
+ * - 数据完整性：通过xferMods函数处理文档获取和验证
+ * - 资源清理：确保未处理的数据重新加入队列
+ * 
+ * 该函数与TransferModsCommand配合工作，是增量数据迁移的核心实现。
+ * 
+ * 参数说明：
+ * @param opCtx 操作上下文，提供事务和中断支持
+ * @param builder BSON对象构建器，用于构建响应数据
+ * 
+ * 返回值：
+ * @return Status 操作执行状态，成功时包含增量修改数据
+ */
 Status MigrationChunkClonerSource::nextModsBatch(OperationContext* opCtx, BSONObjBuilder* builder) {
+    // 集合锁验证：确保调用者持有集合的意向共享锁
+    // 目的：保证在数据读取期间集合不会被删除或重命名
+    // 锁模式：MODE_IS 允许并发读取但阻止结构性变更
     dassert(shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(nss(), MODE_IS));
 
+    // 延迟修改操作处理：
+    // 功能：处理在事务提交时由于缺少后置镜像而延迟的更新操作
+    // 时机：在处理常规修改队列之前优先处理延迟操作
+    // 目的：确保所有修改操作都能被正确识别和处理
     _processDeferredXferMods(opCtx);
 
-    std::list<BSONObj> deleteList;
-    std::list<BSONObj> updateList;
+    // 临时列表声明：
+    // 功能：创建本地临时列表用于存储从队列中取出的操作ID
+    // 设计：使用本地列表避免长时间持有互斥锁
+    std::list<BSONObj> deleteList;  // 删除操作ID列表
+    std::list<BSONObj> updateList;  // 更新/插入操作ID列表
 
     {
         // All clone data must have been drained before starting to fetch the incremental changes.
+        // 前置条件验证：所有克隆数据必须在开始获取增量变更之前被消耗完毕
+        // 原因：确保迁移过程的正确阶段顺序，避免数据重复或遗漏
         stdx::unique_lock<Latch> lk(_mutex);
         invariant(!_cloneList.hasMore());
 
@@ -1307,40 +1366,120 @@ Status MigrationChunkClonerSource::nextModsBatch(OperationContext* opCtx, BSONOb
         // the same doc, then there's no problem since we consume the delete buffer first. If the
         // delete is causally after, we will not be able to see the document when we attempt to
         // fetch it, so it's also ok.
+        // 原子快照获取：
+        // 重要性：删除和更新列表的"快照"必须在单个锁下获取
+        // 目的：确保保持写操作的因果顺序
+        // 策略：总是先消费删除缓冲区，再消费更新缓冲区
+        // 
+        // 因果顺序分析：
+        // 情况1：删除在因果上先于对同一文档的更新
+        //   - 处理：先消费删除缓冲区，因此没有问题
+        // 情况2：删除在因果上后于更新
+        //   - 处理：尝试获取文档时将无法看到该文档，这也是正确的
+        //   - 原因：文档已被删除，获取失败是预期行为
+        
+        // 删除操作转移：将内部删除队列的所有元素移动到本地列表
+        // splice操作：高效地转移元素所有权，避免拷贝开销
+        // 结果：_deleted队列被清空，所有删除操作ID转移到deleteList
         deleteList.splice(deleteList.cbegin(), _deleted);
+        
+        // 更新操作转移：将内部重载队列的所有元素移动到本地列表  
+        // splice操作：原子性地转移所有插入和更新操作ID
+        // 结果：_reload队列被清空，所有操作ID转移到updateList
         updateList.splice(updateList.cbegin(), _reload);
     }
 
     // It's important to abandon any open snapshots before processing updates so that we are sure
     // that our snapshot is at least as new as those updates. It's possible for a stale snapshot to
     // still be open from reads performed by _processDeferredXferMods(), above.
+    // 快照一致性管理：
+    // 重要性：在处理更新之前放弃任何打开的快照，确保快照至少与这些更新一样新
+    // 原因：可能存在来自上面_processDeferredXferMods()执行的读取所打开的陈旧快照
+    // 操作：放弃当前快照，强制后续读取使用最新的数据快照
+    // 目的：保证数据读取的时点一致性和最新性
     shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
 
+    // 删除操作数组构建：
+    // 功能：创建包含删除操作的BSON子数组
+    // 策略：使用无操作函数直接返回ID文档，无需额外处理
     BSONArrayBuilder arrDel(builder->subarrayStart("deleted"));
+    
+    // 无操作函数定义：
+    // 功能：对于删除操作，直接返回ID文档而不进行任何转换
+    // 参数：idDoc - 文档ID，fullDoc - 输出的完整文档
+    // 返回：总是返回true表示处理成功
     auto noopFn = [](BSONObj idDoc, BSONObj* fullDoc) {
-        *fullDoc = idDoc;
+        *fullDoc = idDoc;  // 直接将ID文档作为完整文档
         return true;
     };
+    
+    // 删除操作传输：
+    // 功能：将删除列表中的操作ID传输到数组构建器中
+    // 参数1：数组构建器指针，用于添加删除的文档ID
+    // 参数2：删除列表指针，包含所有待传输的删除操作ID
+    // 参数3：初始大小为0，因为这是第一个处理的数组
+    // 参数4：无操作函数，直接使用ID文档
+    // 返回：传输的总文档大小
     long long totalDocSize = xferMods(&arrDel, &deleteList, 0, noopFn);
-    arrDel.done();
+    arrDel.done();  // 完成删除数组的构建
 
+    // 更新操作条件处理：
+    // 条件：只有当删除列表为空时才处理更新列表
+    // 原因：如果删除列表未完全处理完毕，优先完成删除操作的传输
+    // 策略：避免在单个批次中混合过多不同类型的操作
     if (deleteList.empty()) {
+        // 更新操作数组构建：
+        // 功能：创建包含重新加载操作的BSON子数组
+        // 内容：插入和更新操作需要传输完整的文档内容
         BSONArrayBuilder arrUpd(builder->subarrayStart("reload"));
+        
+        // 文档查找包装函数：
+        // 功能：为更新操作提供文档查找能力
+        // 捕获：操作上下文和当前对象指针，用于文档查找
+        // 逻辑：根据文档ID在集合中查找完整的文档内容
         auto findByIdWrapper = [opCtx, this](BSONObj idDoc, BSONObj* fullDoc) {
             return Helpers::findById(opCtx, this->nss(), idDoc, *fullDoc);
         };
+        
+        // 更新操作传输：
+        // 功能：将更新列表中的操作ID对应的完整文档传输到数组中
+        // 参数1：数组构建器指针，用于添加完整文档
+        // 参数2：更新列表指针，包含需要重新加载的文档ID
+        // 参数3：当前总大小，基于删除操作的传输大小
+        // 参数4：文档查找函数，用于根据ID获取完整文档
+        // 返回：更新后的总文档大小
         totalDocSize = xferMods(&arrUpd, &updateList, totalDocSize, findByIdWrapper);
-        arrUpd.done();
+        arrUpd.done();  // 完成更新数组的构建
     }
 
+    // 传输大小记录：
+    // 功能：在响应中记录本次传输的总数据大小
+    // 用途：接收端可以基于此信息进行传输统计和性能监控
     builder->append("size", totalDocSize);
 
     // Put back remaining ids we didn't consume
+    // 剩余操作恢复：将未消费的ID重新放回内部队列
+    // 原因：某些操作可能因为批次大小限制而未被处理
+    // 策略：确保未处理的操作在下次调用时能被继续处理
     stdx::unique_lock<Latch> lk(_mutex);
+    
+    // 删除操作恢复：
+    // 操作：将未处理的删除操作ID重新插入到内部删除队列的开头
+    // splice：高效地转移所有剩余元素，保持操作顺序
+    // 计数更新：更新未传输删除操作的计数器
     _deleted.splice(_deleted.cbegin(), deleteList);
     _untransferredDeletesCounter = _deleted.size();
+    
+    // 更新操作恢复：
+    // 操作：将未处理的更新/插入操作ID重新插入到内部重载队列的开头
+    // splice：保持操作的原始顺序，确保后续处理的一致性
+    // 计数更新：更新未传输更新操作的计数器
     _reload.splice(_reload.cbegin(), updateList);
     _untransferredUpsertsCounter = _reload.size();
+    
+    // 延迟操作计数更新：
+    // 功能：更新延迟处理的操作计数器
+    // 用途：跟踪仍需要延迟处理的操作数量，用于内存使用估算
     _deferredUntransferredOpsCounter = _deferredReloadOrDeletePreImageDocKeys.size();
 
     return Status::OK();

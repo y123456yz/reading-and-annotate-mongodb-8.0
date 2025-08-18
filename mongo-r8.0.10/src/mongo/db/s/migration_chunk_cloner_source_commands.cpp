@@ -372,6 +372,8 @@ public:
 };
 MONGO_REGISTER_COMMAND(InitialCloneCommand).forShard();
 
+// * 目标分片: MigrationDestinationManager::_migrateDriver->createTransferModsRequest发送“_transferMods”请求
+// * 源分片收到请求后：TransferModsCommand::run
 class TransferModsCommand : public BasicCommand {
 public:
     TransferModsCommand() : BasicCommand("_transferMods") {}
@@ -409,6 +411,7 @@ public:
         return Status::OK();
     }
 
+    //TransferModsCommand::run
     bool run(OperationContext* opCtx,
              const DatabaseName&,
              const BSONObj& cmdObj,
@@ -467,159 +470,159 @@ public:
         return Status::OK();
     }
 
-/**
- * fetchNextSessionMigrationBatch 函数的作用：
- * 获取下一批需要传输的会话相关oplog条目并将其附加到给定的数组构建器中。
- * 这是MongoDB分片迁移过程中处理事务和会话数据的核心函数。
- * 
- * 核心功能：
- * 1. 会话oplog批次获取：从克隆器获取下一批会话相关的oplog条目
- * 2. 异步通知机制：当无可用数据时返回通知对象，支持等待新数据
- * 3. 写关注确认：确保获取的oplog条目已在大多数节点上持久化
- * 4. 回滚检测：通过回滚ID验证数据一致性，防止回滚导致的数据错误
- * 5. 写冲突重试：处理并发访问oplog时可能出现的冲突
- * 
- * 返回值说明：
- * - 返回nullptr：成功获取到oplog数据，调用方可以处理arrBuilder中的数据
- * - 返回Notification对象：当前无可用数据，调用方需要等待通知
- *   - 通知值为true：迁移已进入关键区域或中止，无更多数据
- *   - 通知值为false：有新的oplog批次可用，可以重新调用
- * 
- * 安全保障：
- * - 写关注等待：确保oplog条目的持久性和一致性
- * - 回滚检测：防止已回滚的数据被错误迁移
- * - 会话验证：确保访问正确的迁移会话
- * 
- * 使用场景：
- * - 在chunk迁移过程中传输事务相关的oplog数据
- * - 确保多文档事务在分片迁移中的一致性
- * - 支持MongoDB会话数据的安全迁移
- * 
- * 性能优化：
- * - 写冲突重试机制：处理高并发场景下的冲突
- * - 批次处理：减少网络往返次数
- * - 异步通知：避免忙等待，提高系统效率
- * 
- * 该函数是MigrateSessionCommand的核心实现，确保事务和会话数据的完整迁移。
- * 
- * 参数说明：
- * @param opCtx 操作上下文，提供事务和权限信息
- * @param migrationSessionId 迁移会话ID，确保会话一致性
- * @param arrBuilder 数组构建器指针，用于接收oplog数据
- * 
- * @return std::shared_ptr<Notification<bool>> 异步通知对象或nullptr
- */
-/**
- * Fetches the next batch of oplog that needs to be transferred and appends it to the given
- * array builder. If it was not able to fetch anything, it will return a non-null notification
- * that will get signalled when new batches comes in or when migration is over. If the boolean
- * value from the notification returns true, then the migration has entered the critical
- * section or aborted and there's no more new batches to fetch.
- */
-std::shared_ptr<Notification<bool>> fetchNextSessionMigrationBatch(
-    OperationContext* opCtx,
-    const MigrationSessionId& migrationSessionId,
-    BSONArrayBuilder* arrBuilder) {
-    // 操作时间戳：用于后续的写关注等待
-    // 如果获取到oplog数据，将包含最新操作的时间戳
-    // 用于确保在返回给调用方之前，数据已在大多数节点上持久化
-    boost::optional<repl::OpTime> opTime;
-    
-    // 新oplog通知对象：当没有可用数据时用于异步等待
-    // 如果当前没有可用的会话oplog数据，将返回此通知对象
-    // 调用方可以通过此对象等待新数据到达或迁移完成的信号
-    std::shared_ptr<Notification<bool>> newOplogNotification;
+    /**
+     * fetchNextSessionMigrationBatch 函数的作用：
+     * 获取下一批需要传输的会话相关oplog条目并将其附加到给定的数组构建器中。
+     * 这是MongoDB分片迁移过程中处理事务和会话数据的核心函数。
+     * 
+     * 核心功能：
+     * 1. 会话oplog批次获取：从克隆器获取下一批会话相关的oplog条目
+     * 2. 异步通知机制：当无可用数据时返回通知对象，支持等待新数据
+     * 3. 写关注确认：确保获取的oplog条目已在大多数节点上持久化
+     * 4. 回滚检测：通过回滚ID验证数据一致性，防止回滚导致的数据错误
+     * 5. 写冲突重试：处理并发访问oplog时可能出现的冲突
+     * 
+     * 返回值说明：
+     * - 返回nullptr：成功获取到oplog数据，调用方可以处理arrBuilder中的数据
+     * - 返回Notification对象：当前无可用数据，调用方需要等待通知
+     *   - 通知值为true：迁移已进入关键区域或中止，无更多数据
+     *   - 通知值为false：有新的oplog批次可用，可以重新调用
+     * 
+     * 安全保障：
+     * - 写关注等待：确保oplog条目的持久性和一致性
+     * - 回滚检测：防止已回滚的数据被错误迁移
+     * - 会话验证：确保访问正确的迁移会话
+     * 
+     * 使用场景：
+     * - 在chunk迁移过程中传输事务相关的oplog数据
+     * - 确保多文档事务在分片迁移中的一致性
+     * - 支持MongoDB会话数据的安全迁移
+     * 
+     * 性能优化：
+     * - 写冲突重试机制：处理高并发场景下的冲突
+     * - 批次处理：减少网络往返次数
+     * - 异步通知：避免忙等待，提高系统效率
+     * 
+     * 该函数是MigrateSessionCommand的核心实现，确保事务和会话数据的完整迁移。
+     * 
+     * 参数说明：
+     * @param opCtx 操作上下文，提供事务和权限信息
+     * @param migrationSessionId 迁移会话ID，确保会话一致性
+     * @param arrBuilder 数组构建器指针，用于接收oplog数据
+     * 
+     * @return std::shared_ptr<Notification<bool>> 异步通知对象或nullptr
+     */
+    /**
+     * Fetches the next batch of oplog that needs to be transferred and appends it to the given
+     * array builder. If it was not able to fetch anything, it will return a non-null notification
+     * that will get signalled when new batches comes in or when migration is over. If the boolean
+     * value from the notification returns true, then the migration has entered the critical
+     * section or aborted and there's no more new batches to fetch.
+     */
+    std::shared_ptr<Notification<bool>> fetchNextSessionMigrationBatch(
+        OperationContext* opCtx,
+        const MigrationSessionId& migrationSessionId,
+        BSONArrayBuilder* arrBuilder) {
+        // 操作时间戳：用于后续的写关注等待
+        // 如果获取到oplog数据，将包含最新操作的时间戳
+        // 用于确保在返回给调用方之前，数据已在大多数节点上持久化
+        boost::optional<repl::OpTime> opTime;
+        
+        // 新oplog通知对象：当没有可用数据时用于异步等待
+        // 如果当前没有可用的会话oplog数据，将返回此通知对象
+        // 调用方可以通过此对象等待新数据到达或迁移完成的信号
+        std::shared_ptr<Notification<bool>> newOplogNotification;
 
-    // 写冲突重试机制：处理并发写操作可能导致的冲突
-    // 在高并发环境下，多个操作可能同时访问oplog，导致读取冲突
-    // 此机制确保即使发生写冲突，也能重试并最终成功获取数据
-    writeConflictRetry(
-        opCtx,
-        "Fetching session related oplogs for migration",  // 操作描述，用于日志和调试
-        NamespaceString::kRsOplogNamespace,               // oplog集合命名空间
-        [&]() {
-            // 获取活跃克隆器：
-            // 参数false表示不需要持有集合锁，因为只是读取会话数据
-            // 这避免了在长时间运行的会话数据获取过程中持有不必要的锁
-            AutoGetActiveCloner autoCloner(opCtx, migrationSessionId, false);
+        // 写冲突重试机制：处理并发写操作可能导致的冲突
+        // 在高并发环境下，多个操作可能同时访问oplog，导致读取冲突
+        // 此机制确保即使发生写冲突，也能重试并最终成功获取数据
+        writeConflictRetry(
+            opCtx,
+            "Fetching session related oplogs for migration",  // 操作描述，用于日志和调试
+            NamespaceString::kRsOplogNamespace,               // oplog集合命名空间
+            [&]() {
+                // 获取活跃克隆器：
+                // 参数false表示不需要持有集合锁，因为只是读取会话数据
+                // 这避免了在长时间运行的会话数据获取过程中持有不必要的锁
+                AutoGetActiveCloner autoCloner(opCtx, migrationSessionId, false);
+                
+                // ★ 核心会话数据获取调用：
+                // 功能：从克隆器获取下一批需要迁移的会话相关oplog条目
+                // 参数1：操作上下文，提供事务和权限上下文
+                // 参数2：数组构建器指针，用于接收oplog数据
+                // 返回值：最新处理的oplog操作时间戳，用于后续写关注等待
+                // 重要性：这是实际获取会话oplog数据的关键调用点
+                opTime = autoCloner.getCloner()->nextSessionMigrationBatch(opCtx, arrBuilder);
+
+                // 检查是否获取到数据：
+                // 如果数组大小为0，说明当前没有可用的会话oplog数据
+                // 这种情况下需要获取通知对象，以便等待新数据的到达
+                if (arrBuilder->arrSize() == 0) {
+                    // 获取通知对象：用于等待新的会话迁移批次数据
+                    // 当有新数据可用或迁移状态改变时，此通知会被触发
+                    // 这实现了高效的异步等待机制，避免了忙等待
+                    newOplogNotification =
+                        autoCloner.getCloner()->getNotificationForNextSessionMigrationBatch();
+                }
+            });
+
+        // 如果有通知对象，说明当前没有数据，返回通知让调用方等待
+        // 调用方需要通过notification->get()方法等待信号
+        // 这种设计实现了非阻塞的数据获取机制
+        if (newOplogNotification) {
+            return newOplogNotification;
+        }
+
+        // If the batch returns something, we wait for write concern to ensure that all the entries
+        // in the batch have been majority committed. We then need to check that the rollback id
+        // hasn't changed since we started migration, because a change would indicate that some data
+        // in this batch may have been rolled back. In this case, we abort the migration.
+        // 如果批次返回了数据，我们需要等待写关注以确保批次中的所有条目都已在大多数节点上提交。
+        // 然后我们需要检查回滚ID自迁移开始以来是否发生变化，因为变化表明此批次中的某些数据可能已被回滚。
+        // 在这种情况下，我们会中止迁移。
+        if (opTime) {
+            // 写关注等待：确保oplog条目在大多数节点上持久化
+            // 这是数据一致性的关键保障，确保获取的oplog条目不会因为副本集状态变化而丢失
+            WriteConcernResult wcResult;
+            WriteConcernOptions majorityWC{WriteConcernOptions::kMajority,        // 大多数节点确认
+                                        WriteConcernOptions::SyncMode::UNSET,   // 使用默认同步模式
+                                        WriteConcernOptions::kNoTimeout};       // 无超时限制
             
-            // ★ 核心会话数据获取调用：
-            // 功能：从克隆器获取下一批需要迁移的会话相关oplog条目
-            // 参数1：操作上下文，提供事务和权限上下文
-            // 参数2：数组构建器指针，用于接收oplog数据
-            // 返回值：最新处理的oplog操作时间戳，用于后续写关注等待
-            // 重要性：这是实际获取会话oplog数据的关键调用点
-            opTime = autoCloner.getCloner()->nextSessionMigrationBatch(opCtx, arrBuilder);
+            // 等待指定操作时间的写关注完成
+            // 这确保了当前批次的oplog条目已经安全地复制到大多数副本节点
+            // 只有在此步骤完成后，才能安全地将数据传输给目标分片
+            uassertStatusOK(waitForWriteConcern(opCtx, opTime.value(), majorityWC, &wcResult));
 
-            // 检查是否获取到数据：
-            // 如果数组大小为0，说明当前没有可用的会话oplog数据
-            // 这种情况下需要获取通知对象，以便等待新数据的到达
-            if (arrBuilder->arrSize() == 0) {
-                // 获取通知对象：用于等待新的会话迁移批次数据
-                // 当有新数据可用或迁移状态改变时，此通知会被触发
-                // 这实现了高效的异步等待机制，避免了忙等待
-                newOplogNotification =
-                    autoCloner.getCloner()->getNotificationForNextSessionMigrationBatch();
-            }
-        });
+            // 获取迁移初始化时的回滚ID：用于检测是否发生了回滚
+            // 回滚ID是副本集的一个重要标识，当发生回滚时会发生变化
+            // 通过比较初始值和当前值，可以检测到数据回滚事件
+            auto rollbackIdAtMigrationInit = [&]() {
+                AutoGetActiveCloner autoCloner(opCtx, migrationSessionId, false);
+                return autoCloner.getCloner()->getRollbackIdAtInit();
+            }();
 
-    // 如果有通知对象，说明当前没有数据，返回通知让调用方等待
-    // 调用方需要通过notification->get()方法等待信号
-    // 这种设计实现了非阻塞的数据获取机制
-    if (newOplogNotification) {
-        return newOplogNotification;
+            // The check for rollback id must be done after having waited for majority in order to
+            // ensure that whatever was waited on didn't get rolled back.
+            // 回滚ID检查必须在等待大多数确认之后进行，以确保等待的内容没有被回滚。
+            
+            // 获取当前的回滚ID：与初始值进行比较
+            // 如果两者不同，说明在迁移过程中发生了回滚，必须中止迁移
+            auto rollbackId = repl::ReplicationProcess::get(opCtx)->getRollbackID();
+            
+            // 回滚检测：如果回滚ID发生变化，说明发生了回滚，必须中止迁移
+            // 这是关键的安全检查，防止已回滚的数据被错误地迁移到目标分片
+            // 回滚会导致oplog中的某些条目无效，如果不检测可能导致数据不一致
+            uassert(50881,
+                    str::stream() << "rollback detected, rollbackId was "
+                                << rollbackIdAtMigrationInit << " but is now " << rollbackId,
+                    rollbackId == rollbackIdAtMigrationInit);
+        }
+
+        // 返回nullptr表示成功获取了数据，不需要等待通知
+        // 调用方可以继续处理arrBuilder中的oplog数据
+        // 这种返回值设计清晰地区分了"有数据"和"需要等待"两种情况
+        return nullptr;
     }
-
-    // If the batch returns something, we wait for write concern to ensure that all the entries
-    // in the batch have been majority committed. We then need to check that the rollback id
-    // hasn't changed since we started migration, because a change would indicate that some data
-    // in this batch may have been rolled back. In this case, we abort the migration.
-    // 如果批次返回了数据，我们需要等待写关注以确保批次中的所有条目都已在大多数节点上提交。
-    // 然后我们需要检查回滚ID自迁移开始以来是否发生变化，因为变化表明此批次中的某些数据可能已被回滚。
-    // 在这种情况下，我们会中止迁移。
-    if (opTime) {
-        // 写关注等待：确保oplog条目在大多数节点上持久化
-        // 这是数据一致性的关键保障，确保获取的oplog条目不会因为副本集状态变化而丢失
-        WriteConcernResult wcResult;
-        WriteConcernOptions majorityWC{WriteConcernOptions::kMajority,        // 大多数节点确认
-                                       WriteConcernOptions::SyncMode::UNSET,   // 使用默认同步模式
-                                       WriteConcernOptions::kNoTimeout};       // 无超时限制
-        
-        // 等待指定操作时间的写关注完成
-        // 这确保了当前批次的oplog条目已经安全地复制到大多数副本节点
-        // 只有在此步骤完成后，才能安全地将数据传输给目标分片
-        uassertStatusOK(waitForWriteConcern(opCtx, opTime.value(), majorityWC, &wcResult));
-
-        // 获取迁移初始化时的回滚ID：用于检测是否发生了回滚
-        // 回滚ID是副本集的一个重要标识，当发生回滚时会发生变化
-        // 通过比较初始值和当前值，可以检测到数据回滚事件
-        auto rollbackIdAtMigrationInit = [&]() {
-            AutoGetActiveCloner autoCloner(opCtx, migrationSessionId, false);
-            return autoCloner.getCloner()->getRollbackIdAtInit();
-        }();
-
-        // The check for rollback id must be done after having waited for majority in order to
-        // ensure that whatever was waited on didn't get rolled back.
-        // 回滚ID检查必须在等待大多数确认之后进行，以确保等待的内容没有被回滚。
-        
-        // 获取当前的回滚ID：与初始值进行比较
-        // 如果两者不同，说明在迁移过程中发生了回滚，必须中止迁移
-        auto rollbackId = repl::ReplicationProcess::get(opCtx)->getRollbackID();
-        
-        // 回滚检测：如果回滚ID发生变化，说明发生了回滚，必须中止迁移
-        // 这是关键的安全检查，防止已回滚的数据被错误地迁移到目标分片
-        // 回滚会导致oplog中的某些条目无效，如果不检测可能导致数据不一致
-        uassert(50881,
-                str::stream() << "rollback detected, rollbackId was "
-                              << rollbackIdAtMigrationInit << " but is now " << rollbackId,
-                rollbackId == rollbackIdAtMigrationInit);
-    }
-
-    // 返回nullptr表示成功获取了数据，不需要等待通知
-    // 调用方可以继续处理arrBuilder中的oplog数据
-    // 这种返回值设计清晰地区分了"有数据"和"需要等待"两种情况
-    return nullptr;
-}
 
     /**
      * MigrateSessionCommand::run 函数的作用：
