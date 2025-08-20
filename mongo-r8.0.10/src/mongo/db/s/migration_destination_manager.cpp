@@ -526,49 +526,78 @@ bool MigrationDestinationManager::_isActive(WithLock) const {
     return _sessionId.has_value();
 }
 
+//RecvChunkStatusCommand::run
+/**
+ * MigrationDestinationManager::report
+ * 该函数用于将当前迁移接收端的迁移状态、进度和关键信息填充到 BSONObjBuilder b，
+ * 以响应外部（如源分片的 _recvChunkStatus 命令）对迁移状态的查询请求。
+ * 支持 waitForSteadyOrDone 参数：若为 true，则阻塞等待迁移状态进入稳定或完成阶段后再返回。
+ * 填充内容包括：是否活跃、会话ID、命名空间、源分片信息、chunk范围、分片键、迁移阶段、错误信息、克隆/同步统计等。
+ * 这是分片迁移监控和一致性校验的核心接口之一。
+ */
 void MigrationDestinationManager::report(BSONObjBuilder& b,
                                          OperationContext* opCtx,
                                          bool waitForSteadyOrDone) {
+    // 如果需要等待迁移进入稳定或完成状态，则阻塞等待
     if (waitForSteadyOrDone) {
         stdx::unique_lock<Latch> lock(_mutex);
         try {
+            // 等待条件变量，直到状态不再是 kReady/kClone/kCatchup
             opCtx->waitForConditionOrInterruptFor(_stateChangedCV, lock, Seconds(1), [&]() -> bool {
                 return _state != kReady && _state != kClone && _state != kCatchup;
             });
         } catch (...) {
-            // Ignoring this error because this is an optional parameter and we catch timeout
-            // exceptions later.
+            // 忽略异常（如超时），因为该参数为可选，后续会处理超时
         }
+        // 标记本次请求已等待
         b.append("waited", true);
     }
+    // 加锁保护，确保多线程安全
     stdx::lock_guard<Latch> sl(_mutex);
 
+    // 填充是否活跃标志
     b.appendBool("active", _sessionId.has_value());
 
+    // 如果有会话ID，填充会话ID
     if (_sessionId) {
         b.append("sessionId", _sessionId->toString());
     }
 
+    // 填充命名空间（如 db.collection）
     b.append("ns", NamespaceStringUtil::serialize(_nss, SerializationContext::stateDefault()));
+    // 填充源分片连接字符串
     b.append("from", _fromShardConnString.toString());
+    // 填充源分片ID
     b.append("fromShardId", _fromShard.toString());
+    // 填充 chunk 范围的最小值
     b.append("min", _min);
+    // 填充 chunk 范围的最大值
     b.append("max", _max);
+    // 填充分片键模式
     b.append("shardKeyPattern", _shardKeyPattern);
+    // 标记支持关键区域 catch-up
     b.append(StartChunkCloneRequest::kSupportsCriticalSectionDuringCatchUp, true);
 
+    // 填充当前迁移状态（如 cloning、catchup、steady、fail 等）
     b.append("state", stateToString(_state));
 
+    // 如果迁移失败，填充错误信息
     if (_state == kFail) {
         invariant(!_errmsg.empty());
         b.append("errmsg", _errmsg);
     }
 
+    // 统计信息子文档
     BSONObjBuilder bb(b.subobjStart("counts"));
+    // 已克隆文档数
     bb.append("cloned", _getNumCloned());
+    // 已克隆字节数
     bb.append("clonedBytes", _getNumBytesCloned());
+    // catchup 阶段应用数
     bb.append("catchup", _numCatchup);
+    // steady 阶段应用数
     bb.append("steady", _numSteady);
+    // 结束子文档
     bb.done();
 }
 
