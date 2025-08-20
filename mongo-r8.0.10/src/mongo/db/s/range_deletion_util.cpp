@@ -480,30 +480,57 @@ void deleteRangeDeletionTasksForRename(OperationContext* opCtx,
              << NamespaceStringUtil::serialize(toNss, SerializationContext::stateDefault())));
 }
 
-
+/**
+ * persistUpdatedNumOrphans 函数的作用：
+ * 持久化更新分片迁移或范围删除过程中某个chunk范围内孤儿文档数量的变化到本地config.rangeDeletions集合。
+ *
+ * 核心功能：
+ * 1. 原子性地将孤儿文档数量变化（changeInOrphans）累加到对应的RangeDeletionTask文档。
+ * 2. 保证在迁移/删除过程中孤儿计数的准确性，便于后续清理和统计。
+ * 3. 支持写冲突重试，确保高并发环境下的可靠性。
+ * 4. 通过BalancerStatsRegistry同步更新全局孤儿计数统计。
+ * 5. 兼容升级/降级场景，无孤儿计数字段时安全忽略。
+ *
+ * 使用场景：
+ * - chunk迁移增量应用时，目标分片插入/删除文档后更新孤儿计数。
+ * - 范围删除任务批量删除文档后，及时持久化孤儿计数变化。
+ * - 迁移和清理流程中，保证孤儿文档统计的持久一致性。
+ *
+ * 参数说明：
+ * @param opCtx 操作上下文，包含事务、锁等状态信息
+ * @param collectionUuid 目标集合的UUID
+ * @param range 迁移或删除的chunk范围
+ * @param changeInOrphans 本次操作导致的孤儿文档数量变化（正数为增加，负数为减少）
+ */
 void persistUpdatedNumOrphans(OperationContext* opCtx,
                               const UUID& collectionUuid,
                               const ChunkRange& range,
                               long long changeInOrphans) {
+    // 构造查询条件：定位目标集合和chunk范围对应的RangeDeletionTask文档
     const auto query = getQueryFilterForRangeDeletionTask(collectionUuid, range);
     try {
+        // 创建持久化任务存储实例，指向config.rangeDeletions集合
         PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionNamespace);
+
+        // 范围删除锁保护，确保并发安全
         ScopedRangeDeleterLock rangeDeleterLock(opCtx, LockMode::MODE_IX);
-        // The DBDirectClient will not retry WriteConflictExceptions internally while holding an X
-        // mode lock, so we need to retry at this level.
+
+        // 写冲突重试：在高并发环境下保证原子性和可靠性
         writeConflictRetry(
             opCtx, "updateOrphanCount", NamespaceString::kRangeDeletionNamespace, [&] {
+                // 原子更新：将changeInOrphans累加到numOrphanDocs字段
                 store.update(opCtx,
                              query,
                              BSON("$inc" << BSON(RangeDeletionTask::kNumOrphanDocsFieldName
                                                  << changeInOrphans)),
                              WriteConcerns::kLocalWriteConcern);
             });
+
+        // 同步更新全局孤儿计数统计（用于监控和均衡器决策）
         BalancerStatsRegistry::get(opCtx)->updateOrphansCount(collectionUuid, changeInOrphans);
     } catch (const ExceptionFor<ErrorCodes::NoMatchingDocument>&) {
-        // When upgrading or downgrading, there may be no documents with the orphan count field.
+        // 兼容升级/降级场景：无孤儿计数字段时安全忽略，不影响主流程
     }
-}
 
 void removePersistentRangeDeletionTask(OperationContext* opCtx,
                                        const UUID& collectionUuid,
