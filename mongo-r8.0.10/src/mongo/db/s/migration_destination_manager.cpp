@@ -2410,6 +2410,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx,
     }
 }
 
+
 /**
  * MigrationDestinationManager::_applyMigrateOp 函数的作用：
  * 负责在目标分片应用从源分片迁移过来的增量数据（包括删除和插入/更新），确保迁移chunk范围内的数据一致性。

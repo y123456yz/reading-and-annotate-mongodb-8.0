@@ -295,6 +295,10 @@ public:
 };
 MONGO_REGISTER_COMMAND(RecvChunkStartCommand).forShard();
 
+/*
+ * 源分片： MigrationChunkClonerSource::_callRecipient 发送 recvChunkStatus 请求
+ * 目标分片: RecvChunkStatusCommand::run 接收 recvChunkStatus 请求处理
+ */
 class RecvChunkStatusCommand : public BasicCommand {
 public:
     RecvChunkStatusCommand() : BasicCommand("_recvChunkStatus") {}
@@ -332,14 +336,28 @@ public:
         return Status::OK();
     }
 
-    bool run(OperationContext* opCtx,
-             const DatabaseName&,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) override {
-        bool waitForSteadyOrDone = cmdObj["waitForSteadyOrDone"].boolean();
-        MigrationDestinationManager::get(opCtx)->report(result, opCtx, waitForSteadyOrDone);
-        return true;
-    }
+/**
+ * RecvChunkStatusCommand::run
+ * 该方法用于处理分片迁移过程中的 _recvChunkStatus 命令请求。
+ * 当源分片需要获知目标分片（接收端）当前迁移状态时，会调用此命令。
+ * 该接口会解析请求参数，判断是否需要等待目标分片进入稳定或完成状态，
+ * 并调用 MigrationDestinationManager::report 方法，将迁移状态、进度等信息写入响应。
+ * 这是分片迁移一致性校验和流程推进的关键环节。
+ */
+bool run(OperationContext* opCtx,
+         const DatabaseName&,
+         const BSONObj& cmdObj,
+         BSONObjBuilder& result) override {
+    // 解析请求参数 waitForSteadyOrDone，决定是否阻塞直到迁移进入稳定或完成状态
+    bool waitForSteadyOrDone = cmdObj["waitForSteadyOrDone"].boolean();
+
+    // 调用迁移管理器的 report 方法，收集当前迁移状态和进度信息
+    // result 中会包含如 state、lastOpApplied、进度统计等字段
+    MigrationDestinationManager::get(opCtx)->report(result, opCtx, waitForSteadyOrDone);
+
+    // 命令执行成功，返回 true
+    return true;
+}
 };
 MONGO_REGISTER_COMMAND(RecvChunkStatusCommand).forShard();
 

@@ -1543,6 +1543,8 @@ void MigrationChunkClonerSource::_cleanup(bool wasSuccessful) {
  * - 回调安全：确保本地变量的有效性
  * 
  * 该函数是迁移过程中所有分片间通信的统一入口点，确保网络通信的可靠性和一致性。
+ * 源分片： MigrationChunkClonerSource::_callRecipient 发送 recvChunkStatus 请求
+ * 目标分片: RecvChunkStatusCommand::run 接收 recvChunkStatus 请求处理
  */
 StatusWith<BSONObj> MigrationChunkClonerSource::_callRecipient(OperationContext* opCtx,
                                                                const BSONObj& cmdObj) {

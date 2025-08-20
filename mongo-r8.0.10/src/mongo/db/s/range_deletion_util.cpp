@@ -481,6 +481,22 @@ void deleteRangeDeletionTasksForRename(OperationContext* opCtx,
 }
 
 /**
+        // config.rangeDeletions 集合
+        // 
+        // 插入的文档结构大致如下：
+        // {
+        //   "_id": <migrationId>,                    // 唯一标识符，通常是迁移UUID
+        //   "nss": "<database>.<collection>",        // 目标集合的命名空间
+        //   "collectionUuid": <UUID>,               // 集合的唯一标识符
+        //   "range": {                              // 要删除的文档范围
+        //     "min": <BSONObj>,                     // 范围最小值（包含）
+        //     "max": <BSONObj>                      // 范围最大值（不包含）
+        //   },
+        //   "whenToClean": "now"|"delayed",         // 清理时机策略
+        //   "pending": true,                        // 是否处于等待状态
+        //   "processing": false,                    // 是否正在处理中
+        //   "numOrphanDocs": <long>                 // 孤立文档数量估计
+        // }
  * persistUpdatedNumOrphans 函数的作用：
  * 持久化更新分片迁移或范围删除过程中某个chunk范围内孤儿文档数量的变化到本地config.rangeDeletions集合。
  *
@@ -501,6 +517,7 @@ void deleteRangeDeletionTasksForRename(OperationContext* opCtx,
  * @param collectionUuid 目标集合的UUID
  * @param range 迁移或删除的chunk范围
  * @param changeInOrphans 本次操作导致的孤儿文档数量变化（正数为增加，负数为减少）
+ * 更新 config.rangeDeletions 表中的 numOrphanDocs 字段。
  */
 void persistUpdatedNumOrphans(OperationContext* opCtx,
                               const UUID& collectionUuid,
@@ -509,7 +526,7 @@ void persistUpdatedNumOrphans(OperationContext* opCtx,
     // 构造查询条件：定位目标集合和chunk范围对应的RangeDeletionTask文档
     const auto query = getQueryFilterForRangeDeletionTask(collectionUuid, range);
     try {
-        // 创建持久化任务存储实例，指向config.rangeDeletions集合
+        // 创建持久化任务存储实例，指向 config.rangeDeletions 集合
         PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionNamespace);
 
         // 范围删除锁保护，确保并发安全
