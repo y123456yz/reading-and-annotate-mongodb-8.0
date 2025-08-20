@@ -139,15 +139,24 @@ bool isDocInRange(const BSONObj& obj,
     return isShardKeyValueInRange(shardKeyPattern.extractShardKeyFromDoc(obj), min, max);
 }
 
+/**
+ * createRequestWithSessionId
+ * 该函数用于构造分片迁移相关命令的 BSON 请求对象，包含命令名、命名空间、迁移会话ID和是否等待稳态参数。
+ * 主要用于源分片与目标分片进行迁移状态查询等 RPC 通信时，确保请求中包含唯一标识本次迁移的关键信息。
+ */
 BSONObj createRequestWithSessionId(StringData commandName,
                                    const NamespaceString& nss,
                                    const MigrationSessionId& sessionId,
                                    bool waitForSteadyOrDone = false) {
     BSONObjBuilder builder;
+    // 命令名字段，值为序列化后的命名空间字符串（如 "db.collection"）
     builder.append(commandName,
                    NamespaceStringUtil::serialize(nss, SerializationContext::stateDefault()));
+    // 是否等待目标分片进入稳定或完成状态
     builder.append("waitForSteadyOrDone", waitForSteadyOrDone);
+    // 追加迁移会话ID相关字段
     sessionId.append(&builder);
+    // 返回最终构造的 BSON 请求对象
     return builder.obj();
 }
 
@@ -1544,7 +1553,7 @@ void MigrationChunkClonerSource::_cleanup(bool wasSuccessful) {
  * 
  * 该函数是迁移过程中所有分片间通信的统一入口点，确保网络通信的可靠性和一致性。
  * 源分片： MigrationChunkClonerSource::_callRecipient 发送 recvChunkStatus 请求
- * 目标分片: RecvChunkStatusCommand::run 接收 recvChunkStatus 请求处理
+ * 目标分片: RecvChunkStatusCommand::run->MigrationDestinationManager::report 接收 recvChunkStatus 请求处理
  */
 StatusWith<BSONObj> MigrationChunkClonerSource::_callRecipient(OperationContext* opCtx,
                                                                const BSONObj& cmdObj) {

@@ -335,9 +335,12 @@ public:
 
         return Status::OK();
     }
-
+/*
+ * 源分片： MigrationChunkClonerSource::_callRecipient 发送 recvChunkStatus 请求
+ * 目标分片: RecvChunkStatusCommand::run->MigrationDestinationManager::report 接收 recvChunkStatus 请求处理
+*/
 /**
- * RecvChunkStatusCommand::run
+ * RecvChunkStatusCommand::run->MigrationDestinationManager::report
  * 该方法用于处理分片迁移过程中的 _recvChunkStatus 命令请求。
  * 当源分片需要获知目标分片（接收端）当前迁移状态时，会调用此命令。
  * 该接口会解析请求参数，判断是否需要等待目标分片进入稳定或完成状态，
