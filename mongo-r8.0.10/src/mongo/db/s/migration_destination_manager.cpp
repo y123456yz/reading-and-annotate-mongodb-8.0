@@ -821,72 +821,196 @@ Status MigrationDestinationManager::restoreRecoveredMigrationState(
     return Status::OK();
 }
 
+/**
+ * fetchAndApplyBatch 函数的作用：
+ * chunk迁移过程中的生产者-消费者模式批次数据处理核心函数，负责并行获取和应用增量修改数据。
+ * 
+ * 核心功能：
+ * 1. 双线程协作模式：创建独立的应用线程，实现数据获取和应用的并行处理
+ * 2. 队列缓冲机制：使用单生产者单消费者队列在获取线程和应用线程间传递数据
+ * 3. 异常传播处理：确保应用线程的异常能够正确传播到主线程
+ * 4. 资源生命周期管理：通过RAII模式确保线程和队列资源的正确清理
+ * 5. 操作时间跟踪：返回最后应用操作的OpTime用于复制状态监控
+ * 6. 文档验证绕过：在应用过程中禁用文档验证以提高性能
+ * 
+ * 使用场景：
+ * - 在迁移的增量同步阶段(catch-up)批量处理_transferMods返回的增量数据
+ * - 支持大量增量修改的高效并行处理，避免单线程顺序处理的性能瓶颈
+ * - 确保获取和应用操作的流水线化，最大化网络和存储的利用率
+ * 
+ * 线程模型：
+ * - 主线程(生产者)：调用fetchBatchFn从源分片获取数据并推入队列
+ * - 应用线程(消费者)：从队列获取数据并调用applyBatchFn应用到本地
+ * - 队列容量：深度为1，确保内存使用可控且提供适度的缓冲
+ * 
+ * 错误处理策略：
+ * - 应用线程异常通过killOp机制传播到主线程
+ * - 队列关闭时的异常处理确保优雅退出
+ * - 线程同步保证资源的正确清理和状态同步
+ * 
+ * 性能优化：
+ * - 文档验证禁用：跳过架构和内部验证以提高写入性能
+ * - 流水线处理：获取下一批数据的同时应用当前批数据
+ * - 内存控制：限制队列深度避免内存使用过多
+ * 
+ * 同步机制：
+ * - ScopeGuard确保资源清理的异常安全性
+ * - 队列的生产者/消费者端正确关闭确保线程间通信终止
+ * - OpTime返回机制支持上层的复制状态等待
+ * 
+ * 该函数是MongoDB分片迁移增量数据处理的核心性能优化组件，通过并行化提升迁移效率。
+ * 
+ * 参数说明：
+ * @param opCtx 主线程的操作上下文，用于权限验证和中断检查
+ * @param applyBatchFn 批次应用函数，定义如何将接收到的数据应用到本地集合
+ * @param fetchBatchFn 批次获取函数，定义如何从源分片获取下一批数据
+ * 
+ * 返回值：
+ * @return repl::OpTime 最后应用操作的OpTime，用于复制状态监控和写关注等待
+ */
 repl::OpTime MigrationDestinationManager::fetchAndApplyBatch(
     OperationContext* opCtx,
+    // applyModsFn
     std::function<bool(OperationContext*, BSONObj)> applyBatchFn,
+    // fetchBatchFn
     std::function<bool(OperationContext*, BSONObj*)> fetchBatchFn) {
 
+    // 队列配置选项：设置单生产者单消费者队列的参数
+    // maxQueueDepth = 1：限制队列深度为1，避免内存使用过多
+    // 这样的设计平衡了内存使用和流水线效率
     SingleProducerSingleConsumerQueue<BSONObj>::Options options;
     options.maxQueueDepth = 1;
 
+    // 创建批次传递队列：在获取线程和应用线程间传递BSON数据
+    // 类型：SingleProducerSingleConsumerQueue<BSONObj> 
+    // 目的：实现线程间的异步数据传递和缓冲
     SingleProducerSingleConsumerQueue<BSONObj> batches(options);
+    
+    // 最后应用操作时间：用于跟踪复制状态和写关注等待
+    // 将在应用线程中更新，在主线程中返回
     repl::OpTime lastOpApplied;
 
+    // 应用线程创建：独立线程执行批次数据的应用操作
+    // 线程名称："batchApplier" 便于调试和监控
+    // 服务类型：使用主线程相同的服务实例
+    // 会话类型：无会话模式，避免会话冲突
     stdx::thread applicationThread{[&] {
+        // 初始化应用线程：设置线程名称和客户端上下文
+        // 目的：为应用操作创建独立的执行环境
         Client::initThread("batchApplier", opCtx->getService(), Client::noSession());
+        
+        // 获取执行器：用于创建可取消的操作上下文
+        // 固定执行器确保应用操作的稳定执行
         auto executor =
             Grid::get(opCtx->getServiceContext())->getExecutorPool()->getFixedExecutor();
+        
+        // 创建可取消操作上下文：继承主线程的取消令牌
+        // 目的：支持应用操作的中断和取消机制
+        // 组件：基于当前客户端的操作上下文 + 主线程的取消令牌 + 固定执行器
         auto applicationOpCtx = CancelableOperationContext(
             cc().makeOperationContext(), opCtx->getCancellationToken(), executor);
 
+        // 消费者清理守护：确保队列消费者端正确关闭和OpTime记录
+        // ScopeGuard确保即使在异常情况下也能执行清理操作
         ScopeGuard consumerGuard([&] {
+            // 关闭队列消费者端：通知生产者不再有消费者
+            // 这将导致生产者的push操作抛出异常并优雅退出
             batches.closeConsumerEnd();
+            
+            // 记录最后应用的操作时间：从应用线程的客户端获取最后操作时间
+            // 目的：为主线程返回准确的复制状态信息
             lastOpApplied =
                 repl::ReplClientInfo::forClient(applicationOpCtx->getClient()).getLastOp();
         });
 
         try {
+            // 应用循环：持续处理队列中的批次数据直到完成或异常
             while (true) {
+                // 文档验证禁用：提高批量写入性能
+                // kDisableSchemaValidation：禁用架构验证
+                // kDisableInternalValidation：禁用内部验证
+                // 原因：迁移数据已在源分片验证过，跳过验证可显著提高性能
                 DisableDocumentValidation documentValidationDisabler(
                     applicationOpCtx.get(),
                     DocumentValidationSettings::kDisableSchemaValidation |
                         DocumentValidationSettings::kDisableInternalValidation);
+                
+                // 从队列获取下一批数据：阻塞等待直到有数据或队列关闭
+                // 可能抛出异常：队列关闭时抛出ProducerConsumerQueueEndClosed异常
                 auto nextBatch = batches.pop(applicationOpCtx.get());
+                
+                // 应用批次数据：调用提供的应用函数处理数据
+                // 返回值：false表示应该停止处理，true表示继续
                 if (!applyBatchFn(applicationOpCtx.get(), nextBatch)) {
-                    return;
+                    return;  // 应用函数指示停止处理，正常退出
                 }
             }
         } catch (...) {
-            ClientLock lk(opCtx->getClient());
-            opCtx->getServiceContext()->killOperation(lk, opCtx, ErrorCodes::Error(51008));
+            // 异常处理：将应用线程的异常传播到主线程
+            // 机制：通过killOp中断主线程的操作
+            // 错误码：51008 表示批次应用失败
+            {
+                ClientLock lk(opCtx->getClient());  // 获取主线程客户端锁
+                // 中断主线程操作：使主线程抛出相应异常
+                opCtx->getServiceContext()->killOperation(lk, opCtx, ErrorCodes::Error(51008));
+            }
+            
+            // 记录应用失败日志：便于问题诊断和监控
             LOGV2(21999, "Batch application failed", "error"_attr = redact(exceptionToStatus()));
         }
     }};
 
-
+    // 主线程数据获取逻辑：生产者模式获取数据并推入队列
     {
+        // 应用线程等待守护：确保主线程退出前应用线程正确结束
+        // ScopeGuard确保队列正确关闭和线程正确join，避免资源泄漏
         ScopeGuard applicationThreadJoinGuard([&] {
+            // 关闭队列生产者端：通知消费者不再有数据产生
+            // 这将导致消费者的pop操作返回或抛出异常
             batches.closeProducerEnd();
+            
+            // 等待应用线程结束：确保所有数据处理完成
+            // join()是阻塞操作，等待应用线程完全退出
             applicationThread.join();
         });
 
+        // 数据获取循环：持续从源分片获取批次数据直到完成
         while (true) {
+            // 获取下一批数据：调用提供的获取函数
+            // nextBatch：输出参数，存储获取到的批次数据
             BSONObj nextBatch;
+            
+            // 调用获取函数：从源分片获取下一批增量数据
+            // 返回值：true表示这是空批次（没有更多数据），false表示还有数据
             bool emptyBatch = fetchBatchFn(opCtx, &nextBatch);
+            
             try {
+                // 将数据推入队列：传递给应用线程处理
+                // getOwned()：创建BSON对象的独立副本，避免共享内存问题
+                // opCtx：提供中断检查和超时控制
                 batches.push(nextBatch.getOwned(), opCtx);
+                
+                // 检查是否完成：如果是空批次，表示没有更多数据
                 if (emptyBatch) {
-                    break;
+                    break;  // 正常完成，退出获取循环
                 }
             } catch (const ExceptionFor<ErrorCodes::ProducerConsumerQueueEndClosed>&) {
-                break;
+                // 队列关闭异常处理：消费者端已关闭，停止生产
+                // 这通常发生在应用线程异常退出或正常完成时
+                break;  // 优雅退出获取循环
             }
         }
     }  // This scope ensures that the guard is destroyed
+       // 作用域结束：确保守护对象被销毁，触发队列关闭和线程join
 
-    // This check is necessary because the consumer thread uses killOp to propagate errors to the
-    // producer thread (this thread)
+    // 中断检查：确保主线程没有被应用线程的异常中断
+    // 如果应用线程发生异常，会通过killOp中断主线程
+    // 这里的检查会抛出相应的异常，确保错误正确传播
     opCtx->checkForInterrupt();
+    
+    // 返回最后应用的操作时间：
+    // 用于上层调用者等待复制完成和写关注确认
+    // 时间来源：应用线程中记录的最后操作时间
     return lastOpApplied;
 }
 
@@ -2286,16 +2410,40 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx,
     }
 }
 
+/**
+ * MigrationDestinationManager::_applyMigrateOp 函数的作用：
+ * 负责在目标分片应用从源分片迁移过来的增量数据（包括删除和插入/更新），确保迁移chunk范围内的数据一致性。
+ *
+ * 核心功能：
+ * 1. 批量处理迁移增量数据：遍历并应用deleted和reload数组中的所有操作。
+ * 2. 范围校验：只对属于迁移chunk范围的数据进行操作，防止越界或误删。
+ * 3. 幂等性保证：删除和upsert操作均为幂等，支持重试和断点续传。
+ * 4. 冲突检测：upsert前检查本地是否有冲突_id，若有则中止迁移，防止数据覆盖。
+ * 5. 孤儿计数维护：根据实际插入/删除情况更新孤儿文档计数，便于后续清理。
+ * 6. 统计更新：记录本批次处理的文档数，用于迁移进度和性能监控。
+ *
+ * 使用场景：
+ * - 在迁移catch-up和steady阶段，批量应用_transferMods命令返回的增量数据。
+ * - 目标分片通过fetchAndApplyBatch驱动本函数，确保数据最终一致。
+ *
+ * 参数说明：
+ * @param opCtx 操作上下文，提供写锁和事务环境
+ * @param xfer 源分片返回的增量数据BSON对象，包含deleted和reload数组
+ *
+ * 返回值：
+ * @return bool 是否实际应用了任何迁移操作（用于流程控制）
+ */
 bool MigrationDestinationManager::_applyMigrateOp(OperationContext* opCtx, const BSONObj& xfer) {
-    bool didAnything = false;
-    long long changeInOrphans = 0;
-    long long totalDocs = 0;
+    bool didAnything = false;      // 标记是否有实际操作
+    long long changeInOrphans = 0; // 孤儿计数变化
+    long long totalDocs = 0;       // 本批次处理的文档总数
 
     // Deleted documents
     if (xfer["deleted"].isABSONObj()) {
         BSONObjIterator i(xfer["deleted"].Obj());
         while (i.more()) {
             totalDocs++;
+            // 获取集合写锁，确保写操作安全
             const auto collection = acquireCollection(
                 opCtx,
                 CollectionAcquisitionRequest(_nss,
@@ -2311,6 +2459,7 @@ bool MigrationDestinationManager::_applyMigrateOp(OperationContext* opCtx, const
             BSONObj id = i.next().Obj();
 
             // Do not apply delete if doc does not belong to the chunk being migrated
+            // 范围校验：只删除属于迁移chunk的数据
             BSONObj fullObj;
             if (Helpers::findById(opCtx, _nss, id, fullObj)) {
                 if (!isInRange(fullObj, _min, _max, _shardKeyPattern)) {
@@ -2321,6 +2470,7 @@ bool MigrationDestinationManager::_applyMigrateOp(OperationContext* opCtx, const
                 }
             }
 
+            // 写冲突重试：保证写操作的幂等性和安全性
             writeConflictRetry(opCtx, "transferModsDeletes", _nss, [&] {
                 deleteObjects(opCtx,
                               collection,
@@ -2330,7 +2480,7 @@ bool MigrationDestinationManager::_applyMigrateOp(OperationContext* opCtx, const
                               true /* fromMigrate */);
             });
 
-            changeInOrphans--;
+            changeInOrphans--; // 每删除一个文档，孤儿计数减一
             didAnything = true;
         }
     }
@@ -2355,6 +2505,7 @@ bool MigrationDestinationManager::_applyMigrateOp(OperationContext* opCtx, const
             BSONObj updatedDoc = i.next().Obj();
 
             // do not apply insert/update if doc does not belong to the chunk being migrated
+            // 范围校验：只插入/更新属于迁移chunk的数据
             if (!isInRange(updatedDoc, _min, _max, _shardKeyPattern)) {
                 if (MONGO_unlikely(failMigrationReceivedOutOfRangeOperation.shouldFail())) {
                     MONGO_UNREACHABLE;
@@ -2362,6 +2513,7 @@ bool MigrationDestinationManager::_applyMigrateOp(OperationContext* opCtx, const
                 continue;
             }
 
+            // 冲突检测：本地是否有同_id但不在chunk范围的文档
             BSONObj localDoc;
             if (willOverrideLocalId(
                     opCtx, _nss, _min, _max, _shardKeyPattern, updatedDoc, &localDoc)) {
@@ -2377,10 +2529,11 @@ bool MigrationDestinationManager::_applyMigrateOp(OperationContext* opCtx, const
             }
 
             // We are in write lock here, so sure we aren't killing
+            // 写冲突重试：upsert操作，插入或更新文档，保证幂等性
             writeConflictRetry(opCtx, "transferModsUpdates", _nss, [&] {
                 auto res = Helpers::upsert(opCtx, collection, updatedDoc, true);
                 if (!res.upsertedId.isEmpty()) {
-                    changeInOrphans++;
+                    changeInOrphans++; // 新插入文档，孤儿计数加一
                 }
             });
 
@@ -2388,11 +2541,13 @@ bool MigrationDestinationManager::_applyMigrateOp(OperationContext* opCtx, const
         }
     }
 
+    // 更新孤儿计数到持久化任务
     if (changeInOrphans != 0) {
         rangedeletionutil::persistUpdatedNumOrphans(
             opCtx, *_collectionUuid, ChunkRange(_min, _max), changeInOrphans);
     }
 
+    // 统计本批次处理的文档数
     ShardingStatistics::get(opCtx).countDocsClonedOnCatchUpOnRecipient.addAndFetch(totalDocs);
 
     return didAnything;
