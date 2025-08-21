@@ -595,6 +595,8 @@ Status MigrationChunkClonerSource::awaitUntilCriticalSectionIsAppropriate(
  * MigrationChunkClonerSource::commitClone
  * 该函数用于在分片迁移流程的克隆阶段结束时，向目标分片发送 commit 命令，通知其完成数据克隆。
  * 主要流程包括：状态校验、巨型块特殊处理、会话数据处理、RPC发送 commit 命令、根据响应结果清理本地状态或报错。
+ * 源分片： MigrationChunkClonerSource::commitClone 发送  _recvChunkCommit 命令
+ * 目标分片:  RecvChunkCommitCommand::run 接收 _recvChunkCommit 命令
  */
 StatusWith<BSONObj> MigrationChunkClonerSource::commitClone(OperationContext* opCtx) {
     invariant(_state == kCloning); // 确保当前处于克隆阶段

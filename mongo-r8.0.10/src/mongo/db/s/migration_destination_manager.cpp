@@ -1074,19 +1074,29 @@ void MigrationDestinationManager::abortWithoutSessionIdCheck() {
     _errmsg = "aborted without session id check";
 }
 
+/**
+ * MigrationDestinationManager::startCommit
+ * 该函数用于在分片迁移流程中，目标分片收到源分片的提交信号后，正式进入关键区域（critical section）。
+ * 主要职责包括：等待 catchup 阶段完成，校验迁移状态和会话，切换迁移状态为提交开始，阻塞迁移范围的写操作，
+ * 持久化关键区域信号，唤醒等待线程，等待最终进入关键区域，并处理超时或失败情况。
+ * 这是迁移流程中保证数据一致性和安全切换所有权的关键步骤。
+ */
 Status MigrationDestinationManager::startCommit(const MigrationSessionId& sessionId) {
+    // 加锁保护迁移状态，确保线程安全
     stdx::unique_lock<Latch> lock(_mutex);
 
+    // 计算 catchup 阶段的超时时间
     const auto convergenceTimeout = Milliseconds(defaultConfigCommandTimeoutMS.load()) +
         Milliseconds(defaultConfigCommandTimeoutMS.load()) / 4;
 
-    // The donor may have started the commit while the recipient is still busy processing
-    // the last batch of mods sent in the catch up phase. Allow some time for synching up.
+    // 允许目标分片在 catchup 阶段有时间处理最后一批增量数据
     auto deadline = Date_t::now() + convergenceTimeout;
 
+    // 如果当前处于 catchup 阶段，则等待其完成或超时
     while (_state == kCatchup) {
         if (stdx::cv_status::timeout ==
             _stateChangedCV.wait_until(lock, deadline.toSystemTimePoint())) {
+            // 如果超时未完成 catchup，则返回错误
             return {ErrorCodes::CommandFailed,
                     str::stream() << "startCommit timed out waiting for the catch up completion. "
                                   << "Sender's session is " << sessionId.toString()
@@ -1095,6 +1105,7 @@ Status MigrationDestinationManager::startCommit(const MigrationSessionId& sessio
         }
     }
 
+    // 如果当前状态不是 STEADY，则不允许进入关键区域，返回错误
     if (_state != kSteady) {
         return {ErrorCodes::CommandFailed,
                 str::stream() << "Migration startCommit attempted when not in STEADY state."
@@ -1103,12 +1114,11 @@ Status MigrationDestinationManager::startCommit(const MigrationSessionId& sessio
                                              : ". No active session on this shard.")};
     }
 
-    // In STEADY state we must have active migration
+    // 在 STEADY 状态下必须有活跃的迁移会话
     invariant(_sessionId);
 
-    // This check guards against the (unusual) situation where the current donor shard has stalled,
-    // during which the recipient shard crashed or timed out, and then began serving as a recipient
-    // or donor for another migration.
+    // 检查 sessionId 是否匹配，防止处理过期的 commit 请求
+    // 这种情况可能发生在 donor 卡住、recipient 重启后参与其他迁移
     if (!_sessionId->matches(sessionId)) {
         return {ErrorCodes::CommandFailed,
                 str::stream() << "startCommit received commit request from a stale session "
@@ -1116,29 +1126,38 @@ Status MigrationDestinationManager::startCommit(const MigrationSessionId& sessio
                               << _sessionId->toString()};
     }
 
+    // 通知 session 迁移流程完成
     _sessionMigration->finish();
+
+    // 切换迁移状态为提交开始
     _state = kCommitStart;
+
+    // 唤醒所有等待迁移状态变更的线程
     _stateChangedCV.notify_all();
 
-    // Assigning a timeout slightly higher than the one used for network requests to the config
-    // server. Enough time to retry at least once in case of network failures (SERVER-51397).
+    // 重新分配一个超时时间，略高于网络请求超时，便于网络故障时重试
+    // SERVER-51397: 这样可以保证在网络故障时有足够时间重试
     deadline = Date_t::now() + convergenceTimeout;
 
+    // 等待迁移状态从 kCommitStart 变为 kEnteredCritSec，期间可能有数据传输或关键区切换
     while (_state == kCommitStart) {
         if (stdx::cv_status::timeout ==
             _stateChangedCV.wait_until(lock, deadline.toSystemTimePoint())) {
+            // 如果超时未进入关键区域，则设置错误信息、切换到失败状态，并唤醒所有等待线程
             _errmsg = str::stream() << "startCommit timed out waiting, " << _sessionId->toString();
             _state = kFail;
             _stateChangedCV.notify_all();
             return {ErrorCodes::CommandFailed, _errmsg};
         }
     }
+
+    // 如果最终状态不是 kEnteredCritSec，说明迁移未能成功进入关键区域，返回错误
     if (_state != kEnteredCritSec) {
         return {ErrorCodes::CommandFailed,
-                "startCommit failed, final data failed to transfer or failed to enter critical "
-                "section"};
+                "startCommit failed, final data failed to transfer or failed to enter critical section"};
     }
 
+    // 返回成功状态
     return Status::OK();
 }
 
