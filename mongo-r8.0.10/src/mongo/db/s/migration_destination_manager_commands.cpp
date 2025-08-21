@@ -402,6 +402,8 @@ public:
         return Status::OK();
     }
 
+    //* 源分片： MigrationChunkClonerSource::commitClone 发送  _recvChunkCommit 命令
+    //* 目标分片:  RecvChunkCommitCommand::run -》MigrationDestinationManager::startCommit 接收 _recvChunkCommit 命令
     // RecvChunkCommitCommand::run 
     bool run(OperationContext* opCtx,
              const DatabaseName& dbName,

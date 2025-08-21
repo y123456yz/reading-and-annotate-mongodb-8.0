@@ -1080,6 +1080,8 @@ void MigrationDestinationManager::abortWithoutSessionIdCheck() {
  * 主要职责包括：等待 catchup 阶段完成，校验迁移状态和会话，切换迁移状态为提交开始，阻塞迁移范围的写操作，
  * 持久化关键区域信号，唤醒等待线程，等待最终进入关键区域，并处理超时或失败情况。
  * 这是迁移流程中保证数据一致性和安全切换所有权的关键步骤。
+//* 源分片： MigrationChunkClonerSource::commitClone 发送  _recvChunkCommit 命令
+//* 目标分片:  RecvChunkCommitCommand::run -》MigrationDestinationManager::startCommit 接收 _recvChunkCommit 命令 
  */
 Status MigrationDestinationManager::startCommit(const MigrationSessionId& sessionId) {
     // 加锁保护迁移状态，确保线程安全

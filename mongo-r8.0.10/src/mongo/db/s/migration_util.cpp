@@ -756,15 +756,26 @@ ExecutorFuture<void> launchReleaseCriticalSectionOnRecipientFuture(
     });
 }
 
+/**
+ * persistMigrationRecipientRecoveryDocument
+ * 该函数用于在分片迁移流程中，目标分片进入关键区域时持久化迁移接收端恢复文档。
+ * 主要作用是：在发生主节点故障转移（failover）时，新主节点能够根据该文档恢复迁移状态，
+ * 重新进入关键区域并继续完成迁移，保证迁移过程的高可用性和故障恢复能力。
+ * 文档会被存储在 config.migrationRecipients 集合中，使用多数派写关注确保持久性。
+ */
 void persistMigrationRecipientRecoveryDocument(
     OperationContext* opCtx, const MigrationRecipientRecoveryDocument& migrationRecipientDoc) {
+    // 创建持久化任务存储对象，用于操作 config.migrationRecipients 集合
     PersistentTaskStore<MigrationRecipientRecoveryDocument> store(
         NamespaceString::kMigrationRecipientsNamespace);
     try {
+        // 将迁移接收端恢复文档添加到集合中
+        // 使用多数派写关注确保文档在主节点切换时不会丢失
         store.add(
             opCtx, migrationRecipientDoc, WriteConcerns::kMajorityWriteConcernShardingTimeout);
     } catch (const ExceptionFor<ErrorCodes::DuplicateKey>&) {
         // Convert a DuplicateKey error to an anonymous error.
+        // 如果出现重复键错误（相同迁移ID已存在），转换为更明确的错误信息
         uasserted(6064502,
                   str::stream()
                       << "While attempting to write migration recipient information for migration "
