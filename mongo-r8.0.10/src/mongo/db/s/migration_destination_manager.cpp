@@ -1079,7 +1079,7 @@ void MigrationDestinationManager::abortWithoutSessionIdCheck() {
  * 该函数用于在分片迁移流程中，目标分片收到源分片的提交信号后，正式进入关键区域（critical section）。
  * 主要职责包括：等待 catchup 阶段完成，校验迁移状态和会话，切换迁移状态为提交开始，阻塞迁移范围的写操作，
  * 持久化关键区域信号，唤醒等待线程，等待最终进入关键区域，并处理超时或失败情况。
- * 这是迁移流程中保证数据一致性和安全切换所有权的关键步骤。
+ * 这是迁移流程中保证数据一致性和安全切换所有权的关键步骤。 
 //* 源分片： MigrationChunkClonerSource::commitClone 发送  _recvChunkCommit 命令
 //* 目标分片:  RecvChunkCommitCommand::run -》MigrationDestinationManager::startCommit 接收 _recvChunkCommit 命令 
  */
@@ -2393,6 +2393,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx,
             stdx::lock_guard<Latch> sl(_mutex);
             if (_state != kFail && _state != kAbort) {
                 _state = kEnteredCritSec;  // 设置状态为已进入关键区域
+                //这里通知 MigrationDestinationManager::startCommit 中的等待线程
                 _stateChangedCV.notify_all();
             }
         }
@@ -2424,6 +2425,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx,
         {
             stdx::lock_guard<Latch> sl(_mutex);
             _state = kEnteredCritSec;  // 设置状态为已进入关键区域
+            // MigrationDestinationManager::startCommit 会等待这个状态变化
             _stateChangedCV.notify_all();
         }
 
@@ -2635,26 +2637,35 @@ bool MigrationDestinationManager::_flushPendingWrites(OperationContext* opCtx,
     return true;
 }
 
+/**
+ * MigrationDestinationManager::awaitCriticalSectionReleaseSignalAndCompleteMigration
+ * 该函数用于在迁移流程最后阶段，目标分片已进入关键区域后，阻塞等待迁移线程发出释放关键区域的信号，
+ * 收到信号后完成关键区域的释放、元数据刷新、统计更新和清理迁移恢复文档，确保数据一致性和迁移流程安全收尾。
+ */
 void MigrationDestinationManager::awaitCriticalSectionReleaseSignalAndCompleteMigration(
     OperationContext* opCtx, const Timer& timeInCriticalSection) {
-    // Wait until the migrate thread is signaled to release the critical section
+    // 等待迁移线程发出释放关键区域的信号（通常由源分片迁移完成后触发）
     LOGV2_DEBUG(5899111, 3, "Waiting for release critical section signal");
     invariant(_canReleaseCriticalSectionPromise);
     _canReleaseCriticalSectionPromise->getFuture().get(opCtx);
 
+    // 设置迁移状态为退出关键区域
     _setState(kExitCritSec);
 
-    // Refresh the filtering metadata
+    // 刷新分片过滤元数据，确保路由信息最新
     LOGV2_DEBUG(5899112, 3, "Refreshing filtering metadata before exiting critical section");
 
     bool refreshFailed = false;
     try {
+        // 测试挂点，模拟元数据刷新失败
         if (MONGO_unlikely(migrationRecipientFailPostCommitRefresh.shouldFail())) {
             uasserted(ErrorCodes::InternalError, "skipShardFilteringMetadataRefresh failpoint");
         }
 
+        // 强制刷新分片过滤元数据
         forceShardFilteringMetadataRefresh(opCtx, _nss);
     } catch (const DBException& ex) {
+        // 刷新失败时记录日志
         LOGV2_DEBUG(5899103,
                     2,
                     "Post-migration commit refresh failed on recipient",
@@ -2663,13 +2674,14 @@ void MigrationDestinationManager::awaitCriticalSectionReleaseSignalAndCompleteMi
         refreshFailed = true;
     }
 
+    // 如果元数据刷新失败，清除本地过滤元数据
     if (refreshFailed) {
         AutoGetCollection autoColl(opCtx, _nss, MODE_IX);
         CollectionShardingRuntime::assertCollectionLockedAndAcquireExclusive(opCtx, _nss)
             ->clearFilteringMetadata(opCtx);
     }
 
-    // Release the critical section
+    // 释放关键区域，允许集合写操作恢复
     LOGV2_DEBUG(5899110, 3, "Exiting critical section");
     const auto critSecReason = criticalSectionReason(*_sessionId);
 
@@ -2680,6 +2692,7 @@ void MigrationDestinationManager::awaitCriticalSectionReleaseSignalAndCompleteMi
         ShardingCatalogClient::kMajorityWriteConcern,
         ShardingRecoveryService::NoCustomAction());
 
+    // 统计关键区域停留时间
     const auto timeInCriticalSectionMs = timeInCriticalSection.millis();
     ShardingStatistics::get(opCtx).totalRecipientCriticalSectionTimeMillis.addAndFetch(
         timeInCriticalSectionMs);
@@ -2689,14 +2702,10 @@ void MigrationDestinationManager::awaitCriticalSectionReleaseSignalAndCompleteMi
           logAttrs(_nss),
           "durationMillis"_attr = timeInCriticalSectionMs);
 
-    // Wait for the updates to the catalog cache to be written to disk before removing the
-    // recovery document. This ensures that on case of stepdown, the new primary will know of a
-    // placement version inclusive of the migration. NOTE: We rely on the
-    // deleteMigrationRecipientRecoveryDocument call below to wait for the CatalogCache on-disk
-    // persistence to be majority committed.
+    // 等待 CatalogCache 更新持久化到磁盘，确保主节点切换时新主节点能感知最新分片布局
     CatalogCacheLoader::get(opCtx).waitForCollectionFlush(opCtx, _nss);
 
-    // Delete the recovery document
+    // 删除迁移恢复文档，迁移流程彻底收尾
     migrationutil::deleteMigrationRecipientRecoveryDocument(opCtx, *_migrationId);
 }
 

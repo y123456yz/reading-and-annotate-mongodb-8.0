@@ -762,6 +762,25 @@ ExecutorFuture<void> launchReleaseCriticalSectionOnRecipientFuture(
  * 主要作用是：在发生主节点故障转移（failover）时，新主节点能够根据该文档恢复迁移状态，
  * 重新进入关键区域并继续完成迁移，保证迁移过程的高可用性和故障恢复能力。
  * 文档会被存储在 config.migrationRecipients 集合中，使用多数派写关注确保持久性。
+{
+  "_id": "123e4567-e89b-12d3-a456-426614174000",  // 迁移唯一ID (UUID)
+  "nss": "test.users",                            // 迁移的命名空间
+  "migrationSessionId": {                         // 迁移会话ID
+    "id": "456e7890-a123-45bc-6789-012345678901"
+  },
+  "range": {                                      // 迁移的 chunk 范围
+    "min": { "userId": 1000 },
+    "max": { "userId": 2000 }
+  },
+  "fromShard": "shard0000",                       // 源分片ID
+  "lsid": {                                       // 逻辑会话ID
+    "id": "789e0123-b456-78cd-9012-345678901234",
+    "uid": "abcdef12-3456-7890-abcd-ef1234567890"
+  },
+  "txnNumber": NumberLong(1)                      // 事务编号
+}
+记录该表的目的是如果第8阶段关键区域期间发生故障转移，新主节点可以读取该文档并恢复迁移状态。
+恢复见函数 ShardingRecoveryService::recoverRecoverableCriticalSections
  */
 void persistMigrationRecipientRecoveryDocument(
     OperationContext* opCtx, const MigrationRecipientRecoveryDocument& migrationRecipientDoc) {

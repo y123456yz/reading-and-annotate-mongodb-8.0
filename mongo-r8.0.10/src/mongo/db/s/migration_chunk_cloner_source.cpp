@@ -620,7 +620,7 @@ StatusWith<BSONObj> MigrationChunkClonerSource::commitClone(OperationContext* op
     // 通知会话迁移源，克隆提交阶段已开始
     _sessionCatalogSource->onCommitCloneStarted();
 
-    // 构造并发送 commit 命令到目标分片
+    // 构造并发送 commit 命令到目标分片，等待目标分片返回
     auto responseStatus = _callRecipient(opCtx, [&] {
         BSONObjBuilder builder;
         builder.append(kRecvChunkCommit,

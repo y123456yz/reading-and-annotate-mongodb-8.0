@@ -201,11 +201,34 @@ ShardingRecoveryService* ShardingRecoveryService::get(OperationContext* opCtx) {
 const ReplicaSetAwareServiceRegistry::Registerer<ShardingRecoveryService>
     shardingRecoveryServiceRegisterer("ShardingRecoveryService");
 
+/**
+ * ShardingRecoveryService::acquireRecoverableCriticalSectionBlockWrites
+ * 该函数用于在分片迁移或其他分片操作中，获取可恢复的关键区域（critical section）并阻塞写操作。
+ * 主要作用是：
+ * 1. 检查指定集合是否已经处于关键区域，如果是且原因相同则直接返回
+ * 2. 如果集合未处于关键区域，则将关键区域信息持久化到 config.collectionCriticalSections 集合
+ * 3. 通过 op observer 机制，当文档写入成功后，会自动在内存中设置关键区域，阻塞写操作
+ * 4. 使用指定的写关注（通常是多数派）确保关键区域信息在主节点切换时不会丢失
+ * 
+ * 这是分片迁移流程中保证数据一致性和高可用性的核心机制之一。
+ * 
+ 向config.collectionCriticalSections表中记录数据，用于持久化存储集合级别的关键区域（critical section）信息,数据内容:
+{
+  "_id": ObjectId("65a1234567890abcdef12345"),
+  "nss": "test.users",
+  "reason": {
+    "recvChunk":1,
+    "sessionId":"shard3ReplSet_shard2ReplSet_6888b4f59b404274eb601371"
+  },
+  "blockReads": false
+}
+ */
 void ShardingRecoveryService::acquireRecoverableCriticalSectionBlockWrites(
     OperationContext* opCtx,
     const NamespaceString& nss,
     const BSONObj& reason,
     const WriteConcernOptions& writeConcern) {
+    // 记录开始获取关键区域的调试日志
     LOGV2_DEBUG(5656600,
                 3,
                 "Acquiring recoverable critical section blocking writes",
@@ -213,6 +236,7 @@ void ShardingRecoveryService::acquireRecoverableCriticalSectionBlockWrites(
                 "reason"_attr = reason,
                 "writeConcern"_attr = writeConcern);
 
+    // 确保调用此函数时没有持有任何锁，避免死锁
     tassert(7032360,
             fmt::format("Can't acquire recoverable critical section for collection '{}' with "
                         "reason '{}' while holding locks",
@@ -221,21 +245,28 @@ void ShardingRecoveryService::acquireRecoverableCriticalSectionBlockWrites(
             !shard_role_details::getLocker(opCtx)->isLocked());
 
     {
+        // 获取全局意向锁
         Lock::GlobalLock lk(opCtx, MODE_IX);
         boost::optional<AutoGetDb> dbLock;
         boost::optional<AutoGetCollection> collLock;
+        
+        // 根据命名空间类型获取相应的锁
         if (nss.isDbOnly()) {
+            // 数据库级别的关键区域
             tassert(8096300,
                     "Cannot acquire critical section on the config database",
                     !nss.isConfigDB());
             dbLock.emplace(opCtx, nss.dbName(), MODE_S);
         } else {
+            // 集合级别的关键区域
             if (nss.isConfigDB()) {
                 // Take the 'config' database lock in mode IX to prevent lock upgrade when we later
                 // write to kCollectionCriticalSectionsNamespace.
+                // 对 config 库加 IX 锁，避免后续写入时的锁升级
                 dbLock.emplace(opCtx, nss.dbName(), MODE_IX);
             }
 
+            // 获取集合的共享锁
             collLock.emplace(opCtx,
                              nss,
                              MODE_S,
@@ -243,6 +274,7 @@ void ShardingRecoveryService::acquireRecoverableCriticalSectionBlockWrites(
                                  auto_get_collection::ViewMode::kViewsPermitted));
         }
 
+        // 使用直接客户端查询关键区域集合
         DBDirectClient dbClient(opCtx);
         FindCommandRequest findRequest{NamespaceString::kCollectionCriticalSectionsNamespace};
         findRequest.setFilter(
@@ -252,11 +284,13 @@ void ShardingRecoveryService::acquireRecoverableCriticalSectionBlockWrites(
 
         // if there is a doc with the same nss -> in order to not fail it must have the same
         // reason
+        // 检查是否已经存在相同命名空间的关键区域文档
         if (cursor->more()) {
             const auto bsonObj = cursor->next();
             const auto collCSDoc = CollectionCriticalSectionDocument::parse(
                 IDLParserContext("AcquireRecoverableCSBW"), bsonObj);
 
+            // 如果已存在但原因不同，则断言失败
             tassert(7032368,
                     fmt::format("Trying to acquire a  critical section blocking writes for "
                                 "namespace '{}' and reason '{}' but it is already taken by another "
@@ -266,6 +300,7 @@ void ShardingRecoveryService::acquireRecoverableCriticalSectionBlockWrites(
                                 collCSDoc.getReason().toString()),
                     collCSDoc.getReason().woCompare(reason) == 0);
 
+            // 关键区域已存在且原因相同，无需重复获取
             LOGV2_DEBUG(5656601,
                         3,
                         "The recoverable critical section was already acquired to block "
@@ -278,14 +313,17 @@ void ShardingRecoveryService::acquireRecoverableCriticalSectionBlockWrites(
         }
 
         // The collection critical section is not taken, try to acquire it.
+        // 集合未处于关键区域，尝试获取
 
         // The following code will try to add a doc to config.criticalCollectionSections:
         // - If everything goes well, the shard server op observer will acquire the in-memory
         // CS.
         // - Otherwise this call will fail and the CS won't be taken (neither persisted nor
         // in-mem)
+        // 构造关键区域文档（false 表示只阻塞写，不阻塞读）
         CollectionCriticalSectionDocument newDoc(nss, reason, false /* blockReads */);
 
+        // 执行插入操作，将关键区域文档写入 config.collectionCriticalSections
         const auto commandResponse = dbClient.runCommand([&] {
             write_ops::InsertCommandRequest insertOp(
                 NamespaceString::kCollectionCriticalSectionsNamespace);
@@ -293,9 +331,11 @@ void ShardingRecoveryService::acquireRecoverableCriticalSectionBlockWrites(
             return insertOp.serialize({});
         }());
 
+        // 检查写入结果
         const auto commandReply = commandResponse->getCommandReply();
         uassertStatusOK(getStatusFromWriteCommandReply(commandReply));
 
+        // 解析批量写入响应，确保文档已成功插入
         BatchedCommandResponse batchedResponse;
         std::string unusedErrmsg;
         batchedResponse.parseBSON(commandReply, &unusedErrmsg);
@@ -309,10 +349,12 @@ void ShardingRecoveryService::acquireRecoverableCriticalSectionBlockWrites(
                 batchedResponse.getN() > 0);
     }
 
+    // 等待写操作达到指定的写关注级别（通常是多数派）
     WriteConcernResult ignoreResult;
     const auto latestOpTime = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
     uassertStatusOK(waitForWriteConcern(opCtx, latestOpTime, writeConcern, &ignoreResult));
 
+    // 记录成功获取关键区域的日志
     LOGV2_DEBUG(5656602,
                 2,
                 "Acquired recoverable critical section blocking writes",
