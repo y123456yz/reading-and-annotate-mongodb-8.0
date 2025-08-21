@@ -772,48 +772,60 @@ void MigrationSourceManager::awaitToCatchUp() {
     scopedGuard.dismiss();
 }
 
-
+/**
+ * MigrationSourceManager::enterCriticalSection
+ * 该函数用于在分片迁移流程中，源分片进入关键区域（critical section）。
+ * 进入关键区域后，源分片会阻塞对迁移 chunk 范围的所有写操作，确保数据一致性，
+ * 并为迁移所有权切换做准备。此操作会通知副本集成员刷新路由信息，保证迁移期间的因果一致性。
+ */
 void MigrationSourceManager::enterCriticalSection() {
+    // 保证当前没有持有锁，防止死锁或状态异常
     invariant(!shard_role_details::getLocker(_opCtx)->isLocked());
+    // 保证迁移状态为 kCloneCaughtUp，确保已完成数据克隆和追赶
     invariant(_state == kCloneCaughtUp);
+
+    // 构造异常安全保护，若后续步骤出错可自动清理
     ScopeGuard scopedGuard([&] { _cleanupOnError(); });
+
+    // 统计并累加本次迁移的克隆阶段耗时
     _stats.totalDonorChunkCloneTimeMillis.addAndFetch(_cloneAndCommitTimer.millis());
+    // 重置计时器，为关键区域阶段重新计时
     _cloneAndCommitTimer.reset();
 
+    // 测试挂点，可用于调试或模拟关键区域前的暂停
     hangBeforeEnteringCriticalSection.pauseWhileSet();
 
+    // 获取集合的分片路由信息
     const auto [cm, _] =
         uassertStatusOK(Grid::get(_opCtx)->catalogCache()->getCollectionRoutingInfo(_opCtx, nss()));
 
-    // Check that there are no chunks on the recepient shard. Write an oplog event for change
-    // streams if this is the first migration to the recipient.
+    // 检查目标分片是否首次拥有 chunk，如果是则写入 oplog 事件用于 change stream
     if (!cm.getVersion(_args.getToShard()).isSet()) {
         migrationutil::notifyChangeStreamsOnRecipientFirstChunk(
             _opCtx, nss(), _args.getFromShard(), _args.getToShard(), _collectionUUID);
 
-        // Wait for the above 'migrateChunkToNewShard' oplog message to be majority acknowledged.
+        // 等待上述 oplog 事件被多数派节点确认，保证副本集一致性
         WriteConcernResult ignoreResult;
         auto latestOpTime = repl::ReplClientInfo::forClient(_opCtx->getClient()).getLastOp();
         uassertStatusOK(waitForWriteConcern(
             _opCtx, latestOpTime, WriteConcerns::kMajorityWriteConcernNoTimeout, &ignoreResult));
     }
 
+    // 记录进入关键区域的日志，便于性能分析和问题排查
     LOGV2_DEBUG_OPTIONS(4817402,
                         2,
                         {logv2::LogComponent::kShardMigrationPerf},
                         "Starting critical section",
                         "migrationId"_attr = _coordinator->getMigrationId());
 
+    // 设置关键区域标志，阻塞迁移范围的写操作
     _critSec.emplace(_opCtx, nss(), _critSecReason);
 
+    // 更新迁移状态为关键区域
     _state = kCriticalSection;
 
-    // Persist a signal to secondaries that we've entered the critical section. This is will cause
-    // secondaries to refresh their routing table when next accessed, which will block behind the
-    // critical section. This ensures causal consistency by preventing a stale mongos with a cluster
-    // time inclusive of the migration config commit update from accessing secondary data.
-    // Note: this write must occur after the critSec flag is set, to ensure the secondary refresh
-    // will stall behind the flag.
+    // 向副本集持久化关键区域信号，促使副本集成员刷新路由表并阻塞在关键区域
+    // 这样可以保证因果一致性，防止 stale mongos 访问到未完成迁移的数据
     uassertStatusOKWithContext(
         shardmetadatautil::updateShardCollectionsEntry(
             _opCtx,
@@ -823,10 +835,12 @@ void MigrationSourceManager::enterCriticalSection() {
             false /*upsert*/),
         "Persist critical section signal for secondaries");
 
+    // 记录成功进入关键区域的日志
     LOGV2(22017,
           "Migration successfully entered critical section",
           "migrationId"_attr = _coordinator->getMigrationId());
 
+    // 关键区域进入成功，撤销异常保护
     scopedGuard.dismiss();
 }
 

@@ -526,7 +526,10 @@ bool MigrationDestinationManager::_isActive(WithLock) const {
     return _sessionId.has_value();
 }
 
-//
+/*
+ * 源分片： MigrationChunkClonerSource::_callRecipient 发送 recvChunkStatus 请求
+ * 目标分片: RecvChunkStatusCommand::run->MigrationDestinationManager::report 接收 recvChunkStatus 请求处理
+*/
 /**
  * MigrationDestinationManager::report
  * 该函数用于将当前迁移接收端的迁移状态、进度和关键信息填充到 BSONObjBuilder b，
