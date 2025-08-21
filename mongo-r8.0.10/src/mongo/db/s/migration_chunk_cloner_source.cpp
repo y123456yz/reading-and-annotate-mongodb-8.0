@@ -591,24 +591,34 @@ Status MigrationChunkClonerSource::awaitUntilCriticalSectionIsAppropriate(
     return _checkRecipientCloningStatus(opCtx, maxTimeToWait);
 }
 
-
+/**
+ * MigrationChunkClonerSource::commitClone
+ * 该函数用于在分片迁移流程的克隆阶段结束时，向目标分片发送 commit 命令，通知其完成数据克隆。
+ * 主要流程包括：状态校验、巨型块特殊处理、会话数据处理、RPC发送 commit 命令、根据响应结果清理本地状态或报错。
+ */
 StatusWith<BSONObj> MigrationChunkClonerSource::commitClone(OperationContext* opCtx) {
-    invariant(_state == kCloning);
-    invariant(!shard_role_details::getLocker(opCtx)->isLocked());
+    invariant(_state == kCloning); // 确保当前处于克隆阶段
+    invariant(!shard_role_details::getLocker(opCtx)->isLocked()); // 确保没有持有锁
+
+    // 针对巨型块迁移的特殊处理
     if (_jumboChunkCloneState && _forceJumbo) {
         if (_args.getForceJumbo() == ForceJumbo::kForceManual) {
+            // 手动强制迁移时，需再次检查目标分片克隆状态
             auto status = _checkRecipientCloningStatus(opCtx, kMaxWaitToCommitCloneForJumboChunk);
             if (!status.isOK()) {
-                return status;
+                return status; // 检查失败则直接返回错误
             }
         } else {
+            // 自动强制迁移时，确保所有数据已克隆完毕
             invariant(PlanExecutor::IS_EOF == _jumboChunkCloneState->clonerState);
             invariant(!_cloneList.hasMore());
         }
     }
 
+    // 通知会话迁移源，克隆提交阶段已开始
     _sessionCatalogSource->onCommitCloneStarted();
 
+    // 构造并发送 commit 命令到目标分片
     auto responseStatus = _callRecipient(opCtx, [&] {
         BSONObjBuilder builder;
         builder.append(kRecvChunkCommit,
@@ -618,17 +628,21 @@ StatusWith<BSONObj> MigrationChunkClonerSource::commitClone(OperationContext* op
     }());
 
     if (responseStatus.isOK()) {
+        // 如果目标分片响应成功，则进行本地清理
         _cleanup(true);
 
+        // 检查会话数据是否全部同步完成
         if (_sessionCatalogSource->hasMoreOplog()) {
             return {ErrorCodes::SessionTransferIncomplete,
                     "destination shard finished committing but there are still some session "
                     "metadata that needs to be transferred"};
         }
 
+        // 返回目标分片的响应结果
         return responseStatus;
     }
 
+    // 如果 commit 失败，则取消克隆流程并返回错误
     cancelClone(opCtx);
     return responseStatus.getStatus();
 }

@@ -777,6 +777,7 @@ void MigrationSourceManager::awaitToCatchUp() {
  * 该函数用于在分片迁移流程中，源分片进入关键区域（critical section）。
  * 进入关键区域后，源分片会阻塞对迁移 chunk 范围的所有写操作，确保数据一致性，
  * 并为迁移所有权切换做准备。此操作会通知副本集成员刷新路由信息，保证迁移期间的因果一致性。
+ * migrationSourceManager.enterCriticalSection();
  */
 void MigrationSourceManager::enterCriticalSection() {
     // 保证当前没有持有锁，防止死锁或状态异常
