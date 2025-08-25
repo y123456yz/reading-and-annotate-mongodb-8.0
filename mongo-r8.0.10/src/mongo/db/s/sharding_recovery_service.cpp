@@ -489,6 +489,13 @@ void ShardingRecoveryService::promoteRecoverableCriticalSectionToBlockAlsoReads(
                 "writeConcern"_attr = writeConcern);
 }
 
+/**
+ * ShardingRecoveryService::releaseRecoverableCriticalSection
+ * 该函数用于释放集合的可恢复关键区域（critical section），允许集合的读写操作恢复。
+ * 核心作用是：检查关键区域的状态，执行自定义操作（如清理任务），
+ * 然后从 `config.collectionCriticalSections` 集合中删除对应的文档，解除关键区域。
+ * 如果关键区域的原因不匹配或不存在，则不会执行释放操作。
+ */
 void ShardingRecoveryService::releaseRecoverableCriticalSection(
     OperationContext* opCtx,
     const NamespaceString& nss,
@@ -503,6 +510,7 @@ void ShardingRecoveryService::releaseRecoverableCriticalSection(
                 "reason"_attr = reason,
                 "writeConcern"_attr = writeConcern);
 
+    // 确保当前没有持有锁，避免死锁
     tassert(7032365,
             fmt::format("Can't release recoverable critical section for collection '{}' with "
                         "reason '{}' while holding locks",
@@ -513,6 +521,8 @@ void ShardingRecoveryService::releaseRecoverableCriticalSection(
     {
         boost::optional<AutoGetDb> dbLock;
         boost::optional<AutoGetCollection> collLock;
+
+        // 根据命名空间类型获取数据库或集合锁
         if (nss.isDbOnly()) {
             dbLock.emplace(opCtx, nss.dbName(), MODE_X);
         } else {
@@ -525,6 +535,7 @@ void ShardingRecoveryService::releaseRecoverableCriticalSection(
 
         DBDirectClient dbClient(opCtx);
 
+        // 查询 config.collectionCriticalSections 集合，检查是否存在关键区域文档
         const auto queryNss =
             BSON(CollectionCriticalSectionDocument::kNssFieldName
                  << NamespaceStringUtil::serialize(nss, SerializationContext::stateDefault()));
@@ -532,7 +543,7 @@ void ShardingRecoveryService::releaseRecoverableCriticalSection(
         findRequest.setFilter(queryNss);
         auto cursor = dbClient.find(std::move(findRequest));
 
-        // if there is no document with the same nss -> do nothing!
+        // 如果没有找到对应的关键区域文档，直接返回
         if (!cursor->more()) {
             LOGV2_DEBUG(5656607,
                         3,
@@ -543,10 +554,12 @@ void ShardingRecoveryService::releaseRecoverableCriticalSection(
             return;
         }
 
+        // 解析关键区域文档
         BSONObj bsonObj = cursor->next();
         const auto collCSDoc = CollectionCriticalSectionDocument::parse(
             IDLParserContext("ReleaseRecoverableCS"), bsonObj);
 
+        // 检查关键区域的原因是否匹配
         const bool isDifferentReason = collCSDoc.getReason().woCompare(reason) != 0;
         if (MONGO_unlikely(!throwIfReasonDiffers && isDifferentReason)) {
             LOGV2_DEBUG(7019701,
@@ -560,6 +573,7 @@ void ShardingRecoveryService::releaseRecoverableCriticalSection(
             return;
         }
 
+        // 如果原因不匹配，抛出断言错误
         tassert(7032366,
                 fmt::format("Trying to release a critical for namespace '{}' and reason '{}' but "
                             "it is already taken by another operation with different reason '{}'",
@@ -568,16 +582,10 @@ void ShardingRecoveryService::releaseRecoverableCriticalSection(
                             collCSDoc.getReason().toString()),
                 !isDifferentReason);
 
-        // The collection critical section is taken (in any phase), perform the custom action then
-        // try to release it.
-
+        // 执行自定义操作（如清理任务）
         beforeReleasingAction(opCtx, nss);
 
-        // The following code will try to remove a doc from config.criticalCollectionSections:
-        // - If everything goes well, the shard server op observer will release the in-memory CS
-        // - Otherwise this call will fail and the CS won't be released (neither persisted nor
-        // in-mem)
-
+        // 从 config.collectionCriticalSections 集合中删除关键区域文档
         auto commandResponse = dbClient.runCommand([&] {
             write_ops::DeleteCommandRequest deleteOp(
                 NamespaceString::kCollectionCriticalSectionsNamespace);
@@ -592,9 +600,11 @@ void ShardingRecoveryService::releaseRecoverableCriticalSection(
             return deleteOp.serialize({});
         }());
 
+        // 检查删除操作的响应状态
         const auto commandReply = commandResponse->getCommandReply();
         uassertStatusOK(getStatusFromWriteCommandReply(commandReply));
 
+        // 确保至少删除了一条文档
         BatchedCommandResponse batchedResponse;
         std::string unusedErrmsg;
         batchedResponse.parseBSON(commandReply, &unusedErrmsg);
@@ -608,10 +618,12 @@ void ShardingRecoveryService::releaseRecoverableCriticalSection(
             batchedResponse.getN() > 0);
     }
 
+    // 等待写操作达到指定的写关注级别
     WriteConcernResult ignoreResult;
     const auto latestOpTime = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
     uassertStatusOK(waitForWriteConcern(opCtx, latestOpTime, writeConcern, &ignoreResult));
 
+    // 记录释放关键区域的日志
     LOGV2_DEBUG(5656608,
                 2,
                 "Released recoverable critical section",

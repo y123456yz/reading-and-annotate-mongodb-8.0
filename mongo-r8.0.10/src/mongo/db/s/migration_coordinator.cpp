@@ -441,13 +441,20 @@ void MigrationCoordinator::forgetMigration(OperationContext* opCtx) {
                  WriteConcernOptions{1, WriteConcernOptions::SyncMode::UNSET, Seconds(0)});
 }
 
+/**
+ * MigrationCoordinator::launchReleaseRecipientCriticalSection
+ * 该函数用于在迁移元数据提交到 config server 成功后，异步通知目标分片释放关键区域（critical section）。
+ * 主要作用是：通过异步任务，调用目标分片的接口，解除对迁移 chunk 范围的写操作阻塞，
+ * 让目标分片完成迁移收尾并恢复正常业务写入。
+ */
 void MigrationCoordinator::launchReleaseRecipientCriticalSection(OperationContext* opCtx) {
+    // 异步发起释放关键区域的请求，保存 future 以便后续跟踪任务完成状态
     _releaseRecipientCriticalSectionFuture =
         migrationutil::launchReleaseCriticalSectionOnRecipientFuture(
             opCtx,
-            _migrationInfo.getRecipientShardId(),
-            _migrationInfo.getNss(),
-            _migrationInfo.getMigrationSessionId());
+            _migrationInfo.getRecipientShardId(),      // 目标分片ID
+            _migrationInfo.getNss(),                   // 迁移集合命名空间
+            _migrationInfo.getMigrationSessionId());    // 迁移会话ID
 }
 
 void MigrationCoordinator::_waitForReleaseRecipientCriticalSectionFutureIgnoreShardNotFound(

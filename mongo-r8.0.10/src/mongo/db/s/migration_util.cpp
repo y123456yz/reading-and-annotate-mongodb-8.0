@@ -708,6 +708,16 @@ void recoverMigrationCoordinations(OperationContext* opCtx,
         });
 }
 
+/**
+ * launchReleaseCriticalSectionOnRecipientFuture
+ * 该函数用于异步通知目标分片释放关键区域（critical section），允许写操作恢复。
+ * 主要作用是：在迁移元数据提交成功后，通过异步任务向目标分片发送 _recvChunkReleaseCritSec 命令，
+ * 解除对迁移 chunk 范围的写操作阻塞，完成迁移收尾。
+ * 
+
+源分片: launchReleaseCriticalSectionOnRecipientFuture 发送 _recvChunkReleaseCritSec 给目标分片
+目标分片：RecvChunkReleaseCritSecCommand::run 接收 _recvChunkReleaseCritSec 命令处理
+ */
 ExecutorFuture<void> launchReleaseCriticalSectionOnRecipientFuture(
     OperationContext* opCtx,
     const ShardId& recipientShardId,
@@ -716,21 +726,25 @@ ExecutorFuture<void> launchReleaseCriticalSectionOnRecipientFuture(
     const auto serviceContext = opCtx->getServiceContext();
     auto executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
 
+    // 在 executor 上异步执行释放关键区域的任务
     return ExecutorFuture<void>(executor).then([=] {
         ThreadClient tc("releaseRecipientCritSec",
                         serviceContext->getService(ClusterRole::ShardServer));
         auto uniqueOpCtx = tc->makeOperationContext();
         auto opCtx = uniqueOpCtx.get();
 
+        // 获取目标分片连接
         const auto recipientShard =
             uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, recipientShardId));
 
+        // 构造释放关键区域的命令请求
         BSONObjBuilder builder;
         builder.append("_recvChunkReleaseCritSec",
                        NamespaceStringUtil::serialize(nss, SerializationContext::stateDefault()));
         sessionId.append(&builder);
         const auto commandObj = CommandHelpers::appendMajorityWriteConcern(builder.obj());
 
+        // 重试发送释放关键区域命令，直到成功或主节点切换
         sharding_util::retryIdempotentWorkAsPrimaryUntilSuccessOrStepdown(
             opCtx,
             "release migration critical section on recipient",

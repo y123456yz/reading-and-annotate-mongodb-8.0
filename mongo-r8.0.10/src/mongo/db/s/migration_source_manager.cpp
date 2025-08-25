@@ -953,20 +953,25 @@ void MigrationSourceManager::commitChunkOnRecipient() {
     scopedGuard.dismiss();
 }
 
+/*
+该函数负责在迁移最后阶段将 chunk 元数据变更提交到 config server，完成所有权切换。
+包括进入关键区域、发送元数据变更请求、处理响应、刷新本地元数据、通知目标分片释放关键区域、清理本地状态和 orphaned 数据等。
+保证集群元数据与实际数据分布一致，是迁移流程安全收尾和一致性的关键步骤。
+*/
 void MigrationSourceManager::commitChunkMetadataOnConfig() {
+    // 确保没有持有锁，防止死锁
     invariant(!shard_role_details::getLocker(_opCtx)->isLocked());
+    // 确保迁移状态为克隆完成
     invariant(_state == kCloneCompleted);
 
+    // 构造异常保护，迁移失败时自动清理本地状态并尝试恢复
     ScopeGuard scopedGuard([&] {
         _cleanupOnError();
         migrationutil::asyncRecoverMigrationUntilSuccessOrStepDown(_opCtx, nss());
     });
 
-    // If we have chunks left on the FROM shard, bump the version of one of them as well. This will
-    // change the local collection major version, which indicates to other processes that the chunk
-    // metadata has changed and they should refresh.
+    // 如果源分片还有剩余 chunk，提升其中一个 chunk 的版本，通知其他节点刷新元数据
     BSONObjBuilder builder;
-
     {
         const auto metadata = _getCurrentMetadataAndCheckForConflictingErrors();
 
@@ -982,14 +987,15 @@ void MigrationSourceManager::commitChunkMetadataOnConfig() {
         builder.append(kWriteConcernField, kMajorityWriteConcern.toBSON());
     }
 
-    // Read operations must begin to wait on the critical section just before we send the commit
-    // operation to the config server
+    // 进入关键区域的提交阶段，阻塞读写操作
     _critSec->enterCommitPhase();
 
+    // 更新迁移状态为正在提交到 config
     _state = kCommittingOnConfig;
 
     Timer t;
 
+    // 向 config server 发送 chunk 元数据变更请求
     auto commitChunkMigrationResponse =
         Grid::get(_opCtx)->shardRegistry()->getConfigShard()->runCommandWithFixedRetryAttempts(
             _opCtx,
@@ -998,17 +1004,19 @@ void MigrationSourceManager::commitChunkMetadataOnConfig() {
             builder.obj(),
             Shard::RetryPolicy::kIdempotent);
 
+    // 测试挂点，模拟网络错误
     if (MONGO_unlikely(migrationCommitNetworkError.shouldFail())) {
         commitChunkMigrationResponse = Status(
             ErrorCodes::InternalError, "Failpoint 'migrationCommitNetworkError' generated error");
     }
 
+    // 检查 config server 响应状态
     Status migrationCommitStatus =
         Shard::CommandResponse::getEffectiveStatus(commitChunkMigrationResponse);
 
     if (!migrationCommitStatus.isOK()) {
         {
-            // TODO (SERVER-71444): Fix to be interruptible or document exception.
+            // 清除本地分片过滤元数据
             UninterruptibleLockGuard noInterrupt(_opCtx);  // NOLINT.
             AutoGetCollection autoColl(_opCtx, nss(), MODE_IX);
             CollectionShardingRuntime::assertCollectionLockedAndAcquireExclusive(_opCtx, nss())
@@ -1020,7 +1028,7 @@ void MigrationSourceManager::commitChunkMetadataOnConfig() {
         uassertStatusOK(migrationCommitStatus);
     }
 
-    // Asynchronously tell the recipient to release its critical section
+    // 异步通知目标分片释放关键区域
     _coordinator->launchReleaseRecipientCriticalSection(_opCtx);
 
     hangBeforePostMigrationCommitRefresh.pauseWhileSet();
@@ -1032,6 +1040,7 @@ void MigrationSourceManager::commitChunkMetadataOnConfig() {
                             "Starting post-migration commit refresh on the shard",
                             "migrationId"_attr = _coordinator->getMigrationId());
 
+        // 强制刷新本地分片过滤元数据
         forceShardFilteringMetadataRefresh(_opCtx, nss());
 
         LOGV2_DEBUG_OPTIONS(4817405,
@@ -1047,7 +1056,7 @@ void MigrationSourceManager::commitChunkMetadataOnConfig() {
                             "migrationId"_attr = _coordinator->getMigrationId(),
                             "error"_attr = redact(ex));
         {
-            // TODO (SERVER-71444): Fix to be interruptible or document exception.
+            // 清除本地分片过滤元数据
             UninterruptibleLockGuard noInterrupt(_opCtx);  // NOLINT.
             AutoGetCollection autoColl(_opCtx, nss(), MODE_IX);
             CollectionShardingRuntime::assertCollectionLockedAndAcquireExclusive(_opCtx, nss())
@@ -1055,40 +1064,37 @@ void MigrationSourceManager::commitChunkMetadataOnConfig() {
         }
         scopedGuard.dismiss();
         _cleanup(false);
-        // Best-effort recover of the chunk version.
+        // 尝试恢复 chunk 版本
         onCollectionPlacementVersionMismatchNoExcept(_opCtx, nss(), boost::none).ignore();
         throw;
     }
 
-    // Migration succeeded
-
+    // 检查是否迁移了 donor 上的最后一个 chunk，写入 oplog 事件用于 change stream
     const auto refreshedMetadata = _getCurrentMetadataAndCheckForConflictingErrors();
-    // Check if there are no chunks left on donor shard. Write an oplog event for change streams if
-    // the last chunk migrated off the donor.
     if (!refreshedMetadata.getChunkManager()->getVersion(_args.getFromShard()).isSet()) {
         migrationutil::notifyChangeStreamsOnDonorLastChunk(
             _opCtx, nss(), _args.getFromShard(), _collectionUUID);
     }
-
 
     LOGV2(22018,
           "Migration succeeded and updated collection placement version",
           "updatedCollectionPlacementVersion"_attr = refreshedMetadata.getCollPlacementVersion(),
           "migrationId"_attr = _coordinator->getMigrationId());
 
-    // If the migration has succeeded, clear the BucketCatalog so that the buckets that got migrated
-    // out are no longer updatable.
+    // 如果是时序集合，清理迁移出去的桶
     if (nss().isTimeseriesBucketsCollection()) {
         auto& bucketCatalog = timeseries::bucket_catalog::BucketCatalog::get(_opCtx);
         clear(bucketCatalog, _collectionUUID.get());
     }
 
+    // 标记迁移决策为已提交
     _coordinator->setMigrationDecision(DecisionEnum::kCommitted);
 
     hangBeforeLeavingCriticalSection.pauseWhileSet();
 
     scopedGuard.dismiss();
 
+    // 统计关键区域提交阶段耗时
     _stats.totalCriticalSectionCommitTimeMillis.addAndFetch(t.millis());
 
     LOGV2(6107801,
@@ -1096,10 +1102,10 @@ void MigrationSourceManager::commitChunkMetadataOnConfig() {
           "migrationId"_attr = _coordinator->getMigrationId(),
           "durationMillis"_attr = t.millis());
 
-    // Exit the critical section and ensure that all the necessary state is fully persisted before
-    // scheduling orphan cleanup.
+    // 退出关键区域并确保所有状态已持久化
     _cleanup(true);
 
+    // 记录迁移日志到 config.changelog
     ShardingLogging::get(_opCtx)->logChange(
         _opCtx,
         "moveChunk.commit",
@@ -1114,6 +1120,7 @@ void MigrationSourceManager::commitChunkMetadataOnConfig() {
         << "Moved chunks successfully but failed to clean up " << nss().toStringForErrorMsg()
         << " range " << redact(range.toString()) << " due to: ";
 
+    // 如果需要等待删除 orphaned 数据，则阻塞直到清理完成
     if (_args.getWaitForDelete()) {
         LOGV2(22019,
               "Waiting for migration cleanup after chunk commit",
@@ -1251,25 +1258,33 @@ CollectionMetadata MigrationSourceManager::_getCurrentMetadataAndCheckForConflic
     return metadata;
 }
 
+/**
+ * MigrationSourceManager::_cleanup
+ * 该函数用于在迁移流程结束后（无论成功或失败）清理源分片的迁移状态和资源。
+ * 核心作用是：退出关键区域、取消克隆操作、更新迁移状态、清理元数据和统计信息，确保迁移流程安全收尾。
+ * 如果迁移成功，还会完成迁移的最终步骤；如果失败，则清理相关状态并准备恢复。
+ */
 void MigrationSourceManager::_cleanup(bool completeMigration) noexcept {
+    // 确保迁移状态未标记为完成
     invariant(_state != kDone);
 
+    // 退出关键区域并释放资源
     auto cloneDriver = [&]() {
-        // Unregister from the collection's sharding state and exit the migration critical section.
-        // TODO (SERVER-71444): Fix to be interruptible or document exception.
-        UninterruptibleLockGuard noInterrupt(_opCtx);  // NOLINT.
+        // 取消注册集合的分片状态，并退出迁移关键区域
+        UninterruptibleLockGuard noInterrupt(_opCtx);  // 防止中断
         AutoGetCollection autoColl(_opCtx, nss(), MODE_IX);
         auto scopedCsr =
             CollectionShardingRuntime::assertCollectionLockedAndAcquireExclusive(_opCtx, nss());
 
         if (_state != kCreated) {
-            invariant(_cloneDriver);
+            invariant(_cloneDriver);  // 确保克隆驱动器存在
         }
 
-        _critSec.reset();
-        return std::move(_cloneDriver);
+        _critSec.reset();  // 退出关键区域
+        return std::move(_cloneDriver);  // 返回克隆驱动器
     }();
 
+    // 如果当前状态处于关键区域或提交阶段，记录关键区域完成日志
     if (_state == kCriticalSection || _state == kCloneCompleted || _state == kCommittingOnConfig) {
         LOGV2_DEBUG_OPTIONS(4817403,
                             2,
@@ -1283,20 +1298,20 @@ void MigrationSourceManager::_cleanup(bool completeMigration) noexcept {
               "durationMillis"_attr = _cloneAndCommitTimer.millis());
     }
 
-    // The cleanup operations below are potentially blocking or acquire other locks, so perform them
-    // outside of the collection X lock
-
+    // 以下清理操作可能会阻塞或获取其他锁，因此在退出集合锁后执行
     if (cloneDriver) {
-        cloneDriver->cancelClone(_opCtx);
+        cloneDriver->cancelClone(_opCtx);  // 取消克隆操作
     }
 
     try {
+        // 如果迁移状态已达到克隆阶段，执行迁移协调器的清理操作
         if (_state >= kCloning) {
             invariant(_coordinator);
             if (_state < kCommittingOnConfig) {
-                _coordinator->setMigrationDecision(DecisionEnum::kAborted);
+                _coordinator->setMigrationDecision(DecisionEnum::kAborted);  // 标记迁移为中止
             }
 
+            // 创建新的操作上下文，用于后续操作
             auto newClient = _opCtx->getServiceContext()
                                  ->getService(ClusterRole::ShardServer)
                                  ->makeClient("MigrationCoordinator");
@@ -1304,38 +1319,32 @@ void MigrationSourceManager::_cleanup(bool completeMigration) noexcept {
             auto newOpCtxPtr = cc().makeOperationContext();
             auto newOpCtx = newOpCtxPtr.get();
 
+            // 如果处于关键区域或提交阶段，刷新路由表缓存并确保元数据持久化
             if (_state >= kCriticalSection && _state <= kCommittingOnConfig) {
                 _stats.totalCriticalSectionTimeMillis.addAndFetch(_cloneAndCommitTimer.millis());
 
-                // Wait for the updates to the cache of the routing table to be fully written to
-                // disk. This way, we ensure that all nodes from a shard which donated a chunk will
-                // always be at the placement version of the last migration it performed.
-                //
-                // If the metadata is not persisted before clearing the 'inMigration' flag below, it
-                // is possible that the persisted metadata is rolled back after step down, but the
-                // write which cleared the 'inMigration' flag is not, a secondary node will report
-                // itself at an older placement version.
+                // 等待路由表缓存更新持久化到磁盘，确保所有节点的分片版本一致
                 CatalogCacheLoader::get(newOpCtx).waitForCollectionFlush(newOpCtx, nss());
             }
+
+            // 如果迁移成功，完成迁移的最终步骤
             if (completeMigration) {
-                // This can be called on an exception path after the OperationContext has been
-                // interrupted, so use a new OperationContext. Note, it's valid to call
-                // getServiceContext on an interrupted OperationContext.
                 _cleanupCompleteFuture = _coordinator->completeMigration(newOpCtx);
             }
         }
 
+        // 更新迁移状态为完成
         _state = kDone;
     } catch (const DBException& ex) {
+        // 如果迁移完成失败，记录警告日志并清理元数据
         LOGV2_WARNING(5089001,
                       "Failed to complete the migration",
                       "chunkMigrationRequestParameters"_attr = redact(_args.toBSON({})),
                       "error"_attr = redact(ex),
                       "migrationId"_attr = _coordinator->getMigrationId());
-        // Something went really wrong when completing the migration just unset the metadata and let
-        // the next op to recover.
-        // TODO (SERVER-71444): Fix to be interruptible or document exception.
-        UninterruptibleLockGuard noInterrupt(_opCtx);  // NOLINT.
+
+        // 清除本地分片过滤元数据，准备恢复
+        UninterruptibleLockGuard noInterrupt(_opCtx);  // 防止中断
         AutoGetCollection autoColl(_opCtx, nss(), MODE_IX);
         CollectionShardingRuntime::assertCollectionLockedAndAcquireExclusive(_opCtx, nss())
             ->clearFilteringMetadata(_opCtx);

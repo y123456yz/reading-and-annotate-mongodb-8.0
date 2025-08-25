@@ -780,18 +780,27 @@ CollectionCriticalSection::~CollectionCriticalSection() {
     scopedCsr->exitCriticalSection(_reason);
 }
 
+/**
+ * CollectionCriticalSection::enterCommitPhase
+ * 该函数用于将集合关键区域从只阻塞写操作升级为阻塞所有读写操作，进入迁移的最终提交阶段。
+ * 这是保证迁移元数据变更原子性和一致性的关键步骤。
+ */
 void CollectionCriticalSection::enterCommitPhase() {
+    // 以独占锁（MODE_X）锁定集合，确保没有其他读写操作正在进行
     AutoGetCollection autoColl(_opCtx,
                                _nss,
                                MODE_X,
                                AutoGetCollection::Options{}.deadline(
                                    _opCtx->getServiceContext()->getPreciseClockSource()->now() +
                                    Milliseconds(migrationLockAcquisitionMaxWaitMS.load())));
+    // 获取集合分片运行时的独占访问
     auto scopedCsr =
         CollectionShardingRuntime::assertCollectionLockedAndAcquireExclusive(_opCtx, _nss);
+    // 确保集合元数据已知，才能进入提交阶段
     tassert(7032304,
             "Collection metadata unknown when entering critical section commit phase",
             scopedCsr->getCurrentMetadataIfKnown());
+    // 正式进入关键区域提交阶段
     scopedCsr->enterCriticalSectionCommitPhase(_reason);
 }
 

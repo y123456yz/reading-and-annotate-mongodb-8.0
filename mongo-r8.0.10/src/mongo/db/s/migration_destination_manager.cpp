@@ -1163,11 +1163,21 @@ Status MigrationDestinationManager::startCommit(const MigrationSessionId& sessio
     return Status::OK();
 }
 
+//源分片: launchReleaseCriticalSectionOnRecipientFuture 发送 _recvChunkReleaseCritSec 给目标分片
+//目标分片：RecvChunkReleaseCritSecCommand::run 接收 _recvChunkReleaseCritSec 命令处理
+/**
+ * MigrationDestinationManager::exitCriticalSection
+ * 该函数用于在迁移流程的最后阶段，目标分片退出关键区域（critical section）。
+ * 核心作用是：验证迁移会话是否匹配，确保迁移线程完成后释放关键区域，允许写操作恢复。
+ * 如果迁移线程未完成或会话不匹配，则返回错误状态。
+ */
 Status MigrationDestinationManager::exitCriticalSection(OperationContext* opCtx,
                                                         const MigrationSessionId& sessionId) {
     SharedSemiFuture<State> threadFinishedFuture;
     {
         stdx::unique_lock<Latch> lock(_mutex);
+
+        // 检查迁移会话是否匹配
         if (!_sessionId || !_sessionId->matches(sessionId)) {
             LOGV2_DEBUG(5899104,
                         2,
@@ -1175,42 +1185,44 @@ Status MigrationDestinationManager::exitCriticalSection(OperationContext* opCtx,
                         "requested"_attr = sessionId,
                         "current"_attr = _sessionId);
 
-            // No need to hold _mutex from here on. Release it because the lines below will acquire
-            // other locks and holding the mutex could lead to deadlocks.
+            // 如果会话不匹配，释放锁以避免死锁
             lock.unlock();
 
+            // 检查是否存在迁移恢复文档，可能是主节点切换导致的中断
             if (migrationRecipientRecoveryDocumentExists(opCtx, sessionId)) {
-                // This node may have stepped down and interrupted the migrateThread, which reset
-                // _sessionId. But the critical section may not have been released so it will be
-                // recovered by the new primary.
                 return {ErrorCodes::CommandFailed,
                         "Recipient migration recovery document still exists"};
             }
 
-            // Ensure the command's wait for writeConcern will until the recovery document is
-            // deleted.
+            // 确保写关注等待恢复文档被删除
             repl::ReplClientInfo::forClient(opCtx->getClient()).setLastOpToSystemLastOpTime(opCtx);
 
             return Status::OK();
         }
 
+        // 检查是否已进入关键区域
         if (_state < kEnteredCritSec) {
             return {ErrorCodes::CommandFailed,
                     "recipient critical section has not yet been entered"};
         }
 
-        // Fulfill the promise to let the migrateThread release the critical section.
+        // 完成 promise，通知迁移线程释放关键区域
+
+        // 通知线程: MigrationDestinationManager::exitCriticalSection
+        // 被通知的是 migrateThread 线程：该线程在 awaitCriticalSectionReleaseSignalAndCompleteMigration 中阻塞等待推出临界区
         invariant(_canReleaseCriticalSectionPromise);
         if (!_canReleaseCriticalSectionPromise->getFuture().isReady()) {
             _canReleaseCriticalSectionPromise->emplaceValue();
         }
 
+        // 获取迁移线程完成的 future
         threadFinishedFuture = _migrateThreadFinishedPromise->getFuture();
     }
 
-    // Wait for the migrateThread to finish
+    // 等待迁移线程完成
     const auto threadFinishState = threadFinishedFuture.get(opCtx);
 
+    // 如果迁移线程未完成，返回错误
     if (threadFinishState != kDone) {
         return {ErrorCodes::CommandFailed, "exitCriticalSection failed"};
     }
@@ -2637,6 +2649,8 @@ bool MigrationDestinationManager::_flushPendingWrites(OperationContext* opCtx,
     return true;
 }
 
+        // 通知线程: MigrationDestinationManager::exitCriticalSection
+        // 被通知的是 migrateThread 线程：该线程在 awaitCriticalSectionReleaseSignalAndCompleteMigration 中阻塞等待推出临界区
 /**
  * MigrationDestinationManager::awaitCriticalSectionReleaseSignalAndCompleteMigration
  * 该函数用于在迁移流程最后阶段，目标分片已进入关键区域后，阻塞等待迁移线程发出释放关键区域的信号，

@@ -1582,6 +1582,27 @@ public:
 };
 MONGO_REGISTER_COMMAND(BulkWriteCmd).forShard();
 
+/**
+ * handleUpdateOp - 处理批量写入命令中的更新操作
+ * 
+ * 该函数负责执行批量写入（BulkWrite）命令中的单个更新操作。主要功能包括：
+ * 1. 验证命名空间和操作参数的有效性
+ * 2. 处理 FLE（字段级加密）更新
+ * 3. 处理时间序列集合的更新操作
+ * 4. 处理可重试写入（retryable writes）的逻辑
+ * 5. 执行实际的更新操作，包括正常更新和 upsert
+ * 6. 处理并发冲突和重复键错误
+ * 7. 收集操作统计信息和性能指标
+ * 
+ * @param opCtx 操作上下文
+ * @param op 更新操作对象
+ * @param req 批量写入请求
+ * @param currentOpIdx 当前操作在批量操作中的索引
+ * @param lastOpFixer 用于修复最后操作的辅助对象
+ * @param validatedNamespaces 已验证的命名空间列表
+ * @param responses 用于收集操作响应的对象
+ * @return bool 返回是否可以继续执行后续操作
+ */
 bool handleUpdateOp(OperationContext* opCtx,
                     const BulkWriteUpdateOp* op,
                     const BulkWriteCommandRequest& req,
@@ -1589,55 +1610,68 @@ bool handleUpdateOp(OperationContext* opCtx,
                     write_ops_exec::LastOpFixer& lastOpFixer,
                     std::vector<int>& validatedNamespaces,
                     BulkWriteReplies& responses) {
+    // 检查响应大小是否超过限制，避免响应过大
     if (aboveBulkWriteRepliesMaxSize(opCtx, currentOpIdx, responses)) {
         return false;
     }
 
+    // 获取命名空间信息
     const auto& nsInfo = req.getNsInfo();
     const auto idx = op->getUpdate();
     const auto& nsEntry = nsInfo[idx];
 
     try {
+        // 验证 multi=true 与可重试写入的兼容性
         if (op->getMulti()) {
             uassert(ErrorCodes::InvalidOptions,
                     "Cannot use retryable writes with multi=true",
                     !opCtx->isRetryableWrite());
         }
 
+        // 获取目标命名空间并验证写入权限
         const NamespaceString& nsString = nsEntry.getNs();
         validateNamespaceForWrites(opCtx, idx, nsString, validatedNamespaces);
 
         // Handle FLE updates.
+        // 处理字段级加密（FLE）更新
         if (nsEntry.getEncryptionInformation().has_value()) {
             // For BulkWrite, re-entry is un-expected.
+            // 对于批量写入，不应该重复处理 FLE
             invariant(!nsEntry.getEncryptionInformation()->getCrudProcessed().value_or(false));
 
             // Map to processFLEUpdate.
             return attemptProcessFLEUpdate(opCtx, op, req, currentOpIdx, responses, nsEntry);
         }
 
+        // 获取语句ID（用于可重试写入）
         auto stmtId = opCtx->isRetryableWrite()
             ? bulk_write_common::getStatementId(req, currentOpIdx)
             : kUninitializedStmtId;
 
+        // 检查是否是时间序列视图请求
         TimeseriesBucketNamespace tsNs(nsEntry.getNs(), nsEntry.getIsTimeseriesNamespace());
         auto [isTimeseriesViewRequest, bucketNs] = timeseries::isTimeseriesViewRequest(opCtx, tsNs);
 
         // Handle retryable timeseries updates.
+        // 处理可重试的时间序列更新（不在多文档事务中）
         if (isTimeseriesViewRequest && opCtx->isRetryableWrite() &&
             !opCtx->inMultiDocumentTransaction()) {
             write_ops_exec::WriteResult out;
+            // 根据集群角色选择执行器
             auto executor = serverGlobalParams.clusterRole.has(ClusterRole::None)
                 ? ReplicaSetNodeProcessInterface::getReplicaSetNodeExecutor(
                       opCtx->getServiceContext())
                 : Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
+            // 构造更新请求
             auto updateRequest =
                 bulk_write_common::makeUpdateCommandRequestFromUpdateOp(op, req, currentOpIdx);
 
+            // 执行时间序列可重试更新
             write_ops_exec::runTimeseriesRetryableUpdates(
                 opCtx, bucketNs, updateRequest, executor, &out);
             responses.addUpdateReply(opCtx, currentOpIdx, out);
 
+            // 增加更新操作的统计指标
             bulk_write_common::incrementBulkWriteUpdateMetrics(ClusterRole::ShardServer,
                                                                op->getUpdateMods(),
                                                                nsEntry.getNs(),
@@ -1646,17 +1680,23 @@ bool handleUpdateOp(OperationContext* opCtx,
         }
 
         // Handle retryable non-timeseries updates.
+        // 处理可重试的非时间序列更新
         if (opCtx->isRetryableWrite()) {
             const auto txnParticipant = TransactionParticipant::get(opCtx);
+            // 检查语句是否已经执行过
             if (auto entry = txnParticipant.checkStatementExecuted(opCtx, stmtId)) {
+                // 增加重试语句计数
                 RetryableWritesStats::get(opCtx)->incrementRetriedStatementsCount();
 
+                // 从已执行的条目中获取更新结果
                 auto [numMatched, numDocsModified, upserted] =
                     getRetryResultForUpdate(opCtx, nsString, op, entry);
 
+                // 添加更新响应
                 responses.addUpdateReply(
                     currentOpIdx, numMatched, numDocsModified, upserted, stmtId);
 
+                // 增加更新操作的统计指标
                 bulk_write_common::incrementBulkWriteUpdateMetrics(ClusterRole::ShardServer,
                                                                    op->getUpdateMods(),
                                                                    nsEntry.getNs(),
@@ -1666,23 +1706,29 @@ bool handleUpdateOp(OperationContext* opCtx,
         }
 
         // Create nested CurOp for update.
+        // 为更新操作创建嵌套的 CurOp
         auto& parentCurOp = *CurOp::get(opCtx);
         const Command* cmd = parentCurOp.getCommand();
         CurOp curOp(cmd);
         curOp.push(opCtx);
+        // 确保在退出时完成 CurOp
         ON_BLOCK_EXIT([&] { finishCurOp(opCtx, &curOp, LogicalOp::opUpdate); });
 
         // Initialize curOp information.
+        // 初始化 CurOp 信息
         setCurOpInfoAndEnsureStarted(opCtx, &curOp, LogicalOp::opUpdate, nsEntry, op->toBSON());
 
         // Begin query planning timing once we have the nested CurOp.
+        // 开始查询计划计时
         CurOp::get(opCtx)->beginQueryPlanningTimer();
 
         // Handle non-retryable normal and timeseries updates, as well as retryable normal
         // updates that were not already executed.
+        // 构造更新请求（处理不可重试的普通和时间序列更新，以及未执行的可重试普通更新）
         auto updateRequest = bulk_write_common::makeUpdateRequestFromUpdateOp(
             opCtx, nsEntry, op, stmtId, req.getLet(), req.getBypassEmptyTsReplacement());
 
+        // 处理查询分析采样
         if (auto sampleId = analyze_shard_key::getOrGenerateSampleId(
                 opCtx,
                 nsString,
@@ -1701,8 +1747,11 @@ bool handleUpdateOp(OperationContext* opCtx,
         // Although usually the PlanExecutor handles WCE internally, it will throw WCEs when it
         // is executing an update. This is done to ensure that we can always match,
         // modify, and return the document under concurrency, if a matching document exists.
+        // 开始操作，用于最后操作修复
         lastOpFixer.startingOp(nsString);
+        // 处理写冲突重试
         return writeConflictRetry(opCtx, "bulkWriteUpdate", nsString, [&] {
+            // 测试点：在执行更新前挂起
             if (MONGO_unlikely(hangBeforeBulkWritePerformsUpdate.shouldFail())) {
                 CurOpFailpointHelpers::waitWhileFailPointEnabled(
                     &hangBeforeBulkWritePerformsUpdate, opCtx, "hangBeforeBulkWritePerformsUpdate");
@@ -1710,30 +1759,38 @@ bool handleUpdateOp(OperationContext* opCtx,
 
             // Nested retry loop to handle concurrent conflicting upserts with equality
             // match.
+            // 嵌套重试循环，处理并发冲突的相等匹配 upsert
             int retryAttempts = 0;
             for (;;) {
                 try {
                     boost::optional<BSONObj> docFound;
+                    // 增加全局更新计数
                     globalOpCounters.gotUpdate();
+                    // 记录更新操作的写关注
                     ServerWriteConcernMetrics::get(opCtx)->recordWriteConcernForUpdate(
                         opCtx->getWriteConcern());
+                    // 执行实际的更新操作
                     auto result = write_ops_exec::performUpdate(opCtx,
                                                                 nsString,
                                                                 &curOp,
                                                                 opCtx->inMultiDocumentTransaction(),
-                                                                false,
+                                                                false,  // fromMigrate
                                                                 updateRequest.isUpsert(),
                                                                 nsEntry.getCollectionUUID(),
                                                                 docFound,
                                                                 &updateRequest);
+                    // 标记操作成功完成
                     lastOpFixer.finishedOpSuccessfully();
+                    // 添加更新响应
                     responses.addUpdateReply(currentOpIdx, result, boost::none);
+                    // 增加更新操作的统计指标
                     bulk_write_common::incrementBulkWriteUpdateMetrics(ClusterRole::ShardServer,
                                                                        op->getUpdateMods(),
                                                                        nsEntry.getNs(),
                                                                        op->getArrayFilters());
                     return true;
                 } catch (const ExceptionFor<ErrorCodes::DuplicateKey>& ex) {
+                    // 解析查询以检查是否应该重试重复键异常
                     auto cq = uassertStatusOK(
                         parseWriteQueryToCQ(opCtx, nullptr /* expCtx */, updateRequest));
                     if (!write_ops_exec::shouldRetryDuplicateKeyException(
@@ -1741,6 +1798,7 @@ bool handleUpdateOp(OperationContext* opCtx,
                         throw;
                     }
 
+                    // 增加重试次数并记录日志
                     ++retryAttempts;
                     logAndBackoff(7276500,
                                   ::mongo::logv2::LogComponent::kWrite,
@@ -1753,11 +1811,14 @@ bool handleUpdateOp(OperationContext* opCtx,
         });
     } catch (const DBException& ex) {
         // IncompleteTrasactionHistory should always be command fatal.
+        // 不完整的事务历史应该总是致命的命令错误
         if (ex.code() == ErrorCodes::IncompleteTransactionHistory) {
             throw;
         }
+        // 添加更新错误响应
         responses.addUpdateErrorReply(opCtx, currentOpIdx, ex.toStatus());
         write_ops_exec::WriteResult out;
+        // 处理错误并返回是否可以继续
         return write_ops_exec::handleError(
             opCtx, ex, nsEntry.getNs(), req.getOrdered(), op->getMulti(), boost::none, &out);
     }

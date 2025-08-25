@@ -486,6 +486,8 @@ public:
 };
 MONGO_REGISTER_COMMAND(RecvChunkAbortCommand).forShard();
 
+//源分片: launchReleaseCriticalSectionOnRecipientFuture 发送 _recvChunkReleaseCritSec 给目标分片
+//目标分片：RecvChunkReleaseCritSecCommand::run 接收 _recvChunkReleaseCritSec 命令处理
 class RecvChunkReleaseCritSecCommand : public BasicCommand {
 public:
     RecvChunkReleaseCritSecCommand() : BasicCommand("_recvChunkReleaseCritSec") {}

@@ -597,6 +597,8 @@ Status MigrationChunkClonerSource::awaitUntilCriticalSectionIsAppropriate(
  * 主要流程包括：状态校验、巨型块特殊处理、会话数据处理、RPC发送 commit 命令、根据响应结果清理本地状态或报错。
  * 源分片： MigrationChunkClonerSource::commitClone 发送  _recvChunkCommit 命令
  * 目标分片:  RecvChunkCommitCommand::run 接收 _recvChunkCommit 命令
+ * 
+ * MigrationSourceManager::commitChunkOnRecipient 调用
  */
 StatusWith<BSONObj> MigrationChunkClonerSource::commitClone(OperationContext* opCtx) {
     invariant(_state == kCloning); // 确保当前处于克隆阶段
@@ -1513,18 +1515,27 @@ Status MigrationChunkClonerSource::nextModsBatch(OperationContext* opCtx, BSONOb
     return Status::OK();
 }
 
+/**
+ * MigrationChunkClonerSource::_cleanup
+ * 该函数用于在分片迁移流程结束后（无论成功或失败），清理源分片迁移相关的本地状态和资源。
+ * 主要职责包括：重置迁移状态、清空待同步和待删除的数据队列、归零相关计数器、清理所有未完成的操作跟踪请求。
+ * 如果迁移成功，还会断言所有待处理队列已为空，确保迁移过程没有遗留数据。
+ * 这是迁移流程安全收尾和资源释放的关键步骤，防止数据泄漏和状态异常。
+ */
 void MigrationChunkClonerSource::_cleanup(bool wasSuccessful) {
-    stdx::unique_lock<Latch> lk(_mutex);
-    _state = kDone;
+    stdx::unique_lock<Latch> lk(_mutex); // 加锁保护状态，确保线程安全
+    _state = kDone; // 标记迁移状态为完成
 
-    _drainAllOutstandingOperationTrackRequests(lk);
+    _drainAllOutstandingOperationTrackRequests(lk); // 清理所有未完成的操作跟踪请求
 
     if (wasSuccessful) {
+        // 如果迁移成功，断言所有待处理队列已为空，确保没有遗留数据
         invariant(_reload.empty());
         invariant(_deleted.empty());
         invariant(_deferredReloadOrDeletePreImageDocKeys.empty());
     }
 
+    // 清空所有待同步和待删除的数据队列
     _reload.clear();
     _untransferredUpsertsCounter = 0;
     _deleted.clear();
@@ -1532,7 +1543,6 @@ void MigrationChunkClonerSource::_cleanup(bool wasSuccessful) {
     _deferredReloadOrDeletePreImageDocKeys.clear();
     _deferredUntransferredOpsCounter = 0;
 }
-
 
 /**
  * MigrationChunkClonerSource::_callRecipient 函数的作用：
