@@ -2562,18 +2562,40 @@ bool matchContainsOnlyAndedEqualityNodes(const MatchExpression& root) {
 }
 }  // namespace
 
+/**
+ * shouldRetryDuplicateKeyException - 判断是否应该重试重复键异常
+ * 
+ * 该函数用于判断在执行 upsert 操作时遇到 DuplicateKey 错误是否应该重试。
+ * 在并发场景下，多个线程可能同时尝试插入相同的文档，导致重复键冲突。
+ * 如果满足特定条件，可以通过重试来解决这种竞态条件。
+ * 
+ * 重试的条件包括：
+ * 1. 必须是 upsert 操作且 multi 为 false
+ * 2. 查询条件只包含 AND 和 EQ（相等）操作符
+ * 3. 查询条件中的字段必须完全匹配唯一索引的字段
+ * 4. 触发重复键错误的值必须与查询条件中的值相同
+ * 5. 查询和索引的排序规则（collation）必须一致
+ * 
+ * @param updateRequest 更新请求对象
+ * @param cq 规范化查询对象
+ * @param errorInfo 重复键错误信息
+ * @return bool 如果满足重试条件返回 true，否则返回 false
+ */
 bool shouldRetryDuplicateKeyException(const UpdateRequest& updateRequest,
                                       const CanonicalQuery& cq,
                                       const DuplicateKeyErrorInfo& errorInfo) {
     // In order to be retryable, the update must be an upsert with multi:false.
+    // 检查是否是 upsert 操作且不是多文档更新
     if (!updateRequest.isUpsert() || updateRequest.isMulti()) {
         return false;
     }
 
+    // 获取查询的主匹配表达式
     auto matchExpr = cq.getPrimaryMatchExpression();
     invariant(matchExpr);
 
     // In order to be retryable, the update query must contain no expressions other than AND and EQ.
+    // 检查查询条件是否只包含 AND 和 EQ 操作符
     if (!matchContainsOnlyAndedEqualityNodes(*matchExpr)) {
         return false;
     }
@@ -2581,71 +2603,92 @@ bool shouldRetryDuplicateKeyException(const UpdateRequest& updateRequest,
     // In order to be retryable, the update equality field paths must be identical to the unique
     // index key field paths. Also, the values that triggered the DuplicateKey error must match the
     // values used in the upsert query predicate.
+    // 提取查询条件中的相等匹配字段
     pathsupport::EqualityMatches equalities;
     auto status = pathsupport::extractEqualityMatches(*matchExpr, &equalities);
     if (!status.isOK()) {
         return false;
     }
 
+    // 获取触发重复键错误的索引键模式
     auto keyPattern = errorInfo.getKeyPattern();
+    // 检查查询条件中的字段数量是否与索引键字段数量相同
     if (equalities.size() != static_cast<size_t>(keyPattern.nFields())) {
         return false;
     }
 
     // Check that collation of the query matches the unique index. To avoid calling
     // CollatorFactoryInterface when possible, first check the simple collator case.
+    // 检查查询的排序规则是否与唯一索引的排序规则匹配
     bool queryHasSimpleCollator = CollatorInterface::isSimpleCollator(cq.getCollator());
     bool indexHasSimpleCollator = errorInfo.getCollation().isEmpty();
+    // 如果一个使用简单排序规则而另一个不是，则不匹配
     if (queryHasSimpleCollator != indexHasSimpleCollator) {
         return false;
     }
 
+    // 如果索引使用了非简单排序规则，需要详细比较
     if (!indexHasSimpleCollator) {
+        // 创建索引的排序器
         auto indexCollator =
             uassertStatusOK(CollatorFactoryInterface::get(cq.getOpCtx()->getServiceContext())
                                 ->makeFromBSON(errorInfo.getCollation()));
+        // 比较查询和索引的排序器是否匹配
         if (!CollatorInterface::collatorsMatch(cq.getCollator(), indexCollator.get())) {
             return false;
         }
     }
 
+    // 获取导致重复键错误的实际键值
     auto keyValue = errorInfo.getDuplicatedKeyValue();
 
+    // 遍历索引键模式和键值，验证每个字段
     BSONObjIterator keyPatternIter(keyPattern);
     BSONObjIterator keyValueIter(keyValue);
     while (keyPatternIter.more() && keyValueIter.more()) {
         auto keyPatternElem = keyPatternIter.next();
         auto keyValueElem = keyValueIter.next();
 
+        // 获取索引键字段名
         auto keyName = keyPatternElem.fieldNameStringData();
+        // 在查询条件中查找对应的相等条件
         auto equalityIt = equalities.find(keyName);
         if (equalityIt == equalities.end()) {
+            // 如果索引字段在查询条件中不存在，不能重试
             return false;
         }
         const BSONElement& equalityElem = equalityIt->second->getData();
 
         // If the index have collation and we are comparing strings, we need to compare
         // ComparisonStrings instead of the raw value to respect collation.
+        // 如果索引有排序规则且比较的是字符串，需要使用排序规则进行比较
         if (!indexHasSimpleCollator && equalityElem.type() == mongo::String) {
             if (keyValueElem.type() != BSONType::String) {
+                // 类型不匹配，不能重试
                 return false;
             }
+            // 使用排序器获取比较字符串
             auto equalityComparisonString =
                 cq.getCollator()->getComparisonString(equalityElem.valueStringData());
+            // 比较排序后的字符串值
             if (equalityComparisonString != keyValueElem.valueStringData()) {
                 return false;
             }
         } else {
             // Comparison which obeys field ordering but ignores field name.
+            // 对于非字符串类型，使用标准比较器（忽略字段名）
             BSONElementComparator cmp{BSONElementComparator::FieldNamesMode::kIgnore, nullptr};
             if (cmp.evaluate(equalityElem != keyValueElem)) {
+                // 如果查询条件中的值与导致错误的值不相等，不能重试
                 return false;
             }
         }
     }
+    // 确保所有字段都已比较完毕
     invariant(!keyPatternIter.more());
     invariant(!keyValueIter.more());
 
+    // 所有条件都满足，可以重试
     return true;
 }
 
